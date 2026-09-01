@@ -1,0 +1,8 @@
+print(bool())
+print(bool(3))
+print(int())
+print(int(True))
+print(int(" 42 "))
+print(int(3.9))
+print(str(42))
+print(str(False))

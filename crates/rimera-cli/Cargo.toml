@@ -1,0 +1,18 @@
+[package]
+name = "rimera-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rimera"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rimera-compiler = { path = "../rimera-compiler" }
+toml.workspace = true
+
+[lints]
+workspace = true

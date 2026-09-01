@@ -1,0 +1,11 @@
+/target/
+/.DS_Store
+*.rimera-cache
+target/
+dist/
+.rimera/
+*.o
+*.a
+.DS_Store
+Trash/
+tests/fixtures/stress/compile_stress.py

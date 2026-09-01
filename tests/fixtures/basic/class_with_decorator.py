@@ -1,0 +1,3 @@
+@decorator
+class Decorated:
+    pass

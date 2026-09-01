@@ -1,0 +1,23 @@
+print(type(None))
+print(type(True))
+print(type(1))
+print(type(123456789012345678901234567890))
+print(type("rimera"))
+print(type([]))
+print(type(()))
+print(type({}))
+print(type({1}))
+print(type(range(1)))
+print(type(lambda value: value))
+print(type(isinstance))
+try:
+    error_value = 1 // 0
+except ZeroDivisionError as error:
+    print(type(error))
+print(type(type))
+print(type(object))
+print(type(1) == type(2))
+print(isinstance(True, int))
+print(isinstance("native", (int, (str, tuple))))
+print(issubclass(bool, int))
+print(issubclass(bool, object))

@@ -1,0 +1,19 @@
+[package]
+name = "rimera-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true
+cranelift-object.workspace = true
+rimera-abi = { path = "../rimera-abi" }
+rimera-runtime = { path = "../rimera-runtime" }
+rustpython-parser.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+print(ord(chr(0xD7FF)))
+print(ord(chr(0xE000)))
+print(ord(chr(0x10FFFF)))
+print(ascii(chr(0xD7FF)))
+print(ascii(chr(0xE000)))
+print(ascii(chr(0x10FFFF)))

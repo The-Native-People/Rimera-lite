@@ -1,0 +1,1 @@
+type("Dynamic", 1, {})

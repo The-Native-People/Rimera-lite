@@ -1,0 +1,12 @@
+[project]
+name = "rimera-local-pure"
+version = "0.1.0"
+dependencies = []
+
+[tool.rimera]
+output = "dist/app"
+profile = "release"
+debug = false
+heap_limit_bytes = 1048576
+run = false
+target = "aarch64-apple-darwin"

@@ -1,0 +1,7 @@
+print(None, True, False)
+print(not False, -5)
+print(2 + 3, 8 - 3, 4 * 5)
+print(7 // -3, 7 % -3)
+print(2 == 2, 2 != 3, 2 < 3, 3 <= 3, 4 > 3, 4 >= 4)
+print("a" == "a", "a" != "b")
+print()

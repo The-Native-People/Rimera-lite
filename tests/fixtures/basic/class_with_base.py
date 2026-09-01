@@ -1,0 +1,2 @@
+class Derived(object):
+    pass
