@@ -19,10 +19,11 @@ bytecode, or use host unwinding for Python exceptions.
 
 The execution kernel supports a meaningful but still bounded single-module
 subset. Functions, lexical scopes, structured exceptions, tracing GC, the
-Gate 1 class/object model, Gate 2 generic protocol dispatch, and Gate 3 managed
-builtin values/collections are proven through the native pipeline. Imports,
-standard library, later synchronous syntax/reflection, and ecosystem
-compatibility are not established.
+Gate 1 class/object model, Gate 2 generic protocol dispatch, Gate 3 managed
+builtin values/collections, and Gate 4 unpacking/comprehension/remaining
+synchronous source forms are proven through the native pipeline. Source
+synchronous generators beyond executable generator expressions, reflection,
+imports, standard library, and ecosystem compatibility are not established.
 
 | # | Compatibility area | Status | Proven scope |
 |---:|---|---|---|
@@ -33,13 +34,13 @@ compatibility are not established.
 | 5 | Core builtin types | Implemented — conformance audit pending | Gate 3 managed `float`, `complex`, `bytes`, `bytearray`, `frozenset`, `slice`, dictionary views, and native-exporter `memoryview`; generic-call constructors, exact type identity, tracing/managed-size accounting, conversion, mutation/slicing, representation/formatting, iteration, and generic hash/equality collections within the documented boundaries |
 | 6 | Operators and dunder dispatch | Implemented — conformance audit pending | Shared ABI operator discriminants, direct/reflected/in-place dispatch including `@`, strict-subclass priority, rooted `NotImplemented`, identity comparisons, truth/length/hash/item/call/iteration/conversion/representation/formatting protocols, target-aware augmented assignment, and item deletion all reach the native pipeline. Exhaustive CPython edge-case parity remains a conformance audit. |
 | 7 | Iterators | Implemented — conformance audit pending | Native range, list, tuple, string, dictionary, set, generator-foundation, validated user `__iter__`/`__next__`, legacy `__getitem__` sequence fallback, containment fallback, and reverse iteration through `__reversed__` or `__len__`/`__getitem__` all reach `for` and public native fixtures. |
-| 8 | Generators | Foundation only | Traceable generator objects, a native resume ABI, persistent slots, GC traversal, and generic `iter`/`next` are established; source `yield`, suspension MIR, and lifecycle semantics are not yet proven |
+| 8 | Generators | Foundation only | Traceable generator objects, native resume ABI, persistent slots, GC traversal, generic `iter`/`next`, and executable Gate 4 generator expressions are established; source `yield`, `send`, `throw`, `close`, `yield from`, and complete lifecycle semantics remain Gate 6 |
 | 9 | Classes, inheritance, and MRO | Implemented — conformance audit pending | Compiled prepared-namespace class bodies, single/multiple inheritance, C3, atomic descendant `__bases__` planning, metaclass selection/hooks, builtin-storage subclasses, decorators, and supported explicit/zero-argument `super` |
 | 10 | Descriptors | Implemented — conformance audit pending | Data/non-data precedence across instances/classes/metaclasses, native property/static/class methods, custom `__get__`/`__set__`/`__delete__`, traced member descriptors, slots, and compiled class cells |
 | 11 | Context managers | Not started | No `with` or async context protocol |
 | 12 | Imports, modules, and `sys.modules` | Not started | Builds execute one compiled module |
 | 13 | Builtins | Implemented — conformance audit pending | Gate 3 audits the complete 57-name synchronous builtin/type namespace owned by the finished core as lazy, first-class, aliasable, and rebindable, including constructors, numeric/collection/iteration helpers, predicates, sorting/reduction, formatting/representation, and supported attribute helpers. Imports, dynamic compilation, async helpers, broad reflection method tables, and stdlib-dependent behavior remain explicitly later-gate owned. |
-| 14 | Comprehensions and unpacking | Partial | Flat exact and final-starred assignment unpacking; no comprehensions or nested unpacking |
+| 14 | Comprehensions and unpacking | Implemented — conformance audit pending | Recursive exact/starred/chained targets across normal and class-body execution, `for`/comprehension destructuring, dictionary unpacking, expanded calls, list/set/dict comprehensions, and executable generator expressions with CPython 3.12.11 differential, GC, failure-atomicity, and release-artifact proof |
 | 15 | Reflection and introspection | Small partial | `type`, `isinstance`, `issubclass`, compiled attribute syntax, and generic-call `getattr`/`setattr`/`delattr`/`hasattr`/`callable` for the supported object subset; no general inspection protocol or frame metadata |
 | 16 | Async and await | Not started | Syntax and execution are deferred |
 | 17 | `eval`, `exec`, and runtime compilation | Not started | No dynamic-code pipeline |
@@ -83,13 +84,18 @@ These are defects or deliberate boundaries, not completed architecture:
   hashes when merging another native dictionary; `|=` also accepts the normal
   mapping and iterable-of-pairs update sources. Broad CPython set layout and
   iteration-order equivalence remains a later corpus concern.
-- Assignment unpacking accepts flat names and one final starred name only.
+- Gate 4 recursive assignment/unpacking supports nested tuple/list targets,
+  one star in any legal position per sequence level, chained targets, compiled
+  class-body targets, and generic single-pass iterators. Extended unpacking
+  preserves CPython's observable second `iter()` callback on the current
+  iterator before draining the starred remainder, without source re-evaluation
+  or rewind.
 - Gate 3's owned builtin namespace, managed conversions, collection protocols,
   normalized builtin slicing, and forward/reverse iterator helpers are complete
   within their documented boundaries. Remaining gaps are owned explicitly by
-  later gates: Gate 4 source syntax/unpacking/comprehensions/expanded calls,
-  Gate 7 reflection and PEP 688 user buffer providers, and the final Unicode/
-  codec corpus for surrogate-preserving Python string behavior.
+  later gates: Gate 6 source generator lifecycle, Gate 7 reflection and PEP 688
+  user buffer providers, and the final Unicode/codec corpus for
+  surrogate-preserving Python string behavior.
 - Class inheritance accepts Rimera user classes, `object`, and the supported
   list/tuple/dict/set/float/complex/bytes/bytearray/frozenset storage layouts.
   Those subclasses share builtin construction semantics, keep native payloads
@@ -219,8 +225,9 @@ These are defects or deliberate boundaries, not completed architecture:
 - Source name/item/attribute augmented assignment and deletion use the proven
   native binding, item, attribute, and in-place protocol operations. `__iop__`
   dispatch falls back through normal/reflected operators as established by
-  Gate 2; remaining source syntax combinations are owned by Gate 4 rather than
-  a missing runtime operator path.
+  Gate 2. Gate 4's included synchronous source combinations are now implemented
+  through this same path; exhaustive operator edge parity remains conformance
+  audit work rather than a missing execution backend.
 - Generator allocation and resumption have a documented native ABI and exact
   GC ownership, while source `yield`, suspension-aware MIR/codegen,
   `StopIteration` values, `send`, `throw`, `close`, and `yield from` remain
@@ -228,16 +235,21 @@ These are defects or deliberate boundaries, not completed architecture:
 
 ## Active dependency order
 
-Gate 3 is closed. Work proceeds from **Gate 4** unless an earlier correctness
-regression must be repaired first:
+Gate 4 is closed. The resume board's sole active implementation gate is
+**Gate 6 — native synchronous generators**, because Gate 4 generator expressions
+already exercise the permanent generator object/resume ABI:
 
-1. Gate 4 — nested/starred unpacking, comprehensions, expanded calls, and the
-   remaining synchronous syntax listed in `GATES.MD`.
-2. Continue Gates 5–8 in contract order: function/LEGB/exception closure,
-   generators, reflection/introspection, and synchronous context managers.
+1. Gate 6 — add source `yield`, `send`, `throw`, `close`, and `yield from` plus
+   complete suspension/lifecycle semantics without introducing a second
+   generator implementation. Execute the substantial vertical slices in
+   [`spec/gates/6/README.md`](gates/6/README.md) in numeric order.
+2. Gate 5 function/LEGB/structured-exception closure remains an unpromoted
+   compatibility area with its own queued slice ledger in
+   [`spec/gates/5/README.md`](gates/5/README.md); Gates 7–8 remain queued for
+   their own end-to-end evidence, and Gate 4 does not imply their completion.
 3. Imports/modules, async, dynamic compilation, weak references/finalizers,
    Unicode/edge-semantics corpora, stdlib/platform work, and package corpora
-   remain explicitly queued behind the numbered synchronous core.
+   remain explicitly queued.
 
 ## Status-change rules
 

@@ -57,7 +57,7 @@ cleanup machinery must be extended rather than duplicated.
 - [x] Slice 21 — sequence/mapping patterns
 - [x] Slice 22 — class patterns
 - [x] Slice 23 — composition/GC/failure proof
-- [ ] Slice 24 — final audit and tracker closure
+- [x] Slice 24 — final audit and tracker closure
 
 ## Slice order
 

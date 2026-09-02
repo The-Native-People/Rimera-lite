@@ -2,7 +2,7 @@
 
 ## Summary
 
-The current epic is not complete. Gates 1–3 are complete and Gate 4 is the sole active implementation gate. Remaining end-to-end work includes expanded synchronous syntax/unpacking/comprehensions, function/exception closure, generators, reflection, and context managers.
+The current epic is not complete. Gates 1–4 are complete. Gate 6 native synchronous generators are the sole active implementation gate selected by the Gate 4 closure; executable generator expressions already use the permanent native generator ABI. Function/exception closure, source generator lifecycle, reflection, and context managers still require their own end-to-end promotions.
 
 Continue from the current worktree. Preserve every passing implementation and finish all started synchronous language areas plus synchronous context managers.
 
@@ -152,6 +152,11 @@ Acceptance must cover evaluation order, scope isolation, nested/starred failures
 
 ## Gate 5 — Close Functions, LEGB, and Structured Exceptions
 
+The detailed implementation order is the eight-slice ledger in
+[`spec/gates/5/README.md`](spec/gates/5/README.md). Gate 5 remains an
+unpromoted closure audit while Gate 6 is active; only concrete Gate 5
+prerequisites exposed by an active generator slice are repaired early.
+
 Functions and scopes:
 
 - Complete annotations, `__annotations__`, `__name__`, `__qualname__`, defaults, keyword defaults, decorators, and callable objects.
@@ -173,6 +178,11 @@ Exceptions:
 After this gate, exceptions, calls, and LEGB become `Implemented — conformance audit pending`, with remaining behavioral mismatches recorded separately.
 
 ## Gate 6 — Complete Native Synchronous Generators
+
+The detailed implementation order is the nine-slice ledger in
+[`spec/gates/6/README.md`](spec/gates/6/README.md). Each slice is a substantial
+vertical unit with synchronized compiler, runtime/ABI, and public-proof lanes;
+only the integrated slice advances the ledger.
 
 Extend the existing generator object and ABI instead of introducing a second implementation.
 

@@ -75,9 +75,10 @@
 - Current proven substantial partials: structured exceptions and tracebacks;
   native functions and full supported-signature binding; LEGB/global/nonlocal
   closure cells; arbitrary integers and strings; lists, tuples, ranges,
-  restricted dictionaries and sets; native iteration and `for`; flat/final-
-  starred unpacking; primitive arithmetic, comparison, sequence, and
-  membership operations.
+  managed dictionaries and sets; native iteration and `for`; recursive,
+  chained, and general-starred unpacking; expanded calls; list/set/dict
+  comprehensions; executable generator expressions; and Gate 4's included
+  synchronous expression/statement/pattern forms.
 - Current proven object-model partial: GC-rooted lazy builtin type identities,
   exact `rimera_type_of`, module-scope classes and instances, native attribute
   read/write/delete, descriptor precedence, supported slots, class cells, both
@@ -98,15 +99,19 @@
   bytearrays, slices, frozensets, and native-exporter memoryviews are
   source-to-runtime values. Builtin value families must extend these paths
   rather than add intrinsics.
-- Not implemented as compatibility claims: generators,
-  context managers, imports/modules/`sys.modules`, a
-  complete builtin namespace, comprehensions, reflection, async execution,
+- Not implemented as compatibility claims: source synchronous generators beyond
+  the already-native generator-expression path, context managers,
+  imports/modules/`sys.modules`, broad reflection/introspection, async execution,
   `eval`/`exec`, weak references/finalizers, stdlib corpora, native stdlib
   bindings, or PyPI compatibility.
-- The active compatibility gate is native builtin values, collections, slicing,
-  and the remaining builtin namespace. Its order is: builtin value families ->
-  generators -> context managers. Do not jump to frameworks,
-  modules, or packages before these dependencies exist.
+- Gate 4 is closed. The sole active implementation gate is Gate 6 native
+  synchronous generators, extending the existing generator object/resume ABI
+  with source `yield`, `send`, `throw`, `close`, and `yield from`. Generator
+  expressions are already native and must not be reimplemented. Execute its
+  substantial synchronized slices from `spec/gates/6/README.md`; Gate 5's
+  separate queued closure slices live in `spec/gates/5/README.md`. Other
+  unpromoted compatibility areas remain separate work; do not jump to
+  frameworks, modules, or packages.
 - For implementation requests, begin from the earliest relevant incomplete
   dependency in `spec/compatibility.md`. Repair missing prerequisites and then
   continue the requested vertical slice; do not stop at runtime scaffolding.

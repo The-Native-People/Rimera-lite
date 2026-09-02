@@ -228,23 +228,43 @@ Public proof is concentrated in
 [`crates/rimera-compiler/tests/native_pipeline.rs`](crates/rimera-compiler/tests/native_pipeline.rs).
 These checks describe proven slices, not complete Python categories.
 
+## Completed Gate 4
+
+- [x] **Gate 4 — Unpacking, comprehensions, expanded calls, and remaining synchronous syntax**
+  - Recursive/chained/starred assignment targets now work in module, function,
+    loop, comprehension, match-body, and compiled class-body execution; generic
+    `for`/dictionary unpacking and call-site `*iterable`/`**mapping` preserve
+    CPython 3.12.11 order and failure behavior.
+  - List/set/dictionary comprehensions, executable generator expressions,
+    boolean short-circuiting, chained comparisons, slices, augmented assignment,
+    deletion/assertions, walrus expressions, f-strings, annotations, and Python
+    3.12 structural pattern matching execute through owned HIR/MIR/Cranelift and
+    the Rust runtime with precise GC proofs.
+  - Final acceptance is green: 3 ABI + 8 CLI + 37 compiler-lib + 145 public
+    native-pipeline + 57 runtime tests, zero ignored tests, warning-denied clippy,
+    doc tests, release build, and `git diff --check`. The release `hello` is
+    485,144 bytes under the 512 KiB budget and passes the forbidden-symbol scan.
+
 ## Active gate
 
-- [ ] **Gate 4 — Unpacking, comprehensions, expanded calls, and remaining synchronous syntax**
-  - Nested/starred assignment targets, `for` and dictionary unpacking, call-site
-    `*iterable`/`**mapping`, comprehensions, generator-expression syntax, and the
-    remaining source forms defined by `GATES.MD` are the sole active next work.
-  - Gate 3 builtin values, conversions, collection protocols, and slicing are
-    complete within their documented boundaries and must not be folded back
-    into this gate.
+- [ ] **Gate 6 — Native synchronous generators**
+  - Execute the substantial vertical slices in
+    [`spec/gates/6/README.md`](spec/gates/6/README.md) in numeric order, with
+    compiler, runtime/ABI, and proof lanes synchronized inside one active slice.
+  - Extend the existing single generator object/resume ABI; generator
+    expressions are already native and are not a fallback or Gate 6 placeholder.
+  - The active source work is `yield`, `send`, `throw`, `close`, and
+    `yield from`, including suspension cleanup, exception state, and lifecycle
+    semantics. Do not introduce a second generator implementation.
 
 ## Queued compatibility gates
 
-These remain unchecked until their own end-to-end evidence lands. Work them in
-`GATES.MD` dependency order; do not skip ahead for framework-specific behavior.
+These remain unchecked until their own end-to-end evidence lands. Gate 6 is the
+sole active implementation gate selected by the Gate 4 closure; the other areas
+below remain separate compatibility promotions and must not be implied complete.
 
-- [ ] Functions/LEGB/structured-exception closure work.
-- [ ] Generators and suspension.
+- [ ] Functions/LEGB/structured-exception closure work, split into the queued
+  substantial slices in [`spec/gates/5/README.md`](spec/gates/5/README.md).
 - [ ] Reflection and introspection.
 - [ ] Context managers.
 - [ ] Imports, packages, modules, and `sys.modules`.
