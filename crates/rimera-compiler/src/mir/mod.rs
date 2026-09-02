@@ -4,7 +4,8 @@ use crate::core::Span;
 use rimera_abi::RParameterKind;
 pub use rimera_abi::{
     RBinaryOperator as BinaryOperator, RCallArgumentKind as CallArgumentKind,
-    RCompareOperator as CompareOperator, RUnaryOperator as UnaryOperator,
+    RCompareOperator as CompareOperator, RFormatConversion as FormatConversion,
+    RUnaryOperator as UnaryOperator,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -25,6 +26,7 @@ pub struct FunctionId(pub u32);
 pub enum FunctionKind {
     Module,
     Python,
+    Generator,
     ClassBody,
 }
 
@@ -102,6 +104,12 @@ pub enum OperationKind {
         left: ValueId,
         right: ValueId,
     },
+    FormatValue {
+        dest: ValueId,
+        value: ValueId,
+        conversion: FormatConversion,
+        spec: ValueId,
+    },
     ValueArray {
         dest: ValueId,
         values: Vec<ValueId>,
@@ -114,6 +122,10 @@ pub enum OperationKind {
         dest: ValueId,
         values: Vec<ValueId>,
     },
+    ListAppend {
+        list: ValueId,
+        value: ValueId,
+    },
     Dictionary {
         dest: ValueId,
         keys: Vec<ValueId>,
@@ -123,9 +135,18 @@ pub enum OperationKind {
         dictionary: ValueId,
         source: ValueId,
     },
+    DictionaryInsert {
+        dictionary: ValueId,
+        key: ValueId,
+        value: ValueId,
+    },
     Set {
         dest: ValueId,
         values: Vec<ValueId>,
+    },
+    SetInsert {
+        set: ValueId,
+        value: ValueId,
     },
     SliceNew {
         dest: ValueId,
@@ -184,6 +205,34 @@ pub enum OperationKind {
         array: ValueId,
         index: u32,
     },
+    PatternSequence {
+        values: ValueId,
+        matched: ValueId,
+        subject: ValueId,
+        before_count: u32,
+        after_count: u32,
+        starred: bool,
+    },
+    PatternMappingCheck {
+        matched: ValueId,
+        subject: ValueId,
+        minimum_count: u32,
+    },
+    PatternMapping {
+        values: ValueId,
+        matched: ValueId,
+        subject: ValueId,
+        keys: Vec<ValueId>,
+        rest: bool,
+    },
+    PatternClass {
+        values: ValueId,
+        matched: ValueId,
+        subject: ValueId,
+        class: ValueId,
+        positional_count: u32,
+        keyword_names: Vec<String>,
+    },
     MakeFunction {
         dest: ValueId,
         function: FunctionId,
@@ -192,6 +241,9 @@ pub enum OperationKind {
     },
     ClassNamespaceNew {
         dest: ValueId,
+    },
+    AnnotationsEnsure {
+        namespace: Option<ValueId>,
     },
     ClassNamespaceSet {
         namespace: ValueId,
@@ -345,6 +397,7 @@ impl OperationKind {
             | Self::Binary { dest, .. }
             | Self::InPlace { dest, .. }
             | Self::Compare { dest, .. }
+            | Self::FormatValue { dest, .. }
             | Self::ValueArray { dest, .. }
             | Self::Tuple { dest, .. }
             | Self::List { dest, .. }
@@ -358,6 +411,10 @@ impl OperationKind {
             | Self::IteratorNew { dest, .. }
             | Self::Range { dest, .. }
             | Self::ValueArrayGet { dest, .. }
+            | Self::PatternSequence { values: dest, .. }
+            | Self::PatternMappingCheck { matched: dest, .. }
+            | Self::PatternMapping { values: dest, .. }
+            | Self::PatternClass { values: dest, .. }
             | Self::MakeFunction { dest, .. }
             | Self::ClassNamespaceNew { dest }
             | Self::ClassNamespaceGet { dest, .. }
@@ -380,6 +437,7 @@ impl OperationKind {
             | Self::CellClear { .. }
             | Self::GlobalSet { .. }
             | Self::GlobalDelete { .. }
+            | Self::AnnotationsEnsure { .. }
             | Self::ClassNamespaceSet { .. }
             | Self::ClassNamespaceDelete { .. }
             | Self::AttributeSet { .. }
@@ -390,7 +448,10 @@ impl OperationKind {
             | Self::ExceptionClearActive
             | Self::ItemSet { .. }
             | Self::ItemDelete { .. }
+            | Self::ListAppend { .. }
             | Self::DictionaryMerge { .. }
+            | Self::DictionaryInsert { .. }
+            | Self::SetInsert { .. }
             | Self::CallArgumentAdd { .. }
             | Self::IteratorNext { .. }
             | Self::CallModuleChunk { .. }
@@ -408,6 +469,15 @@ impl OperationKind {
             Self::IteratorNext {
                 item, has_value, ..
             } => vec![*item, *has_value],
+            Self::PatternSequence {
+                values, matched, ..
+            }
+            | Self::PatternMapping {
+                values, matched, ..
+            }
+            | Self::PatternClass {
+                values, matched, ..
+            } => vec![*values, *matched],
             _ => self.destination().into_iter().collect(),
         }
     }
@@ -442,6 +512,10 @@ pub enum Terminator {
     },
     ReturnValue {
         value: Option<ValueId>,
+    },
+    Yield {
+        value: ValueId,
+        resume_target: BlockId,
     },
     Unreachable,
 }
@@ -505,7 +579,10 @@ pub fn safepoint_plan(program: &Function) -> Result<SafepointPlan, String> {
     for (block_index, block) in program.blocks.iter().enumerate() {
         let mut live = successor_live_values(program, block, &live_in);
         live.extend(terminator_inputs(&block.terminator));
-        if matches!(block.terminator, Terminator::Branch { .. }) {
+        if matches!(
+            block.terminator,
+            Terminator::Branch { .. } | Terminator::Yield { .. }
+        ) {
             let roots = live.iter().copied().collect::<Vec<_>>();
             max_roots = max_roots.max(roots.len());
             terminator_roots.insert(block_index, roots);
@@ -549,7 +626,11 @@ fn verify_safepoint_plan(program: &Function, plan: &SafepointPlan) -> Result<(),
             }
         }
         let roots = plan.terminator_roots(block_index);
-        if matches!(block.terminator, Terminator::Branch { .. }) != roots.is_some() {
+        if matches!(
+            block.terminator,
+            Terminator::Branch { .. } | Terminator::Yield { .. }
+        ) != roots.is_some()
+        {
             return Err(format!(
                 "MIR terminator roots are inconsistent at block {block_index}"
             ));
@@ -593,12 +674,16 @@ fn operation_is_safepoint(operation: &OperationKind) -> bool {
         | OperationKind::Binary { .. }
         | OperationKind::InPlace { .. }
         | OperationKind::Compare { .. }
+        | OperationKind::FormatValue { .. }
         | OperationKind::ValueArray { .. }
         | OperationKind::Tuple { .. }
         | OperationKind::List { .. }
+        | OperationKind::ListAppend { .. }
         | OperationKind::Dictionary { .. }
         | OperationKind::DictionaryMerge { .. }
+        | OperationKind::DictionaryInsert { .. }
         | OperationKind::Set { .. }
+        | OperationKind::SetInsert { .. }
         | OperationKind::SliceNew { .. }
         | OperationKind::Contains { .. }
         | OperationKind::Unpack { .. }
@@ -610,8 +695,13 @@ fn operation_is_safepoint(operation: &OperationKind) -> bool {
         | OperationKind::ItemSet { .. }
         | OperationKind::ItemDelete { .. }
         | OperationKind::ValueArrayGet { .. }
+        | OperationKind::PatternSequence { .. }
+        | OperationKind::PatternMappingCheck { .. }
+        | OperationKind::PatternMapping { .. }
+        | OperationKind::PatternClass { .. }
         | OperationKind::MakeFunction { .. }
         | OperationKind::ClassNamespaceNew { .. }
+        | OperationKind::AnnotationsEnsure { .. }
         | OperationKind::ClassNamespaceGet { .. }
         | OperationKind::ClassNameGet { .. }
         | OperationKind::ClassNamespaceSet { .. }
@@ -666,6 +756,7 @@ fn terminator_inputs(terminator: &Terminator) -> Vec<ValueId> {
             .collect(),
         Terminator::Return { .. } | Terminator::Unreachable => Vec::new(),
         Terminator::ReturnValue { value } => value.iter().copied().collect(),
+        Terminator::Yield { value, .. } => vec![*value],
     }
 }
 
@@ -677,6 +768,7 @@ fn terminator_successors(terminator: &Terminator) -> Vec<BlockId> {
             else_target,
             ..
         } => vec![*then_target, *else_target],
+        Terminator::Yield { resume_target, .. } => vec![*resume_target],
         Terminator::Return { .. } | Terminator::ReturnValue { .. } | Terminator::Unreachable => {
             Vec::new()
         }
@@ -922,6 +1014,15 @@ fn render_operation(operation: &Operation) -> String {
             },
             right.0
         ),
+        OperationKind::FormatValue {
+            dest,
+            value,
+            conversion,
+            spec,
+        } => format!(
+            "v{} = format_value(v{}, {:?}, v{})",
+            dest.0, value.0, conversion, spec.0
+        ),
         OperationKind::ValueArray { dest, values } => format!(
             "v{} = value_array({})",
             dest.0,
@@ -949,6 +1050,9 @@ fn render_operation(operation: &Operation) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        OperationKind::ListAppend { list, value } => {
+            format!("list_append(v{}, v{})", list.0, value.0)
+        }
         OperationKind::Dictionary { dest, keys, values } => format!(
             "v{} = dict({})",
             dest.0,
@@ -958,6 +1062,14 @@ fn render_operation(operation: &Operation) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        OperationKind::DictionaryMerge { dictionary, source } => {
+            format!("dict_merge(v{}, v{})", dictionary.0, source.0)
+        }
+        OperationKind::DictionaryInsert {
+            dictionary,
+            key,
+            value,
+        } => format!("dict_insert(v{}, v{}, v{})", dictionary.0, key.0, value.0),
         OperationKind::Set { dest, values } => format!(
             "v{} = set({})",
             dest.0,
@@ -967,6 +1079,9 @@ fn render_operation(operation: &Operation) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        OperationKind::SetInsert { set, value } => {
+            format!("set_insert(v{}, v{})", set.0, value.0)
+        }
         OperationKind::SliceNew {
             dest,
             start,
@@ -1033,6 +1148,46 @@ fn render_operation(operation: &Operation) -> String {
         OperationKind::ValueArrayGet { dest, array, index } => {
             format!("v{} = value_array_get(v{}, {index})", dest.0, array.0)
         }
+        OperationKind::PatternSequence {
+            values,
+            matched,
+            subject,
+            before_count,
+            after_count,
+            starred,
+        } => format!(
+            "v{}, v{} = pattern_sequence(v{}, before={}, after={}, starred={})",
+            values.0, matched.0, subject.0, before_count, after_count, starred
+        ),
+        OperationKind::PatternMappingCheck {
+            matched,
+            subject,
+            minimum_count,
+        } => format!(
+            "v{} = pattern_mapping_check(v{}, minimum={})",
+            matched.0, subject.0, minimum_count
+        ),
+        OperationKind::PatternMapping {
+            values,
+            matched,
+            subject,
+            keys,
+            rest,
+        } => format!(
+            "v{}, v{} = pattern_mapping(v{}, keys={:?}, rest={})",
+            values.0, matched.0, subject.0, keys, rest
+        ),
+        OperationKind::PatternClass {
+            values,
+            matched,
+            subject,
+            class,
+            positional_count,
+            keyword_names,
+        } => format!(
+            "v{}, v{} = pattern_class(v{}, v{}, positional={}, keywords={:?})",
+            values.0, matched.0, subject.0, class.0, positional_count, keyword_names
+        ),
         OperationKind::MakeFunction {
             dest,
             function,
@@ -1043,6 +1198,9 @@ fn render_operation(operation: &Operation) -> String {
             dest.0, function.0, defaults, closure
         ),
         OperationKind::ClassNamespaceNew { dest } => format!("v{} = class_namespace_new()", dest.0),
+        OperationKind::AnnotationsEnsure { namespace } => {
+            format!("annotations_ensure({:?})", namespace.map(|value| value.0))
+        }
         OperationKind::ClassNamespaceSet {
             namespace,
             name,
@@ -1220,6 +1378,10 @@ fn render_terminator(terminator: &Terminator) -> String {
         }
         Terminator::Return { code } => format!("# return {code}"),
         Terminator::ReturnValue { value } => format!("# return {value:?}"),
+        Terminator::Yield {
+            value,
+            resume_target,
+        } => format!("# yield {value:?} -> block{}", resume_target.0),
         Terminator::Unreachable => "# unreachable".to_owned(),
     }
 }
@@ -1253,6 +1415,7 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
         | OperationKind::Compare { left, right, .. } => {
             vec![*left, *right]
         }
+        OperationKind::FormatValue { value, spec, .. } => vec![*value, *spec],
         OperationKind::Print { values } => values.clone(),
         OperationKind::ValueArray { values, .. }
         | OperationKind::Tuple { values, .. }
@@ -1261,7 +1424,14 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
         OperationKind::Dictionary { keys, values, .. } => {
             keys.iter().chain(values).copied().collect()
         }
+        OperationKind::ListAppend { list, value } => vec![*list, *value],
         OperationKind::DictionaryMerge { dictionary, source } => vec![*dictionary, *source],
+        OperationKind::DictionaryInsert {
+            dictionary,
+            key,
+            value,
+        } => vec![*dictionary, *key, *value],
+        OperationKind::SetInsert { set, value } => vec![*set, *value],
         OperationKind::SliceNew {
             start, stop, step, ..
         } => start
@@ -1290,6 +1460,12 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
         } => vec![*collection, *index, *value],
         OperationKind::ItemDelete { collection, index } => vec![*collection, *index],
         OperationKind::ValueArrayGet { array, .. } => vec![*array],
+        OperationKind::PatternSequence { subject, .. }
+        | OperationKind::PatternMappingCheck { subject, .. } => vec![*subject],
+        OperationKind::PatternMapping { subject, keys, .. } => std::iter::once(*subject)
+            .chain(keys.iter().copied())
+            .collect(),
+        OperationKind::PatternClass { subject, class, .. } => vec![*subject, *class],
         OperationKind::MakeFunction {
             defaults, closure, ..
         } => defaults
@@ -1298,6 +1474,7 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
             .chain(closure.iter().copied())
             .collect(),
         OperationKind::ClassNamespaceNew { .. } => Vec::new(),
+        OperationKind::AnnotationsEnsure { namespace } => namespace.iter().copied().collect(),
         OperationKind::ClassNamespaceSet {
             namespace, value, ..
         } => vec![*namespace, *value],
@@ -1330,7 +1507,9 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
             arguments, value, ..
         } => vec![*arguments, *value],
         OperationKind::CallPrepared {
-            callable, arguments, ..
+            callable,
+            arguments,
+            ..
         } => vec![*callable, *arguments],
         OperationKind::CallModuleChunk { .. } => Vec::new(),
         OperationKind::CellNew { initial, .. } => initial.iter().copied().collect(),
@@ -1386,8 +1565,59 @@ fn verify_terminator(
             }
             Ok(())
         }
+        Terminator::Yield {
+            value,
+            resume_target,
+        } => {
+            if program.kind != FunctionKind::Generator {
+                return Err("MIR yield terminator is only valid in generator functions".to_owned());
+            }
+            verify_value(*value, program.value_count)?;
+            verify_edge(program, block_index, *resume_target, &[])
+        }
         Terminator::Unreachable => Err(format!("MIR block {block_index} is unterminated")),
     }
+}
+
+pub fn generator_persistent_values(function: &Function) -> Result<Vec<ValueId>, String> {
+    if function.kind != FunctionKind::Generator {
+        return Ok(Vec::new());
+    }
+    verify_function(function)?;
+    let mut live_in = vec![BTreeSet::new(); function.blocks.len()];
+    loop {
+        let mut changed = false;
+        for (block_index, block) in function.blocks.iter().enumerate().rev() {
+            let mut live = successor_live_values(function, block, &live_in);
+            live.extend(terminator_inputs(&block.terminator));
+            for operation in block.operations.iter().rev() {
+                for destination in operation.kind.destinations() {
+                    live.remove(&destination);
+                }
+                live.extend(operation_inputs(&operation.kind));
+            }
+            for parameter in &block.parameters {
+                live.remove(parameter);
+            }
+            if live != live_in[block_index] {
+                live_in[block_index] = live;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut persistent = BTreeSet::new();
+    for block in &function.blocks {
+        if let Terminator::Yield { resume_target, .. } = block.terminator {
+            persistent.extend(live_in[resume_target.0 as usize].iter().copied());
+        }
+    }
+    for parameter in &function.parameters {
+        persistent.insert(parameter.value);
+    }
+    Ok(persistent.into_iter().collect())
 }
 
 fn verify_edge(
@@ -1785,6 +2015,78 @@ mod tests {
         assert_eq!(
             plan.terminator_roots(1),
             Some([ValueId(1), ValueId(2)].as_slice())
+        );
+    }
+
+    #[test]
+    fn generator_yield_verification_and_persistent_liveness_are_explicit() {
+        let parameter = Parameter {
+            value: ValueId(0),
+            name: ".0".to_owned(),
+            kind: RParameterKind::PositionalOnly,
+            has_default: false,
+        };
+        let program = Function {
+            kind: FunctionKind::Generator,
+            name: "<genexpr>".to_owned(),
+            qualified_name: "<genexpr>".to_owned(),
+            parameters: vec![parameter],
+            entry: BlockId(0),
+            value_count: 3,
+            exception_edges: BTreeMap::new(),
+            blocks: vec![
+                Block {
+                    parameters: vec![],
+                    operations: vec![
+                        Operation {
+                            span: Span::default(),
+                            kind: OperationKind::Constant {
+                                dest: ValueId(1),
+                                value: Constant::String("yielded".to_owned()),
+                            },
+                        },
+                        Operation {
+                            span: Span::default(),
+                            kind: OperationKind::Constant {
+                                dest: ValueId(2),
+                                value: Constant::String("dead-before-yield".to_owned()),
+                            },
+                        },
+                    ],
+                    terminator: Terminator::Yield {
+                        value: ValueId(1),
+                        resume_target: BlockId(1),
+                    },
+                },
+                Block {
+                    parameters: vec![],
+                    operations: vec![Operation {
+                        span: Span::default(),
+                        kind: OperationKind::Print {
+                            values: vec![ValueId(0)],
+                        },
+                    }],
+                    terminator: Terminator::ReturnValue { value: None },
+                },
+            ],
+        };
+        verify_function(&program).unwrap();
+        let plan = safepoint_plan(&program).unwrap();
+        assert_eq!(
+            plan.terminator_roots(0),
+            Some([ValueId(0), ValueId(1)].as_slice())
+        );
+        assert_eq!(
+            generator_persistent_values(&program).unwrap(),
+            vec![ValueId(0)]
+        );
+
+        let mut invalid = program.clone();
+        invalid.kind = FunctionKind::Python;
+        assert!(
+            verify_function(&invalid)
+                .unwrap_err()
+                .contains("only valid in generator functions")
         );
     }
 

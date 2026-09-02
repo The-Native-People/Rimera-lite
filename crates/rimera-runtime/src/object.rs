@@ -32,6 +32,7 @@ pub struct FunctionObject {
     pub qualified_name: String,
     pub parameters: Box<[Parameter]>,
     pub closure: Box<[RValue]>,
+    pub annotations: Option<RValue>,
 }
 
 /// Persistent execution state for one compiled synchronous generator.
@@ -688,7 +689,8 @@ impl ManagedObject {
                     .iter()
                     .filter_map(|parameter| parameter.default)
                     .for_each(&mut *visitor);
-                object.closure.iter().copied().for_each(visitor);
+                object.closure.iter().copied().for_each(&mut *visitor);
+                object.annotations.into_iter().for_each(visitor);
             }
             Self::Generator(object) => {
                 visitor(object.function);
@@ -809,7 +811,7 @@ impl ManagedObject {
                         .map(|(name, _)| name.capacity())
                         .sum::<usize>(),
                 ),
-            Self::Property(_) => size_of::<PropertyObject>(), 
+            Self::Property(_) => size_of::<PropertyObject>(),
             Self::PropertyMethod(_) => size_of::<PropertyMethodObject>(),
             Self::StaticMethod(_) => size_of::<StaticMethodObject>(),
             Self::ClassMethod(_) => size_of::<ClassMethodObject>(),

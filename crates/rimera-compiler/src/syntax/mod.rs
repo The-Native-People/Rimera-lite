@@ -5,6 +5,7 @@ pub use rimera_abi::{
     RBinaryOperator as BinaryOperator, RCompareOperator as CompareOperator,
     RUnaryOperator as UnaryOperator,
 };
+use rustpython_parser::ast::Ranged;
 use rustpython_parser::{Parse, ast};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,10 +41,21 @@ pub enum StatementKind {
     Delete {
         targets: Vec<Target>,
     },
+    AnnAssign {
+        target: Target,
+        annotation: Expression,
+        value: Option<Expression>,
+        simple: bool,
+    },
+    Assert {
+        test: Expression,
+        message: Option<Expression>,
+    },
     FunctionDef {
         name: String,
         decorators: Vec<Expression>,
         parameters: Vec<Parameter>,
+        return_annotation: Option<Expression>,
         body: Vec<Statement>,
     },
     ClassDef {
@@ -91,6 +103,49 @@ pub enum StatementKind {
         body: Vec<Statement>,
         else_body: Vec<Statement>,
     },
+    Match {
+        subject: Expression,
+        cases: Vec<MatchCase>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchCase {
+    pub pattern: Pattern,
+    pub guard: Option<Expression>,
+    pub body: Vec<Statement>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    pub span: Span,
+    pub kind: PatternKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum PatternKind {
+    Value(Expression),
+    SingletonNone,
+    SingletonBool(bool),
+    Capture(String),
+    Wildcard,
+    As {
+        pattern: Box<Pattern>,
+        name: String,
+    },
+    Or(Vec<Pattern>),
+    Sequence(Vec<Pattern>),
+    Star(Option<String>),
+    Mapping {
+        keys: Vec<Expression>,
+        patterns: Vec<Pattern>,
+        rest: Option<String>,
+    },
+    Class {
+        class: Expression,
+        positional: Vec<Pattern>,
+        keywords: Vec<(String, Pattern)>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +190,7 @@ pub struct Parameter {
     pub name: String,
     pub kind: ParameterKind,
     pub default: Option<Expression>,
+    pub annotation: Option<Expression>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +220,29 @@ pub enum CallPart {
     Starred(Expression),
     Keyword { name: String, value: Expression },
     KeywordUnpack(Expression),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatConversion {
+    None,
+    Str,
+    Repr,
+    Ascii,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComprehensionKind {
+    List,
+    Set,
+    Dictionary,
+    Generator,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComprehensionClause {
+    pub target: Target,
+    pub iterable: Expression,
+    pub filters: Vec<Expression>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,9 +293,24 @@ pub enum ExpressionKind {
         right: Box<Expression>,
     },
     Compare {
-        op: CompareOperator,
         left: Box<Expression>,
-        right: Box<Expression>,
+        comparisons: Vec<(CompareOperator, Expression)>,
+    },
+    NamedExpression {
+        name: String,
+        value: Box<Expression>,
+    },
+    Comprehension {
+        kind: ComprehensionKind,
+        element: Box<Expression>,
+        key: Option<Box<Expression>>,
+        clauses: Vec<ComprehensionClause>,
+    },
+    JoinedString(Vec<Expression>),
+    FormattedValue {
+        value: Box<Expression>,
+        conversion: FormatConversion,
+        format_spec: Option<Box<Expression>>,
     },
     Call {
         callable: Box<Expression>,
@@ -257,13 +351,12 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
     let span = span_of(statement.range());
     let kind = match statement {
         ast::Stmt::FunctionDef(node) => {
-            if node.returns.is_some() || node.type_comment.is_some() || !node.type_params.is_empty()
-            {
+            if !node.type_params.is_empty() {
                 return capability(
                     path,
                     span,
-                    "RIM-CAP-G4-13",
-                    "function annotations and type parameters are owned by Gate 4 Slice 13",
+                    "RIM-CAP-G7-01",
+                    "PEP 695 function type parameters require Gate 7 Python-visible type-parameter metadata",
                 );
             }
             StatementKind::FunctionDef {
@@ -274,6 +367,11 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
                     .map(|decorator| convert_expression(path, decorator))
                     .collect::<Result<Vec<_>, _>>()?,
                 parameters: convert_parameters(path, &node.args)?,
+                return_annotation: node
+                    .returns
+                    .as_deref()
+                    .map(|annotation| convert_expression(path, annotation))
+                    .transpose()?,
                 body: convert_statements(path, &node.body)?,
             }
         }
@@ -282,8 +380,8 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
                 return capability(
                     path,
                     span,
-                    "RIM-CAP-G4-13",
-                    "class type parameters are owned by Gate 4 Slice 13",
+                    "RIM-CAP-G7-01",
+                    "PEP 695 class type parameters require Gate 7 Python-visible type-parameter metadata",
                 );
             }
             let mut metaclass = None;
@@ -412,31 +510,42 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
             value: convert_expression(path, &node.value)?,
         },
         ast::Stmt::Expr(node) => StatementKind::Expression(convert_expression(path, &node.value)?),
-        ast::Stmt::AnnAssign(node) => {
-            let _ = convert_target(path, node.target.as_ref())?;
-            return capability(
-                path,
-                span,
-                "RIM-CAP-G4-13",
-                "annotated assignments are owned by Gate 4 Slice 13",
-            );
-        }
-        ast::Stmt::Assert(_) => {
-            return capability(
-                path,
-                span,
-                "RIM-CAP-G4-11",
-                "assert statements are owned by Gate 4 Slice 11",
-            );
-        }
-        ast::Stmt::Match(_) => {
-            return capability(
-                path,
-                span,
-                "RIM-CAP-G4-19",
-                "match control flow is owned by Gate 4 Slice 19",
-            );
-        }
+        ast::Stmt::AnnAssign(node) => StatementKind::AnnAssign {
+            target: convert_target(path, node.target.as_ref())?,
+            annotation: convert_expression(path, &node.annotation)?,
+            value: node
+                .value
+                .as_deref()
+                .map(|value| convert_expression(path, value))
+                .transpose()?,
+            simple: node.simple,
+        },
+        ast::Stmt::Assert(node) => StatementKind::Assert {
+            test: convert_expression(path, &node.test)?,
+            message: node
+                .msg
+                .as_deref()
+                .map(|message| convert_expression(path, message))
+                .transpose()?,
+        },
+        ast::Stmt::Match(node) => StatementKind::Match {
+            subject: convert_expression(path, &node.subject)?,
+            cases: node
+                .cases
+                .iter()
+                .map(|case| {
+                    Ok(MatchCase {
+                        pattern: convert_pattern(path, &case.pattern)?,
+                        guard: case
+                            .guard
+                            .as_deref()
+                            .map(|guard| convert_expression(path, guard))
+                            .transpose()?,
+                        body: convert_statements(path, &case.body)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, DiagnosticSet>>()?,
+        },
         ast::Stmt::Delete(node) => StatementKind::Delete {
             targets: node
                 .targets
@@ -511,8 +620,8 @@ fn convert_target(path: &Path, target: &ast::Expr) -> Result<Target, DiagnosticS
             return capability(
                 path,
                 span,
-                "RIM-CAP-G4-02",
-                "target shape is outside the Gate 4 recursive target model",
+                "RIM-SEMA-001",
+                "invalid assignment target shape",
             );
         }
     };
@@ -544,29 +653,11 @@ fn convert_parameters(
     path: &Path,
     arguments: &ast::Arguments,
 ) -> Result<Vec<Parameter>, DiagnosticSet> {
-    use ast::Ranged;
-
     fn convert(
         path: &Path,
         argument: &ast::ArgWithDefault,
         kind: ParameterKind,
     ) -> Result<Parameter, DiagnosticSet> {
-        if let Some(annotation) = argument.def.annotation.as_deref() {
-            return capability(
-                path,
-                span_of(annotation.range()),
-                "RIM-CAP-G4-13",
-                "parameter annotations are owned by Gate 4 Slice 13",
-            );
-        }
-        if argument.def.type_comment.is_some() {
-            return capability(
-                path,
-                span_of(argument.def.range()),
-                "RIM-CAP-G4-13",
-                "parameter type comments are owned by Gate 4 Slice 13",
-            );
-        }
         Ok(Parameter {
             name: argument.def.arg.to_string(),
             kind,
@@ -574,6 +665,12 @@ fn convert_parameters(
                 .default
                 .as_deref()
                 .map(|default| convert_expression(path, default))
+                .transpose()?,
+            annotation: argument
+                .def
+                .annotation
+                .as_deref()
+                .map(|annotation| convert_expression(path, annotation))
                 .transpose()?,
         })
     }
@@ -585,52 +682,30 @@ fn convert_parameters(
         parameters.push(convert(path, argument, ParameterKind::PositionalOrKeyword)?);
     }
     if let Some(argument) = &arguments.vararg {
-        if let Some(annotation) = argument.annotation.as_deref() {
-            return capability(
-                path,
-                span_of(annotation.range()),
-                "RIM-CAP-G4-13",
-                "parameter annotations are owned by Gate 4 Slice 13",
-            );
-        }
-        if argument.type_comment.is_some() {
-            return capability(
-                path,
-                span_of(argument.range()),
-                "RIM-CAP-G4-13",
-                "parameter type comments are owned by Gate 4 Slice 13",
-            );
-        }
         parameters.push(Parameter {
             name: argument.arg.to_string(),
             kind: ParameterKind::VarArgs,
             default: None,
+            annotation: argument
+                .annotation
+                .as_deref()
+                .map(|annotation| convert_expression(path, annotation))
+                .transpose()?,
         });
     }
     for argument in &arguments.kwonlyargs {
         parameters.push(convert(path, argument, ParameterKind::KeywordOnly)?);
     }
     if let Some(argument) = &arguments.kwarg {
-        if let Some(annotation) = argument.annotation.as_deref() {
-            return capability(
-                path,
-                span_of(annotation.range()),
-                "RIM-CAP-G4-13",
-                "parameter annotations are owned by Gate 4 Slice 13",
-            );
-        }
-        if argument.type_comment.is_some() {
-            return capability(
-                path,
-                span_of(argument.range()),
-                "RIM-CAP-G4-13",
-                "parameter type comments are owned by Gate 4 Slice 13",
-            );
-        }
         parameters.push(Parameter {
             name: argument.arg.to_string(),
             kind: ParameterKind::VarKeywords,
             default: None,
+            annotation: argument
+                .annotation
+                .as_deref()
+                .map(|annotation| convert_expression(path, annotation))
+                .transpose()?,
         });
     }
     Ok(parameters)
@@ -667,6 +742,8 @@ fn convert_class_body(
                 | StatementKind::AugAssign { .. }
                 | StatementKind::For { .. }
                 | StatementKind::Delete { .. }
+                | StatementKind::AnnAssign { .. }
+                | StatementKind::Assert { .. }
                 | StatementKind::Raise { .. }
                 | StatementKind::Try { .. }
                 | StatementKind::ClassDef { .. }
@@ -680,6 +757,34 @@ fn convert_class_body(
         body.push(converted);
     }
     Ok(body)
+}
+
+fn convert_comprehension_clauses(
+    path: &Path,
+    generators: &[ast::Comprehension],
+) -> Result<Vec<ComprehensionClause>, DiagnosticSet> {
+    generators
+        .iter()
+        .map(|generator| {
+            if generator.is_async {
+                return capability(
+                    path,
+                    Span::default(),
+                    "RIM-CAP-ASYNC-001",
+                    "asynchronous comprehensions are owned by the async compatibility gate",
+                );
+            }
+            Ok(ComprehensionClause {
+                target: convert_target(path, &generator.target)?,
+                iterable: convert_expression(path, &generator.iter)?,
+                filters: generator
+                    .ifs
+                    .iter()
+                    .map(|filter| convert_expression(path, filter))
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        })
+        .collect()
 }
 
 fn convert_expression(path: &Path, expression: &ast::Expr) -> Result<Expression, DiagnosticSet> {
@@ -808,100 +913,97 @@ fn convert_expression(path: &Path, expression: &ast::Expr) -> Result<Expression,
                 right: Box::new(convert_expression(path, &node.right)?),
             }
         }
-        ast::Expr::Compare(node) if node.ops.len() == 1 && node.comparators.len() == 1 => {
-            let op = match node.ops[0] {
-                ast::CmpOp::Eq => CompareOperator::Equal,
-                ast::CmpOp::NotEq => CompareOperator::NotEqual,
-                ast::CmpOp::Lt => CompareOperator::Less,
-                ast::CmpOp::LtE => CompareOperator::LessEqual,
-                ast::CmpOp::Gt => CompareOperator::Greater,
-                ast::CmpOp::GtE => CompareOperator::GreaterEqual,
-                ast::CmpOp::In => CompareOperator::In,
-                ast::CmpOp::NotIn => CompareOperator::NotIn,
-                ast::CmpOp::Is => CompareOperator::Is,
-                ast::CmpOp::IsNot => CompareOperator::IsNot,
-            };
+        ast::Expr::Compare(node) => {
+            let comparisons = node
+                .ops
+                .iter()
+                .zip(&node.comparators)
+                .map(|(op, comparator)| {
+                    let op = match op {
+                        ast::CmpOp::Eq => CompareOperator::Equal,
+                        ast::CmpOp::NotEq => CompareOperator::NotEqual,
+                        ast::CmpOp::Lt => CompareOperator::Less,
+                        ast::CmpOp::LtE => CompareOperator::LessEqual,
+                        ast::CmpOp::Gt => CompareOperator::Greater,
+                        ast::CmpOp::GtE => CompareOperator::GreaterEqual,
+                        ast::CmpOp::In => CompareOperator::In,
+                        ast::CmpOp::NotIn => CompareOperator::NotIn,
+                        ast::CmpOp::Is => CompareOperator::Is,
+                        ast::CmpOp::IsNot => CompareOperator::IsNot,
+                    };
+                    Ok((op, convert_expression(path, comparator)?))
+                })
+                .collect::<Result<Vec<_>, DiagnosticSet>>()?;
             ExpressionKind::Compare {
-                op,
                 left: Box::new(convert_expression(path, &node.left)?),
-                right: Box::new(convert_expression(path, &node.comparators[0])?),
+                comparisons,
             }
-        }
-        ast::Expr::Compare(_) => {
-            return capability(
-                path,
-                span,
-                "RIM-CAP-G4-09",
-                "comparison chains are owned by Gate 4 Slice 9",
-            );
         }
         ast::Expr::NamedExpr(node) => {
-            let _ = convert_target(path, node.target.as_ref())?;
-            return capability(
-                path,
-                span,
-                "RIM-CAP-G4-12",
-                "assignment expressions are owned by Gate 4 Slice 12",
-            );
-        }
-        ast::Expr::ListComp(node) => {
-            for generator in &node.generators {
-                let _ = convert_target(path, &generator.target)?;
+            let target = convert_target(path, node.target.as_ref())?;
+            let TargetKind::Name(name) = target.kind else {
+                return unsupported(
+                    path,
+                    target.span,
+                    "assignment-expression targets must be names",
+                );
+            };
+            ExpressionKind::NamedExpression {
+                name,
+                value: Box::new(convert_expression(path, &node.value)?),
             }
-            return capability(
-                path,
-                span,
-                "RIM-CAP-G4-16",
-                "list comprehensions are owned by Gate 4 Slice 16",
-            );
         }
-        ast::Expr::SetComp(node) => {
-            for generator in &node.generators {
-                let _ = convert_target(path, &generator.target)?;
-            }
-            return capability(
-                path,
-                span,
-                "RIM-CAP-G4-17",
-                "set comprehensions are owned by Gate 4 Slice 17",
-            );
-        }
-        ast::Expr::DictComp(node) => {
-            for generator in &node.generators {
-                let _ = convert_target(path, &generator.target)?;
-            }
-            return capability(
-                path,
-                span,
-                "RIM-CAP-G4-17",
-                "dictionary comprehensions are owned by Gate 4 Slice 17",
-            );
-        }
-        ast::Expr::GeneratorExp(node) => {
-            for generator in &node.generators {
-                let _ = convert_target(path, &generator.target)?;
-            }
-            return capability(
-                path,
-                span,
-                "RIM-CAP-G4-18",
-                "generator expressions are owned by Gate 4 Slice 18",
-            );
-        }
-        ast::Expr::JoinedStr(_) | ast::Expr::FormattedValue(_) => {
-            return capability(
-                path,
-                span,
-                "RIM-CAP-G4-14",
-                "formatted strings are owned by Gate 4 Slice 14",
-            );
-        }
+        ast::Expr::ListComp(node) => ExpressionKind::Comprehension {
+            kind: ComprehensionKind::List,
+            element: Box::new(convert_expression(path, &node.elt)?),
+            key: None,
+            clauses: convert_comprehension_clauses(path, &node.generators)?,
+        },
+        ast::Expr::SetComp(node) => ExpressionKind::Comprehension {
+            kind: ComprehensionKind::Set,
+            element: Box::new(convert_expression(path, &node.elt)?),
+            key: None,
+            clauses: convert_comprehension_clauses(path, &node.generators)?,
+        },
+        ast::Expr::DictComp(node) => ExpressionKind::Comprehension {
+            kind: ComprehensionKind::Dictionary,
+            element: Box::new(convert_expression(path, &node.value)?),
+            key: Some(Box::new(convert_expression(path, &node.key)?)),
+            clauses: convert_comprehension_clauses(path, &node.generators)?,
+        },
+        ast::Expr::GeneratorExp(node) => ExpressionKind::Comprehension {
+            kind: ComprehensionKind::Generator,
+            element: Box::new(convert_expression(path, &node.elt)?),
+            key: None,
+            clauses: convert_comprehension_clauses(path, &node.generators)?,
+        },
+        ast::Expr::JoinedStr(node) => ExpressionKind::JoinedString(
+            node.values
+                .iter()
+                .map(|value| convert_expression(path, value))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        ast::Expr::FormattedValue(node) => ExpressionKind::FormattedValue {
+            value: Box::new(convert_expression(path, &node.value)?),
+            conversion: match node.conversion {
+                ast::ConversionFlag::None => FormatConversion::None,
+                ast::ConversionFlag::Str => FormatConversion::Str,
+                ast::ConversionFlag::Repr => FormatConversion::Repr,
+                ast::ConversionFlag::Ascii => FormatConversion::Ascii,
+            },
+            format_spec: node
+                .format_spec
+                .as_deref()
+                .map(|spec| convert_expression(path, spec))
+                .transpose()?
+                .map(Box::new),
+        },
         ast::Expr::Starred(_) => {
             return capability(
                 path,
                 span,
-                "RIM-CAP-G4-04",
-                "standalone starred expressions are owned by Gate 4 Slice 4",
+                "RIM-SEMA-001",
+                "starred expression is not valid in this expression context",
             );
         }
         ast::Expr::Call(node) => {
@@ -946,6 +1048,79 @@ fn convert_expression(path: &Path, expression: &ast::Expr) -> Result<Expression,
         }
     };
     Ok(Expression { span, kind })
+}
+
+fn convert_pattern(path: &Path, pattern: &ast::Pattern) -> Result<Pattern, DiagnosticSet> {
+    let span = span_of(pattern.range());
+    let kind = match pattern {
+        ast::Pattern::MatchValue(node) => {
+            PatternKind::Value(convert_expression(path, &node.value)?)
+        }
+        ast::Pattern::MatchSingleton(node) => match node.value {
+            ast::Constant::None => PatternKind::SingletonNone,
+            ast::Constant::Bool(value) => PatternKind::SingletonBool(value),
+            _ => {
+                return unsupported(path, span, "unsupported singleton pattern");
+            }
+        },
+        ast::Pattern::MatchAs(node) => match (&node.pattern, &node.name) {
+            (None, None) => PatternKind::Wildcard,
+            (None, Some(name)) => PatternKind::Capture(name.to_string()),
+            (Some(pattern), Some(name)) => PatternKind::As {
+                pattern: Box::new(convert_pattern(path, pattern)?),
+                name: name.to_string(),
+            },
+            (Some(pattern), None) => return convert_pattern(path, pattern),
+        },
+        ast::Pattern::MatchOr(node) => PatternKind::Or(
+            node.patterns
+                .iter()
+                .map(|pattern| convert_pattern(path, pattern))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        ast::Pattern::MatchSequence(node) => PatternKind::Sequence(
+            node.patterns
+                .iter()
+                .map(|pattern| convert_pattern(path, pattern))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        ast::Pattern::MatchStar(node) => {
+            PatternKind::Star(node.name.as_ref().map(ToString::to_string))
+        }
+        ast::Pattern::MatchMapping(node) => PatternKind::Mapping {
+            keys: node
+                .keys
+                .iter()
+                .map(|key| convert_expression(path, key))
+                .collect::<Result<Vec<_>, _>>()?,
+            patterns: node
+                .patterns
+                .iter()
+                .map(|pattern| convert_pattern(path, pattern))
+                .collect::<Result<Vec<_>, _>>()?,
+            rest: node.rest.as_ref().map(ToString::to_string),
+        },
+        ast::Pattern::MatchClass(node) => {
+            if node.kwd_attrs.len() != node.kwd_patterns.len() {
+                return unsupported(path, span, "class-pattern keyword arity is invalid");
+            }
+            PatternKind::Class {
+                class: convert_expression(path, &node.cls)?,
+                positional: node
+                    .patterns
+                    .iter()
+                    .map(|pattern| convert_pattern(path, pattern))
+                    .collect::<Result<Vec<_>, _>>()?,
+                keywords: node
+                    .kwd_attrs
+                    .iter()
+                    .zip(&node.kwd_patterns)
+                    .map(|(name, pattern)| Ok((name.to_string(), convert_pattern(path, pattern)?)))
+                    .collect::<Result<Vec<_>, DiagnosticSet>>()?,
+            }
+        }
+    };
+    Ok(Pattern { span, kind })
 }
 
 fn span_of(range: rustpython_parser::text_size::TextRange) -> Span {
@@ -1018,37 +1193,29 @@ mod tests {
 
     #[test]
     fn gate4_owned_syntax_has_stable_slice_diagnostics_and_spans() {
-        for (source, expected_code) in [
-            ("a < b < c\n", "RIM-CAP-G4-09"),
-            ("assert value\n", "RIM-CAP-G4-11"),
-            ("(value := 1)\n", "RIM-CAP-G4-12"),
-            ("value: int = 1\n", "RIM-CAP-G4-13"),
-            ("def f(value: int):\n    return value\n", "RIM-CAP-G4-13"),
-            ("f'{value}'\n", "RIM-CAP-G4-14"),
-            ("[item for item in values]\n", "RIM-CAP-G4-16"),
-            ("{item for item in values}\n", "RIM-CAP-G4-17"),
-            ("{item: item for item in values}\n", "RIM-CAP-G4-17"),
-            ("(item for item in values)\n", "RIM-CAP-G4-18"),
-            ("match value:\n    case 1:\n        pass\n", "RIM-CAP-G4-19"),
-        ] {
-            let diagnostics = parse(path(), source).unwrap_err();
-            let diagnostic = &diagnostics.as_slice()[0];
-            assert_eq!(diagnostic.code, expected_code, "source: {source}");
-            assert!(
-                diagnostic.span.end > diagnostic.span.start,
-                "source: {source}"
-            );
-        }
-
         for source in [
+            "(value := 1)\n",
+            "value: int = 1\n",
+            "def f(value: int) -> int:\n    return value\n",
+            "f'{value}'\n",
+            "[item for item in values]\n",
+            "{item for item in values}\n",
+            "{item: item for item in values}\n",
+            "(item for item in values)\n",
+            "match value:\n    case 1 | 2 as chosen if chosen:\n        result = chosen\n    case _:\n        result = 0\n",
+            "match value:\n    case [left, *middle, right]:\n        result = middle\n",
+            "match value:\n    case {'key': captured, **rest}:\n        result = captured\n",
+            "match value:\n    case Thing(first, named=second):\n        result = first\n",
             "name = 1\n",
             "obj.attr = 1\n",
             "items[0] = 1\n",
             "left, right = [1, 2]\n",
             "left, *tail = [1, 2]\n",
             "a and b\n",
+            "a < b < c\n",
             "items[1:2]\n",
             "del items[0]\n",
+            "assert value, message\n",
             "value = {'first': 1, **other, 'last': 2}\n",
             "f(1, *args, named=2, **kwargs)\n",
         ] {

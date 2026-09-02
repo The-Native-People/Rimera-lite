@@ -76,6 +76,7 @@ const LAZY_BUILTIN_EXCEPTIONS: &[(&str, &str)] = &[
     ("KeyError", "Exception"),
     ("OverflowError", "Exception"),
     ("BufferError", "Exception"),
+    ("AssertionError", "Exception"),
     ("GeneratorExit", "BaseException"),
     ("StopIteration", "Exception"),
 ];
@@ -117,6 +118,7 @@ fn is_public_builtin_type_name(name: &str) -> bool {
             | "KeyError"
             | "OverflowError"
             | "BufferError"
+            | "AssertionError"
             | "GeneratorExit"
             | "StopIteration"
     )
@@ -638,7 +640,7 @@ impl RimeraContext {
                 Some(HeapObject::Generator(_)) => "generator",
                 Some(HeapObject::BoundMethod(_)) => "function",
                 Some(HeapObject::CallArguments(_)) => "object",
-                Some(HeapObject::Property(_)
+                Some(HeapObject::Property(_))
                 | Some(HeapObject::StaticMethod(_))
                 | Some(HeapObject::ClassMethod(_)) => "object",
                 Some(HeapObject::PropertyMethod(_)) => "builtin_function_or_method",
@@ -1367,7 +1369,10 @@ impl RimeraContext {
             return Err("generator already executing".to_owned());
         }
         if completed || closed {
-            return Err("generator is already exhausted".to_owned());
+            return Ok(GeneratorResume {
+                value: RValue::NONE,
+                outcome: RGeneratorOutcome::Returned,
+            });
         }
         if !started && matches!(operation, RGeneratorOperation::Send) && input != RValue::NONE {
             return Err("can't send non-None value to a just-started generator".to_owned());
@@ -1403,6 +1408,11 @@ impl RimeraContext {
                 object.return_value = Some(output);
                 object.delegate = None;
                 object.slots.fill(None);
+            } else if status == RStatus::Exception {
+                object.completed = true;
+                object.return_value = None;
+                object.delegate = None;
+                object.slots.fill(None);
             }
         }
         match status {
@@ -1420,6 +1430,30 @@ impl RimeraContext {
         self.allocate(HeapObject::Dictionary(DictionaryObject {
             entries: Vec::new(),
         }))
+    }
+
+    pub(crate) fn ensure_annotations(&mut self, namespace: Option<RValue>) -> Result<(), String> {
+        self.initialize_kernel()?;
+        let namespace = namespace
+            .or_else(|| self.globals())
+            .ok_or_else(|| "annotation namespace is unavailable".to_owned())?;
+        if self.namespace_value(namespace, "__annotations__").is_some() {
+            return Ok(());
+        }
+        if !matches!(
+            self.heap.get(namespace),
+            Some(HeapObject::Dictionary(_) | HeapObject::ValueDictionary(_))
+        ) {
+            match self.namespace_get(namespace, "__annotations__") {
+                Ok(_) => return Ok(()),
+                Err(_) if self.consume_exception_type("KeyError") => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let annotations = crate::operations::dictionary(self, &[], &[])?;
+        self.with_temporary_roots(&[namespace, annotations], |context| {
+            context.namespace_set(namespace, "__annotations__", annotations)
+        })
     }
 
     pub(crate) fn namespace_set(
@@ -1555,6 +1589,24 @@ impl RimeraContext {
     }
 
     pub(crate) fn attribute_get(&mut self, receiver: RValue, name: &str) -> Result<RValue, String> {
+        if matches!(self.heap.get(receiver), Some(HeapObject::Function(_))) {
+            if name != "__annotations__" {
+                return Err(format!("'function' object has no attribute '{name}'"));
+            }
+            let existing = match self.heap.get(receiver) {
+                Some(HeapObject::Function(function)) => function.annotations,
+                _ => unreachable!("function receiver was checked"),
+            };
+            if let Some(annotations) = existing {
+                return Ok(annotations);
+            }
+            let annotations = crate::operations::dictionary(self, &[], &[])?;
+            let Some(HeapObject::Function(function)) = self.heap.get_mut(receiver) else {
+                return Err("function disappeared while creating annotations".to_owned());
+            };
+            function.annotations = Some(annotations);
+            return Ok(annotations);
+        }
         match self.heap.get(receiver) {
             Some(HeapObject::Float(_)) => match name {
                 "real" => Ok(receiver),
@@ -2128,6 +2180,24 @@ impl RimeraContext {
         name: &str,
         value: RValue,
     ) -> Result<(), String> {
+        if matches!(self.heap.get(receiver), Some(HeapObject::Function(_))) {
+            if name != "__annotations__" {
+                return Err(format!("'function' object has no attribute '{name}'"));
+            }
+            let annotations = if value == RValue::NONE {
+                None
+            } else if matches!(self.heap.get(value), Some(HeapObject::ValueDictionary(_))) {
+                Some(value)
+            } else {
+                return self
+                    .raise_error("TypeError", "__annotations__ must be set to a dict object");
+            };
+            let Some(HeapObject::Function(function)) = self.heap.get_mut(receiver) else {
+                return Err("function disappeared while setting annotations".to_owned());
+            };
+            function.annotations = annotations;
+            return Ok(());
+        }
         let (namespace, class_receiver, class) = match self.heap.get(receiver) {
             Some(HeapObject::Instance(instance)) => (instance.dictionary, false, instance.class),
             Some(HeapObject::Type(class)) => (Some(class.namespace), true, receiver),
@@ -2172,6 +2242,16 @@ impl RimeraContext {
     }
 
     pub(crate) fn attribute_delete(&mut self, receiver: RValue, name: &str) -> Result<(), String> {
+        if matches!(self.heap.get(receiver), Some(HeapObject::Function(_))) {
+            if name != "__annotations__" {
+                return Err(format!("'function' object has no attribute '{name}'"));
+            }
+            let Some(HeapObject::Function(function)) = self.heap.get_mut(receiver) else {
+                return Err("function disappeared while deleting annotations".to_owned());
+            };
+            function.annotations = None;
+            return Ok(());
+        }
         let (namespace, label, class_receiver, class) = match self.heap.get(receiver) {
             Some(HeapObject::Instance(instance)) => (
                 instance.dictionary,
@@ -2509,7 +2589,11 @@ impl RimeraContext {
         }
         match op {
             0 => Ok(RValue::boolean(left == right)),
-            1 => Ok(RValue::boolean(left != right)),
+            1 => {
+                let equal = self.generic_compare(0, left, right)?;
+                let equal = crate::operations::truthy(self, equal)?;
+                Ok(RValue::boolean(!equal))
+            }
             _ => {
                 let left_name = self.type_of(left).map(|value| self.type_name(value))?;
                 let right_name = self.type_of(right).map(|value| self.type_name(value))?;

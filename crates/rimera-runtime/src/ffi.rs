@@ -5,7 +5,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 use rimera_abi::{
-    ABI_VERSION, RCallArgumentKind, RCallArguments, RParameterSpec, RRootFrame, RStatus, RValue,
+    ABI_VERSION, RCallArgumentKind, RCallArguments, RFormatConversion, RParameterSpec, RRootFrame,
+    RStatus, RValue,
 };
 
 use crate::heap::HeapObject;
@@ -102,6 +103,44 @@ fn with_output(
                 "RuntimeError"
             };
             record_exception(context, exception_type, message);
+            Err(RStatus::Exception)
+        }
+    })
+}
+
+fn with_pattern_output(
+    context: *mut RimeraContext,
+    output: *mut RValue,
+    matched: *mut u8,
+    operation: impl FnOnce(&mut RimeraContext) -> Result<Option<RValue>, String>,
+) -> RStatus {
+    if output.is_null() || matched.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    protect(context, |context| match operation(context) {
+        Ok(Some(value)) => {
+            unsafe {
+                output.write(value);
+                matched.write(1);
+            }
+            Ok(())
+        }
+        Ok(None) => {
+            unsafe {
+                output.write(RValue::NONE);
+                matched.write(0);
+            }
+            Ok(())
+        }
+        Err(message) => {
+            if context.raised.is_none() {
+                let exception_type = if message == "managed heap limit exceeded" {
+                    "MemoryError"
+                } else {
+                    "TypeError"
+                };
+                record_exception(context, exception_type, message);
+            }
             Err(RStatus::Exception)
         }
     })
@@ -293,6 +332,7 @@ pub unsafe extern "C" fn rimera_function_new(
                 qualified_name: qualified_name.to_owned(),
                 parameters: converted.into_boxed_slice(),
                 closure: closure.to_vec().into_boxed_slice(),
+                annotations: None,
             }))
         })
     })
@@ -412,6 +452,119 @@ pub unsafe extern "C" fn rimera_generator_resume(
             RStatus::Exception
         }
     }
+}
+
+/// Reads the compiled function owned by a suspended generator.
+///
+/// # Safety
+/// `generator` must be readable and `output` writable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_generator_function_get(
+    context: *mut RimeraContext,
+    generator: *const RValue,
+    output: *mut RValue,
+) -> RStatus {
+    if context.is_null() || generator.is_null() || output.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let (context, generator) = unsafe { (&mut *context, *generator) };
+    let Some(HeapObject::Generator(generator)) = context.heap.get(generator) else {
+        return RStatus::InvalidArgument;
+    };
+    unsafe { output.write(generator.function) };
+    RStatus::Ok
+}
+
+/// Reads the stable suspension state selected by generated code.
+///
+/// # Safety
+/// `generator` must be readable and `output` writable for one `u32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_generator_state_get(
+    context: *mut RimeraContext,
+    generator: *const RValue,
+    output: *mut u32,
+) -> RStatus {
+    if context.is_null() || generator.is_null() || output.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let (context, generator) = unsafe { (&mut *context, *generator) };
+    let Some(HeapObject::Generator(generator)) = context.heap.get(generator) else {
+        return RStatus::InvalidArgument;
+    };
+    unsafe { output.write(generator.state) };
+    RStatus::Ok
+}
+
+/// Publishes a stable suspension state after all live values have been saved.
+///
+/// # Safety
+/// `generator` must be readable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_generator_state_set(
+    context: *mut RimeraContext,
+    generator: *const RValue,
+    state: u32,
+) -> RStatus {
+    if context.is_null() || generator.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let (context, generator) = unsafe { (&mut *context, *generator) };
+    let Some(HeapObject::Generator(generator)) = context.heap.get_mut(generator) else {
+        return RStatus::InvalidArgument;
+    };
+    generator.state = state;
+    RStatus::Ok
+}
+
+/// Restores one compiler-planned value that is live across suspension.
+///
+/// # Safety
+/// `generator` must be readable and `output` writable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_generator_slot_get(
+    context: *mut RimeraContext,
+    generator: *const RValue,
+    index: usize,
+    output: *mut RValue,
+) -> RStatus {
+    if context.is_null() || generator.is_null() || output.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let (context, generator) = unsafe { (&mut *context, *generator) };
+    let Some(HeapObject::Generator(generator)) = context.heap.get(generator) else {
+        return RStatus::InvalidArgument;
+    };
+    let Some(value) = generator.slots.get(index).copied().flatten() else {
+        return RStatus::InvalidArgument;
+    };
+    unsafe { output.write(value) };
+    RStatus::Ok
+}
+
+/// Saves one compiler-planned value that is live across suspension.
+///
+/// # Safety
+/// `generator` and `value` must each be readable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_generator_slot_set(
+    context: *mut RimeraContext,
+    generator: *const RValue,
+    index: usize,
+    value: *const RValue,
+) -> RStatus {
+    if context.is_null() || generator.is_null() || value.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let (context, generator, value) = unsafe { (&mut *context, *generator, *value) };
+    let Some(HeapObject::Generator(generator)) = context.heap.get_mut(generator) else {
+        return RStatus::InvalidArgument;
+    };
+    let Some(slot) = generator.slots.get_mut(index) else {
+        return RStatus::InvalidArgument;
+    };
+    *slot = Some(value);
+    RStatus::Ok
 }
 
 /// Creates a mutable closure cell. A null `initial` creates an unbound cell.
@@ -714,6 +867,32 @@ pub unsafe extern "C" fn rimera_namespace_new(
     output: *mut RValue,
 ) -> RStatus {
     with_output(context, output, RimeraContext::namespace_new)
+}
+
+/// Ensures `__annotations__` exists in globals or a prepared class namespace.
+/// Existing mappings are preserved.
+///
+/// # Safety
+/// When non-null, `namespace` must point to a readable live `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_annotations_ensure(
+    context: *mut RimeraContext,
+    namespace: *const RValue,
+) -> RStatus {
+    let namespace = if namespace.is_null() {
+        None
+    } else {
+        // SAFETY: non-null was checked and the input is read-only for this call.
+        Some(unsafe { *namespace })
+    };
+    protect(context, |context| {
+        context.ensure_annotations(namespace).map_err(|message| {
+            if context.raised.is_none() {
+                record_exception(context, "TypeError", message);
+            }
+            RStatus::Exception
+        })
+    })
 }
 
 /// Stores one named value in a class namespace.
@@ -1746,6 +1925,34 @@ pub unsafe extern "C" fn rimera_list_new(
     with_output(context, output, |context| operations::list(context, values))
 }
 
+/// Appends one value to the exact list owned by a comprehension activation.
+///
+/// # Safety
+/// `list` and `value` must be readable values owned by `context`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_list_append(
+    context: *mut RimeraContext,
+    list: *const RValue,
+    value: *const RValue,
+) -> RStatus {
+    if list.is_null() || value.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let (list, value) = unsafe { (*list, *value) };
+    protect(context, |context| {
+        match operations::list_append(context, list, value) {
+            Ok(()) => Ok(()),
+            Err(message) => {
+                if context.raised.is_some() {
+                    return Err(RStatus::Exception);
+                }
+                record_exception(context, "TypeError", message);
+                Err(RStatus::Exception)
+            }
+        }
+    })
+}
+
 /// Creates an insertion-ordered dictionary from parallel key/value arrays.
 ///
 /// # Safety
@@ -1773,6 +1980,35 @@ pub unsafe extern "C" fn rimera_dict_new(
     };
     with_output(context, output, |context| {
         operations::dictionary(context, keys, values)
+    })
+}
+
+/// Inserts or replaces one key/value pair in a comprehension dictionary.
+///
+/// # Safety
+/// All input values must be readable and owned by `context`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_dictionary_insert(
+    context: *mut RimeraContext,
+    dictionary: *const RValue,
+    key: *const RValue,
+    value: *const RValue,
+) -> RStatus {
+    if dictionary.is_null() || key.is_null() || value.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let (dictionary, key, value) = unsafe { (*dictionary, *key, *value) };
+    protect(context, |context| {
+        match operations::item_set(context, dictionary, key, value) {
+            Ok(()) => Ok(()),
+            Err(message) => {
+                if context.raised.is_some() {
+                    return Err(RStatus::Exception);
+                }
+                record_exception(context, "TypeError", message);
+                Err(RStatus::Exception)
+            }
+        }
     })
 }
 
@@ -1838,6 +2074,34 @@ pub unsafe extern "C" fn rimera_set_new(
     with_output(context, output, |context| operations::set(context, values))
 }
 
+/// Inserts one value in the exact set owned by a comprehension activation.
+///
+/// # Safety
+/// `set` and `value` must be readable values owned by `context`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_set_insert(
+    context: *mut RimeraContext,
+    set: *const RValue,
+    value: *const RValue,
+) -> RStatus {
+    if set.is_null() || value.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let (set, value) = unsafe { (*set, *value) };
+    protect(context, |context| {
+        match operations::set_add(context, set, value) {
+            Ok(()) => Ok(()),
+            Err(message) => {
+                if context.raised.is_some() {
+                    return Err(RStatus::Exception);
+                }
+                record_exception(context, "TypeError", message);
+                Err(RStatus::Exception)
+            }
+        }
+    })
+}
+
 /// Unpacks a supported iterable into a managed ABI result array.
 ///
 /// # Safety
@@ -1882,6 +2146,124 @@ pub unsafe extern "C" fn rimera_unpack_ex(
     let value = unsafe { *value };
     with_output(context, output, |context| {
         operations::unpack(context, value, before_count, after_count, starred != 0)
+    })
+}
+
+/// Creates a native range value from integer start, stop, and step values.
+///
+/// # Safety
+/// Inputs must be readable values owned by `context`; `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_pattern_sequence(
+    context: *mut RimeraContext,
+    value: *const RValue,
+    before_count: usize,
+    after_count: usize,
+    starred: u8,
+    output: *mut RValue,
+    matched: *mut u8,
+) -> RStatus {
+    if value.is_null() || starred > 1 || (starred == 0 && after_count != 0) {
+        return RStatus::InvalidArgument;
+    }
+    let value = unsafe { *value };
+    with_pattern_output(context, output, matched, |context| {
+        operations::pattern_sequence_extract(
+            context,
+            value,
+            before_count,
+            after_count,
+            starred != 0,
+        )
+    })
+}
+
+/// Performs the mapping-pattern type/length preflight before source key
+/// expressions are evaluated.
+///
+/// # Safety
+/// `mapping` must be readable and `output` writable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_pattern_mapping_check(
+    context: *mut RimeraContext,
+    mapping: *const RValue,
+    minimum_count: usize,
+    output: *mut RValue,
+) -> RStatus {
+    if mapping.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let mapping = unsafe { *mapping };
+    with_output(context, output, |context| {
+        call::pattern_mapping_check(context, mapping, minimum_count)
+    })
+}
+
+/// Extracts mapping-pattern values in source-key order and optionally appends
+/// a freshly allocated `**rest` dictionary. Missing keys are a normal mismatch.
+///
+/// # Safety
+/// `mapping`, `output`, and `matched` must be valid pointers. `keys` may be null
+/// only when `key_count == 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_pattern_mapping(
+    context: *mut RimeraContext,
+    mapping: *const RValue,
+    keys: *const RValue,
+    key_count: usize,
+    include_rest: u8,
+    output: *mut RValue,
+    matched: *mut u8,
+) -> RStatus {
+    if mapping.is_null() || include_rest > 1 || (keys.is_null() && key_count != 0) {
+        return RStatus::InvalidArgument;
+    }
+    let mapping = unsafe { *mapping };
+    let keys = if key_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(keys, key_count) }
+    };
+    with_pattern_output(context, output, matched, |context| {
+        call::pattern_mapping_extract(context, mapping, keys, include_rest != 0)
+    })
+}
+
+/// Extracts positional and keyword class-pattern attributes. Keyword names are
+/// encoded as an internal NUL-separated UTF-8 blob by Cranelift metadata.
+///
+/// # Safety
+/// Value/output pointers must be valid. `keyword_blob` may be null only for an
+/// empty blob.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_pattern_class(
+    context: *mut RimeraContext,
+    subject: *const RValue,
+    class: *const RValue,
+    positional_count: usize,
+    keyword_blob: *const u8,
+    keyword_blob_len: usize,
+    output: *mut RValue,
+    matched: *mut u8,
+) -> RStatus {
+    if subject.is_null() || class.is_null() || (keyword_blob.is_null() && keyword_blob_len != 0) {
+        return RStatus::InvalidArgument;
+    }
+    let subject = unsafe { *subject };
+    let class = unsafe { *class };
+    let keyword_names = if keyword_blob_len == 0 {
+        Vec::new()
+    } else {
+        let Ok(blob) = (unsafe { utf8(keyword_blob, keyword_blob_len) }) else {
+            return RStatus::InvalidArgument;
+        };
+        if blob.split('\0').any(str::is_empty) {
+            return RStatus::InvalidArgument;
+        }
+        blob.split('\0').map(str::to_owned).collect::<Vec<_>>()
+    };
+    with_pattern_output(context, output, matched, |context| {
+        call::pattern_class_extract(context, subject, class, positional_count, &keyword_names)
     })
 }
 
@@ -1955,6 +2337,7 @@ pub unsafe extern "C" fn rimera_iterator_next(
                 }
                 Ok(())
             }
+            Err(_) if context.raised.is_some() => Err(RStatus::Exception),
             Err(message) => {
                 record_exception(context, "TypeError", message);
                 Err(RStatus::Exception)
@@ -2184,6 +2567,31 @@ pub unsafe extern "C" fn rimera_compare(
     })
 }
 
+/// Applies an f-string conversion and then the ordinary formatting protocol.
+///
+/// # Safety
+/// `value`, `spec`, and `output` must reference live values in this context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_format_value(
+    context: *mut RimeraContext,
+    conversion: u8,
+    value: *const RValue,
+    spec: *const RValue,
+    output: *mut RValue,
+) -> RStatus {
+    if value.is_null() || spec.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let Ok(conversion) = RFormatConversion::try_from(conversion) else {
+        return RStatus::InvalidArgument;
+    };
+    // SAFETY: null was rejected and inputs are read-only for this call.
+    let (value, spec) = unsafe { (*value, *spec) };
+    with_output(context, output, |context| {
+        operations::format_value(context, value, conversion, spec)
+    })
+}
+
 /// Computes Python truthiness for a native value.
 ///
 /// # Safety
@@ -2360,11 +2768,13 @@ fn is_exception_summary(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ParameterKind;
     use crate::heap::HeapObject;
     use crate::object::{
-        ExceptionObject, FunctionKind, FunctionObject, TracebackObject, ValueDictionaryObject,
+        ExceptionObject, FunctionKind, FunctionObject, Parameter, TracebackObject,
+        ValueDictionaryObject,
     };
-    use rimera_abi::{RGeneratorOperation, RGeneratorOutcome};
+    use rimera_abi::{RCompareOperator, RGeneratorOperation, RGeneratorOutcome};
 
     unsafe extern "C" fn two_stage_generator_resume(
         context: *mut c_void,
@@ -2439,6 +2849,151 @@ mod tests {
         }
     }
 
+    unsafe extern "C" fn collecting_hash_native(
+        context: *mut c_void,
+        _function: *const RValue,
+        bound: *const RValue,
+        bound_len: usize,
+        output: *mut RValue,
+    ) -> RStatus {
+        if context.is_null() || bound.is_null() || bound_len != 1 || output.is_null() {
+            return RStatus::InvalidArgument;
+        }
+        let context = unsafe { &mut *context.cast::<RimeraContext>() };
+        context.collect();
+        unsafe { output.write(RValue::small_int(17)) };
+        RStatus::Ok
+    }
+
+    unsafe extern "C" fn collecting_mutating_hash_native(
+        context: *mut c_void,
+        function: *const RValue,
+        bound: *const RValue,
+        bound_len: usize,
+        output: *mut RValue,
+    ) -> RStatus {
+        if context.is_null()
+            || function.is_null()
+            || bound.is_null()
+            || bound_len != 1
+            || output.is_null()
+        {
+            return RStatus::InvalidArgument;
+        }
+        let context = unsafe { &mut *context.cast::<RimeraContext>() };
+        let function = unsafe { *function };
+        let unrelated = match context.heap.get(function) {
+            Some(HeapObject::Function(function)) => function.closure.first().copied(),
+            _ => None,
+        };
+        let Some(unrelated) = unrelated else {
+            return RStatus::InvalidArgument;
+        };
+        context.collect();
+        if let Err(message) = operations::item_set(
+            context,
+            unrelated,
+            RValue::small_int(1),
+            RValue::small_int(99),
+        ) {
+            context.fail(message);
+            return RStatus::Exception;
+        }
+        unsafe { output.write(RValue::small_int(17)) };
+        RStatus::Ok
+    }
+
+    unsafe extern "C" fn collecting_equal_native(
+        context: *mut c_void,
+        _function: *const RValue,
+        bound: *const RValue,
+        bound_len: usize,
+        output: *mut RValue,
+    ) -> RStatus {
+        if context.is_null() || bound.is_null() || bound_len != 2 || output.is_null() {
+            return RStatus::InvalidArgument;
+        }
+        let context = unsafe { &mut *context.cast::<RimeraContext>() };
+        context.collect();
+        unsafe { output.write(RValue::boolean(true)) };
+        RStatus::Ok
+    }
+
+    unsafe extern "C" fn collecting_truth_native(
+        context: *mut c_void,
+        _function: *const RValue,
+        bound: *const RValue,
+        bound_len: usize,
+        output: *mut RValue,
+    ) -> RStatus {
+        if context.is_null() || bound.is_null() || bound_len != 1 || output.is_null() {
+            return RStatus::InvalidArgument;
+        }
+        let context = unsafe { &mut *context.cast::<RimeraContext>() };
+        let bound = unsafe { std::slice::from_raw_parts(bound, bound_len) };
+        context.collect();
+        if !matches!(context.heap.get(bound[0]), Some(HeapObject::Instance(_))) {
+            return RStatus::InvalidArgument;
+        }
+        unsafe { output.write(RValue::boolean(true)) };
+        RStatus::Ok
+    }
+
+    unsafe extern "C" fn collecting_less_native(
+        context: *mut c_void,
+        _function: *const RValue,
+        bound: *const RValue,
+        bound_len: usize,
+        output: *mut RValue,
+    ) -> RStatus {
+        if context.is_null() || bound.is_null() || bound_len != 2 || output.is_null() {
+            return RStatus::InvalidArgument;
+        }
+        let context = unsafe { &mut *context.cast::<RimeraContext>() };
+        let bound = unsafe { std::slice::from_raw_parts(bound, bound_len) };
+        context.collect();
+        if !matches!(context.heap.get(bound[0]), Some(HeapObject::Instance(_)))
+            || !matches!(context.heap.get(bound[1]), Some(HeapObject::Instance(_)))
+        {
+            return RStatus::InvalidArgument;
+        }
+        unsafe { output.write(RValue::boolean(true)) };
+        RStatus::Ok
+    }
+
+    unsafe extern "C" fn collecting_setitem_native(
+        context: *mut c_void,
+        _function: *const RValue,
+        bound: *const RValue,
+        bound_len: usize,
+        output: *mut RValue,
+    ) -> RStatus {
+        if context.is_null() || bound.is_null() || bound_len != 3 || output.is_null() {
+            return RStatus::InvalidArgument;
+        }
+        let context = unsafe { &mut *context.cast::<RimeraContext>() };
+        let bound = unsafe { std::slice::from_raw_parts(bound, bound_len) };
+        context.collect();
+        if !matches!(context.heap.get(bound[0]), Some(HeapObject::Instance(_))) {
+            return RStatus::InvalidArgument;
+        }
+        let tuple_values = match context.heap.get(bound[1]) {
+            Some(HeapObject::Tuple(values)) => values.to_vec(),
+            _ => return RStatus::InvalidArgument,
+        };
+        if tuple_values.len() != 2
+            || !matches!(
+                context.heap.get(tuple_values[1]),
+                Some(HeapObject::Slice(_))
+            )
+            || operations::display(context, bound[2]).as_deref() != Ok("rhs")
+        {
+            return RStatus::InvalidArgument;
+        }
+        unsafe { output.write(RValue::NONE) };
+        RStatus::Ok
+    }
+
     #[test]
     fn rooted_values_survive_forced_collection() {
         let mut context = RimeraContext::default();
@@ -2473,6 +3028,7 @@ mod tests {
                 qualified_name: "two_stage".to_owned(),
                 parameters: Box::new([]),
                 closure: Box::new([]),
+                annotations: None,
             }))
             .unwrap();
         let mut generator = context.new_generator(function, &[captured]).unwrap();
@@ -3256,6 +3812,7 @@ mod tests {
                 parameters: Box::new([]),
                 kind: FunctionKind::Normal,
                 closure: Box::new([]),
+                annotations: None,
             }))
             .unwrap();
         assert_eq!(
@@ -3594,6 +4151,7 @@ mod tests {
                 parameters: Box::new([]),
                 kind: FunctionKind::Normal,
                 closure: Box::new([]),
+                annotations: None,
             }))
             .unwrap();
         context
@@ -3892,6 +4450,526 @@ mod tests {
         );
         context.collect();
         assert!(context.heap.get(bytes).is_none());
+    }
+
+    #[test]
+    fn gate4_boolean_truth_callback_survives_forced_collection() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let namespace = context.namespace_new().unwrap();
+        let method = context
+            .allocate(HeapObject::Function(FunctionObject {
+                code_address: collecting_truth_native as usize,
+                kind: FunctionKind::Normal,
+                name: "__bool__".to_owned(),
+                qualified_name: "CollectingTruth.__bool__".to_owned(),
+                parameters: vec![Parameter {
+                    name: "self".to_owned(),
+                    kind: ParameterKind::PositionalOrKeyword,
+                    default: None,
+                }]
+                .into_boxed_slice(),
+                closure: Box::new([]),
+                annotations: None,
+            }))
+            .unwrap();
+        context
+            .namespace_set(namespace, "__bool__", method)
+            .unwrap();
+        let truth_type = context
+            .new_class("CollectingTruth", &[], namespace)
+            .unwrap();
+        let value = context.new_instance(truth_type).unwrap();
+        let truth = context
+            .with_temporary_roots(&[value], |context| operations::truthy(context, value))
+            .unwrap();
+        assert!(truth);
+        assert!(matches!(
+            context.heap.get(value),
+            Some(HeapObject::Instance(_))
+        ));
+    }
+
+    #[test]
+    fn gate4_comparison_callback_keeps_both_operands_alive_during_forced_collection() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let namespace = context.namespace_new().unwrap();
+        let method = context
+            .allocate(HeapObject::Function(FunctionObject {
+                code_address: collecting_less_native as usize,
+                kind: FunctionKind::Normal,
+                name: "__lt__".to_owned(),
+                qualified_name: "CollectingCompare.__lt__".to_owned(),
+                parameters: vec![
+                    Parameter {
+                        name: "self".to_owned(),
+                        kind: ParameterKind::PositionalOrKeyword,
+                        default: None,
+                    },
+                    Parameter {
+                        name: "other".to_owned(),
+                        kind: ParameterKind::PositionalOrKeyword,
+                        default: None,
+                    },
+                ]
+                .into_boxed_slice(),
+                closure: Box::new([]),
+                annotations: None,
+            }))
+            .unwrap();
+        context.namespace_set(namespace, "__lt__", method).unwrap();
+        let compare_type = context
+            .new_class("CollectingCompare", &[], namespace)
+            .unwrap();
+        let left = context.new_instance(compare_type).unwrap();
+        let right = context
+            .with_temporary_roots(&[left], |context| context.new_instance(compare_type))
+            .unwrap();
+        let result = context
+            .with_temporary_roots(&[left, right], |context| {
+                operations::compare(context, RCompareOperator::Less as u8, left, right)
+            })
+            .unwrap();
+        assert_eq!(result, RValue::boolean(true));
+        assert!(matches!(
+            context.heap.get(left),
+            Some(HeapObject::Instance(_))
+        ));
+        assert!(matches!(
+            context.heap.get(right),
+            Some(HeapObject::Instance(_))
+        ));
+    }
+
+    #[test]
+    fn gate4_extended_subscript_callback_keeps_index_tuple_slice_and_rhs_alive() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let namespace = context.namespace_new().unwrap();
+        let method = context
+            .allocate(HeapObject::Function(FunctionObject {
+                code_address: collecting_setitem_native as usize,
+                kind: FunctionKind::Normal,
+                name: "__setitem__".to_owned(),
+                qualified_name: "CollectingSubscript.__setitem__".to_owned(),
+                parameters: vec![
+                    Parameter {
+                        name: "self".to_owned(),
+                        kind: ParameterKind::PositionalOrKeyword,
+                        default: None,
+                    },
+                    Parameter {
+                        name: "key".to_owned(),
+                        kind: ParameterKind::PositionalOrKeyword,
+                        default: None,
+                    },
+                    Parameter {
+                        name: "value".to_owned(),
+                        kind: ParameterKind::PositionalOrKeyword,
+                        default: None,
+                    },
+                ]
+                .into_boxed_slice(),
+                closure: Box::new([]),
+                annotations: None,
+            }))
+            .unwrap();
+        context
+            .namespace_set(namespace, "__setitem__", method)
+            .unwrap();
+        let subscript_type = context
+            .new_class("CollectingSubscript", &[], namespace)
+            .unwrap();
+        let receiver = context.new_instance(subscript_type).unwrap();
+        let slice = context
+            .with_temporary_roots(&[receiver], |context| {
+                operations::slice(
+                    context,
+                    Some(RValue::small_int(1)),
+                    Some(RValue::small_int(5)),
+                    Some(RValue::small_int(2)),
+                )
+            })
+            .unwrap();
+        let index = context
+            .with_temporary_roots(&[receiver, slice], |context| {
+                operations::tuple(context, &[RValue::small_int(3), slice])
+            })
+            .unwrap();
+        let rhs = context
+            .with_temporary_roots(&[receiver, index], |context| {
+                operations::string(context, "rhs")
+            })
+            .unwrap();
+        context
+            .with_temporary_roots(&[receiver, index, rhs], |context| {
+                operations::item_set(context, receiver, index, rhs)
+            })
+            .unwrap();
+        assert!(matches!(
+            context.heap.get(index),
+            Some(HeapObject::Tuple(_))
+        ));
+        assert!(matches!(
+            context.heap.get(slice),
+            Some(HeapObject::Slice(_))
+        ));
+        assert_eq!(operations::display(&context, rhs).unwrap(), "rhs");
+    }
+
+    #[test]
+    fn gate4_dictionary_merge_roots_values_across_hash_and_equality_callbacks() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let namespace = context.namespace_new().unwrap();
+        let hash_function = context
+            .allocate(HeapObject::Function(FunctionObject {
+                code_address: collecting_hash_native as usize,
+                kind: FunctionKind::Normal,
+                name: "__hash__".to_owned(),
+                qualified_name: "CollectingKey.__hash__".to_owned(),
+                parameters: vec![Parameter {
+                    name: "self".to_owned(),
+                    kind: ParameterKind::PositionalOrKeyword,
+                    default: None,
+                }]
+                .into_boxed_slice(),
+                closure: Box::new([]),
+                annotations: None,
+            }))
+            .unwrap();
+        let equal_function = context
+            .with_temporary_roots(&[namespace, hash_function], |context| {
+                context.allocate(HeapObject::Function(FunctionObject {
+                    code_address: collecting_equal_native as usize,
+                    kind: FunctionKind::Normal,
+                    name: "__eq__".to_owned(),
+                    qualified_name: "CollectingKey.__eq__".to_owned(),
+                    parameters: vec![
+                        Parameter {
+                            name: "self".to_owned(),
+                            kind: ParameterKind::PositionalOrKeyword,
+                            default: None,
+                        },
+                        Parameter {
+                            name: "other".to_owned(),
+                            kind: ParameterKind::PositionalOrKeyword,
+                            default: None,
+                        },
+                    ]
+                    .into_boxed_slice(),
+                    closure: Box::new([]),
+                    annotations: None,
+                }))
+            })
+            .unwrap();
+        context
+            .namespace_set(namespace, "__hash__", hash_function)
+            .unwrap();
+        context
+            .namespace_set(namespace, "__eq__", equal_function)
+            .unwrap();
+        let key_type = context.new_class("CollectingKey", &[], namespace).unwrap();
+        let first = context.new_instance(key_type).unwrap();
+        let first_value = operations::string(&mut context, "first").unwrap();
+        let target = operations::dictionary(&mut context, &[first], &[first_value]).unwrap();
+
+        let (second, second_value, source) = context
+            .with_temporary_roots(&[target], |context| {
+                let second = context.new_instance(key_type)?;
+                let second_value = operations::string(context, "replacement")?;
+                let source = context
+                    .with_temporary_roots(&[target, second, second_value], |context| {
+                        operations::dictionary(context, &[second], &[second_value])
+                    })?;
+                Ok::<_, String>((second, second_value, source))
+            })
+            .unwrap();
+
+        context
+            .with_temporary_roots(&[target, source], |context| {
+                call::dict_merge_mapping_source(context, target, source)
+            })
+            .unwrap();
+        context.with_temporary_roots(&[target], |context| context.collect());
+        let (stored_key, stored_value) = match context.heap.get(target) {
+            Some(HeapObject::ValueDictionary(dictionary)) => dictionary
+                .table
+                .values()
+                .next()
+                .copied()
+                .expect("merged dictionary keeps one entry"),
+            _ => panic!("merge target stopped being a native dictionary"),
+        };
+        assert_eq!(
+            stored_key, first,
+            "equal replacement must retain the first key"
+        );
+        assert_eq!(stored_value, second_value);
+        assert_eq!(
+            operations::display(&context, second_value).unwrap(),
+            "replacement"
+        );
+        assert!(context.heap.get(second).is_none());
+        assert!(context.heap.get(first).is_some());
+    }
+
+    #[test]
+    fn gate4_prepared_call_arguments_trace_callable_and_accumulated_values() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let callable = context
+            .allocate(HeapObject::Function(FunctionObject {
+                code_address: add_native as usize,
+                kind: FunctionKind::Normal,
+                name: "prepared".to_owned(),
+                qualified_name: "prepared".to_owned(),
+                parameters: Box::new([]),
+                closure: Box::new([]),
+                annotations: None,
+            }))
+            .unwrap();
+        let arguments = call::call_arguments_new(&mut context, callable).unwrap();
+        let first = operations::string(&mut context, "first").unwrap();
+        call::call_argument_add(
+            &mut context,
+            arguments,
+            RCallArgumentKind::Positional,
+            None,
+            first,
+        )
+        .unwrap();
+        let second = operations::string(&mut context, "second").unwrap();
+        let source = context
+            .with_temporary_roots(&[arguments, second], |context| {
+                operations::list(context, &[second])
+            })
+            .unwrap();
+        context
+            .with_temporary_roots(&[arguments, source], |context| {
+                call::call_argument_add(
+                    context,
+                    arguments,
+                    RCallArgumentKind::Starred,
+                    None,
+                    source,
+                )
+            })
+            .unwrap();
+        call::call_argument_add(
+            &mut context,
+            arguments,
+            RCallArgumentKind::Keyword,
+            Some("named"),
+            second,
+        )
+        .unwrap();
+
+        context.with_temporary_roots(&[arguments], |context| context.collect());
+        let Some(HeapObject::CallArguments(prepared)) = context.heap.get(arguments) else {
+            panic!("prepared call accumulator was collected");
+        };
+        assert_eq!(prepared.callable, callable);
+        assert_eq!(prepared.positional, vec![first, second]);
+        assert_eq!(prepared.keywords, vec![("named".to_owned(), second)]);
+        assert_eq!(operations::display(&context, first).unwrap(), "first");
+        assert_eq!(operations::display(&context, second).unwrap(), "second");
+        assert!(context.heap.get(source).is_none());
+        assert!(context.heap.get(callable).is_some());
+
+        context.collect();
+        assert!(context.heap.get(arguments).is_none());
+        assert!(context.heap.get(callable).is_none());
+        assert!(context.heap.get(first).is_none());
+        assert!(context.heap.get(second).is_none());
+    }
+
+    #[test]
+    fn gate4_prepared_call_argument_growth_refreshes_managed_bytes_and_heap_limit() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let callable = context
+            .allocate(HeapObject::Function(FunctionObject {
+                code_address: add_native as usize,
+                kind: FunctionKind::Normal,
+                name: "prepared".to_owned(),
+                qualified_name: "prepared".to_owned(),
+                parameters: Box::new([]),
+                closure: Box::new([]),
+                annotations: None,
+            }))
+            .unwrap();
+        let mut arguments = RValue::NONE;
+        assert_eq!(
+            // SAFETY: callable/output storage and context remain live for the call.
+            unsafe {
+                rimera_call_arguments_new(&raw mut context, &raw const callable, &raw mut arguments)
+            },
+            RStatus::Ok
+        );
+        let before = context.heap.live_bytes();
+        context
+            .set_heap_limit(Some(before.saturating_add(1)))
+            .unwrap();
+        let value = RValue::small_int(7);
+        let status = context.with_temporary_roots(&[callable, arguments], |context| {
+            // SAFETY: all input storage and the context remain live for the call.
+            unsafe {
+                rimera_call_argument_add(
+                    &raw mut *context,
+                    &raw const arguments,
+                    RCallArgumentKind::Positional as u8,
+                    std::ptr::null(),
+                    0,
+                    &raw const value,
+                )
+            }
+        });
+        assert_eq!(status, RStatus::Exception);
+        assert!(context.heap.live_bytes() > before);
+        let raised = context
+            .raised
+            .expect("retained accumulator growth should raise MemoryError");
+        assert_eq!(
+            context.type_of(raised).unwrap(),
+            context.builtin_type("MemoryError").unwrap()
+        );
+        let Some(HeapObject::CallArguments(prepared)) = context.heap.get(arguments) else {
+            panic!("rooted prepared-call accumulator was collected");
+        };
+        assert_eq!(prepared.positional, vec![value]);
+    }
+
+    #[test]
+    fn gate4_comprehension_list_sink_growth_refreshes_managed_bytes_and_heap_limit() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let list = operations::list(&mut context, &[]).unwrap();
+        context.add_context_root(list);
+        let before = context.heap.live_bytes();
+        context
+            .set_heap_limit(Some(before.saturating_add(1)))
+            .unwrap();
+        let value = RValue::small_int(7);
+        let status =
+            unsafe { rimera_list_append(&raw mut context, &raw const list, &raw const value) };
+        assert_eq!(status, RStatus::Exception);
+        assert!(context.heap.live_bytes() > before);
+        assert_eq!(operations::display(&context, list).unwrap(), "[7]");
+        let raised = context
+            .raised
+            .expect("retained comprehension list growth should raise MemoryError");
+        assert_eq!(
+            context.type_of(raised).unwrap(),
+            context.builtin_type("MemoryError").unwrap()
+        );
+    }
+
+    #[test]
+    fn gate4_comprehension_hash_sinks_preserve_failures_without_partial_entries() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let set = operations::set(&mut context, &[]).unwrap();
+        let dictionary = operations::dictionary(&mut context, &[], &[]).unwrap();
+        let bad_key = operations::list(&mut context, &[RValue::small_int(1)]).unwrap();
+        context.add_context_root(set);
+        context.add_context_root(dictionary);
+        context.add_context_root(bad_key);
+
+        let set_status =
+            unsafe { rimera_set_insert(&raw mut context, &raw const set, &raw const bad_key) };
+        assert_eq!(set_status, RStatus::Exception);
+        assert_eq!(operations::display(&context, set).unwrap(), "set()");
+        let set_error = context
+            .raised
+            .take()
+            .expect("set insert should raise TypeError");
+        assert_eq!(
+            context.type_of(set_error).unwrap(),
+            context.builtin_type("TypeError").unwrap()
+        );
+
+        let value = RValue::small_int(9);
+        let dict_status = unsafe {
+            rimera_dictionary_insert(
+                &raw mut context,
+                &raw const dictionary,
+                &raw const bad_key,
+                &raw const value,
+            )
+        };
+        assert_eq!(dict_status, RStatus::Exception);
+        assert_eq!(operations::display(&context, dictionary).unwrap(), "{}");
+        let dict_error = context
+            .raised
+            .expect("dict insert should preserve the hashing TypeError");
+        assert_eq!(
+            context.type_of(dict_error).unwrap(),
+            context.builtin_type("TypeError").unwrap()
+        );
+    }
+
+    #[test]
+    fn gate4_comprehension_dict_insert_survives_gc_and_unrelated_table_mutation_in_hash() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let unrelated = operations::dictionary(&mut context, &[], &[]).unwrap();
+        context.add_context_root(unrelated);
+        let namespace = context.namespace_new().unwrap();
+        let hash_function = context
+            .allocate(HeapObject::Function(FunctionObject {
+                code_address: collecting_mutating_hash_native as usize,
+                kind: FunctionKind::Normal,
+                name: "__hash__".to_owned(),
+                qualified_name: "ComprehensionKey.__hash__".to_owned(),
+                parameters: vec![Parameter {
+                    name: "self".to_owned(),
+                    kind: ParameterKind::PositionalOrKeyword,
+                    default: None,
+                }]
+                .into_boxed_slice(),
+                closure: vec![unrelated].into_boxed_slice(),
+                annotations: None,
+            }))
+            .unwrap();
+        context
+            .namespace_set(namespace, "__hash__", hash_function)
+            .unwrap();
+        let key_type = context
+            .new_class("ComprehensionKey", &[], namespace)
+            .unwrap();
+        let key = context.new_instance(key_type).unwrap();
+        let value = operations::string(&mut context, "kept").unwrap();
+        let dictionary = operations::dictionary(&mut context, &[], &[]).unwrap();
+
+        let status =
+            context.with_temporary_roots(&[dictionary, key, value, unrelated], |context| unsafe {
+                rimera_dictionary_insert(
+                    &raw mut *context,
+                    &raw const dictionary,
+                    &raw const key,
+                    &raw const value,
+                )
+            });
+        assert_eq!(status, RStatus::Ok);
+        context.with_temporary_roots(&[dictionary, unrelated], |context| context.collect());
+
+        assert_eq!(
+            operations::item_get(&mut context, unrelated, RValue::small_int(1)).unwrap(),
+            RValue::small_int(99)
+        );
+        let (stored_key, stored_value) = match context.heap.get(dictionary) {
+            Some(HeapObject::ValueDictionary(dictionary)) => dictionary
+                .table
+                .values()
+                .next()
+                .copied()
+                .expect("comprehension dictionary should contain one entry"),
+            _ => panic!("comprehension sink should retain a value dictionary"),
+        };
+        assert_eq!(stored_key, key);
+        assert_eq!(operations::display(&context, stored_value).unwrap(), "kept");
     }
 
     #[test]

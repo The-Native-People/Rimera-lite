@@ -5,7 +5,10 @@ class Mapping:
 
     def keys(self):
         self.log.append(("keys", len(self.entries)))
-        return [entry[0] for entry in self.entries]
+        result = []
+        for entry in self.entries:
+            result.append(entry[0])
+        return result
 
     def __getitem__(self, key):
         self.log.append(("get", key))

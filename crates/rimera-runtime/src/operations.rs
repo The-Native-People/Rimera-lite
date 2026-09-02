@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
-use rimera_abi::{RGeneratorOperation, RGeneratorOutcome, RTag, RValue};
+use rimera_abi::{RFormatConversion, RGeneratorOperation, RGeneratorOutcome, RTag, RValue};
 
 use crate::RimeraContext;
 use crate::heap::HeapObject;
@@ -77,6 +77,20 @@ pub fn value_array(context: &mut RimeraContext, values: &[RValue]) -> Result<RVa
 pub fn list(context: &mut RimeraContext, values: &[RValue]) -> Result<RValue, String> {
     context.with_temporary_roots(values, |context| {
         context.allocate(HeapObject::List(values.to_vec()))
+    })
+}
+
+pub fn list_append(
+    context: &mut RimeraContext,
+    receiver: RValue,
+    value: RValue,
+) -> Result<(), String> {
+    context.with_temporary_roots(&[receiver, value], |context| {
+        let Some(HeapObject::List(values)) = context.heap.get_mut(receiver) else {
+            return Err("comprehension result is not a list".to_owned());
+        };
+        values.push(value);
+        Ok(())
     })
 }
 
@@ -763,11 +777,16 @@ pub fn unpack(
                     .with_temporary_roots(&consumed, |context| value_array(context, &consumed));
             }
 
-            while let Some(item) = context
-                .with_temporary_roots(&consumed, |context| iterator_next(context, iterator))?
-            {
-                consumed.push(item);
-            }
+            let remainder_iterator = context
+                .with_temporary_roots(&consumed, |context| iterator_new(context, iterator))?;
+            context.with_temporary_roots(&[remainder_iterator], |context| {
+                while let Some(item) = context.with_temporary_roots(&consumed, |context| {
+                    iterator_next(context, remainder_iterator)
+                })? {
+                    consumed.push(item);
+                }
+                Ok::<(), String>(())
+            })?;
 
             if consumed.len() < expected {
                 return context.raise_error(
@@ -793,6 +812,76 @@ pub fn unpack(
             roots.push(starred_list);
             context.with_temporary_roots(&roots, |context| value_array(context, &result))
         })
+    })
+}
+
+pub(crate) fn pattern_sequence_extract(
+    context: &mut RimeraContext,
+    value: RValue,
+    before_count: usize,
+    after_count: usize,
+    starred: bool,
+) -> Result<Option<RValue>, String> {
+    let candidate = match context.heap.get(value) {
+        Some(
+            HeapObject::Tuple(_)
+            | HeapObject::List(_)
+            | HeapObject::Range(_)
+            | HeapObject::MemoryView(_),
+        ) => true,
+        Some(HeapObject::Instance(instance)) => instance.storage.is_some_and(|storage| {
+            matches!(
+                context.heap.get(storage),
+                Some(
+                    HeapObject::Tuple(_)
+                        | HeapObject::List(_)
+                        | HeapObject::Range(_)
+                        | HeapObject::MemoryView(_)
+                )
+            )
+        }),
+        Some(
+            HeapObject::String(_)
+            | HeapObject::Bytes(_)
+            | HeapObject::ByteArray(_)
+            | HeapObject::Dictionary(_)
+            | HeapObject::ValueDictionary(_)
+            | HeapObject::MappingProxy(_)
+            | HeapObject::Set(_)
+            | HeapObject::FrozenSet(_),
+        )
+        | None => false,
+        Some(_) => false,
+    };
+    if !candidate {
+        return Ok(None);
+    }
+    let required = before_count
+        .checked_add(after_count)
+        .ok_or_else(|| "sequence pattern is too large".to_owned())?;
+    context.with_temporary_roots(&[value], |context| {
+        let length_value = match length(context, value) {
+            Ok(length) => length,
+            Err(message) if context.raised.is_none() && message.contains("has no length") => {
+                return Ok(None);
+            }
+            Err(message) => return Err(message),
+        };
+        let length_integer = integer(context, length_value)?;
+        if length_integer.is_negative() {
+            return context.raise_error("ValueError", "__len__() should return >= 0");
+        }
+        let Some(length) = length_integer.to_usize() else {
+            return context.raise_error(
+                "OverflowError",
+                "sequence length is too large for structural pattern matching",
+            );
+        };
+        if (!starred && length != required) || (starred && length < required) {
+            return Ok(None);
+        }
+
+        unpack(context, value, before_count, after_count, starred).map(Some)
     })
 }
 
@@ -1381,6 +1470,11 @@ pub fn item_get(
             return Ok(result);
         }
         return item_get(context, storage, index);
+    }
+    if matches!(context.heap.get(collection), Some(HeapObject::Instance(_))) {
+        return context
+            .invoke_special_method(collection, "__getitem__", &[index])?
+            .ok_or_else(|| "object is not subscriptable".to_owned());
     }
     if let Some(HeapObject::MappingProxy(proxy)) = context.heap.get(collection) {
         return item_get(context, proxy.dictionary, index);
@@ -4166,7 +4260,7 @@ pub fn contains(
     };
     if let Some(values) = native_values {
         for value in values {
-            if value_equal(context, value, needle)? {
+            if value == needle || value_equal(context, value, needle)? {
                 return Ok(true);
             }
         }
@@ -4185,6 +4279,9 @@ pub fn contains(
             match iterator_new(context, collection) {
                 Ok(iterator) => {
                     while let Some(item) = iterator_next(context, iterator)? {
+                        if item == needle {
+                            return Ok(true);
+                        }
                         let equal = compare(context, 0, item, needle)?;
                         if truthy(context, equal)? {
                             return Ok(true);
@@ -4196,6 +4293,9 @@ pub fn contains(
                     for index in 0_i64.. {
                         match item_get(context, collection, RValue::small_int(index)) {
                             Ok(item) => {
+                                if item == needle {
+                                    return Ok(true);
+                                }
                                 let equal = compare(context, 0, item, needle)?;
                                 if truthy(context, equal)? {
                                     return Ok(true);
@@ -4707,6 +4807,30 @@ pub fn repr(context: &mut RimeraContext, value: RValue) -> Result<RValue, String
     context.with_temporary_roots(&[value], |context| {
         let rendered = repr_text(context, value, &mut Vec::new())?;
         string(context, &rendered)
+    })
+}
+
+pub fn ascii(context: &mut RimeraContext, value: RValue) -> Result<RValue, String> {
+    context.with_temporary_roots(&[value], |context| {
+        let rendered = repr(context, value)?;
+        let rendered = match context.heap.get(rendered) {
+            Some(HeapObject::String(value)) => value.clone(),
+            _ => return Err("repr() returned non-string".to_owned()),
+        };
+        let mut escaped = String::with_capacity(rendered.len());
+        for character in rendered.chars() {
+            let codepoint = character as u32;
+            if character.is_ascii() {
+                escaped.push(character);
+            } else if codepoint <= 0xff {
+                escaped.push_str(&format!("\\x{codepoint:02x}"));
+            } else if codepoint <= 0xffff {
+                escaped.push_str(&format!("\\u{codepoint:04x}"));
+            } else {
+                escaped.push_str(&format!("\\U{codepoint:08x}"));
+            }
+        }
+        string(context, &escaped)
     })
 }
 
@@ -5363,6 +5487,26 @@ pub fn format(context: &mut RimeraContext, value: RValue, spec: RValue) -> Resul
     })
 }
 
+pub fn format_value(
+    context: &mut RimeraContext,
+    value: RValue,
+    conversion: RFormatConversion,
+    spec: RValue,
+) -> Result<RValue, String> {
+    context.with_temporary_roots(&[value, spec], |context| {
+        let converted = match conversion {
+            RFormatConversion::None => value,
+            RFormatConversion::Str => {
+                let rendered = stringify(context, value)?;
+                string(context, &rendered)?
+            }
+            RFormatConversion::Repr => repr(context, value)?,
+            RFormatConversion::Ascii => ascii(context, value)?,
+        };
+        context.with_temporary_roots(&[converted], |context| format(context, converted, spec))
+    })
+}
+
 pub fn truthy(context: &mut RimeraContext, value: RValue) -> Result<bool, String> {
     if value.tag == RTag::Handle as u32
         && matches!(context.heap.get(value), Some(HeapObject::Instance(_)))
@@ -5430,6 +5574,7 @@ pub fn truthy(context: &mut RimeraContext, value: RValue) -> Result<bool, String
                 | HeapObject::Type(_)
                 | HeapObject::Instance(_)
                 | HeapObject::BoundMethod(_)
+                | HeapObject::CallArguments(_)
                 | HeapObject::Super(_)
                 | HeapObject::Property(_)
                 | HeapObject::PropertyMethod(_)
@@ -5688,6 +5833,7 @@ pub fn display(context: &RimeraContext, value: RValue) -> Result<String, String>
                 _ => Err("instance has an invalid class".to_owned()),
             },
             Some(HeapObject::BoundMethod(_)) => Ok("<bound method>".to_owned()),
+            Some(HeapObject::CallArguments(_)) => Ok("<internal call arguments>".to_owned()),
             Some(HeapObject::Super(_)) => Ok("<super object>".to_owned()),
             Some(HeapObject::Property(_)) => Ok("<property object>".to_owned()),
             Some(HeapObject::PropertyMethod(_)) => Ok("<property method>".to_owned()),

@@ -9,7 +9,8 @@ use crate::ParameterKind;
 use crate::RimeraContext;
 use crate::heap::HeapObject;
 use crate::object::{
-    BuiltinFunctionKind, CallArgumentsObject, DictionaryObject, FunctionObject, TypeLayout,
+    BuiltinFunctionKind, CallArgumentsObject, DictionaryObject, FunctionObject, TYPE_FLAG_BUILTIN,
+    TypeLayout,
 };
 
 pub(crate) fn invoke(
@@ -404,9 +405,10 @@ fn prepared_keyword_duplicate(
     name: &str,
 ) -> Result<bool, String> {
     match context.heap.get(arguments) {
-        Some(HeapObject::CallArguments(arguments)) => {
-            Ok(arguments.keywords.iter().any(|(current, _)| current == name))
-        }
+        Some(HeapObject::CallArguments(arguments)) => Ok(arguments
+            .keywords
+            .iter()
+            .any(|(current, _)| current == name)),
         _ => Err("prepared call arguments are invalid".to_owned()),
     }
 }
@@ -434,7 +436,8 @@ pub(crate) fn call_argument_add(
             let iterator = crate::operations::iterator_new(context, value)?;
             context.with_temporary_roots(&[arguments, callable, value, iterator], |context| {
                 while let Some(item) = crate::operations::iterator_next(context, iterator)? {
-                    let Some(HeapObject::CallArguments(arguments)) = context.heap.get_mut(arguments)
+                    let Some(HeapObject::CallArguments(arguments)) =
+                        context.heap.get_mut(arguments)
                     else {
                         return Err("prepared call arguments are invalid".to_owned());
                     };
@@ -467,24 +470,29 @@ pub(crate) fn call_argument_add(
                 &[arguments, callable, value, keys_method, keys, iterator],
                 |context| {
                     while let Some(key) = crate::operations::iterator_next(context, iterator)? {
-                        let key_name = crate::operations::string_value(context, key)
-                            .map(ToOwned::to_owned)
-                            .ok_or_else(|| "keywords must be strings".to_owned())?;
-                        if prepared_keyword_duplicate(context, arguments, &key_name)? {
-                            let callable = prepared_callable_name(context, callable);
-                            return Err(format!(
-                                "{callable}() got multiple values for keyword argument '{key_name}'"
-                            ));
+                        let key_name = crate::operations::string_value(context, key).map(ToOwned::to_owned);
+                        if let Some(key_name) = key_name {
+                            if prepared_keyword_duplicate(context, arguments, &key_name)? {
+                                let callable = prepared_callable_name(context, callable);
+                                return Err(format!(
+                                    "{callable}() got multiple values for keyword argument '{key_name}'"
+                                ));
+                            }
+                            let mapped = context.with_temporary_roots(&[key], |context| {
+                                crate::operations::item_get(context, value, key)
+                            })?;
+                            let Some(HeapObject::CallArguments(arguments)) =
+                                context.heap.get_mut(arguments)
+                            else {
+                                return Err("prepared call arguments are invalid".to_owned());
+                            };
+                            arguments.keywords.push((key_name, mapped));
+                        } else {
+                            context.with_temporary_roots(&[key], |context| {
+                                crate::operations::item_get(context, value, key)
+                            })?;
+                            return Err("keywords must be strings".to_owned());
                         }
-                        let mapped = context.with_temporary_roots(&[key], |context| {
-                            crate::operations::item_get(context, value, key)
-                        })?;
-                        let Some(HeapObject::CallArguments(arguments)) =
-                            context.heap.get_mut(arguments)
-                        else {
-                            return Err("prepared call arguments are invalid".to_owned());
-                        };
-                        arguments.keywords.push((key_name, mapped));
                     }
                     Ok(())
                 },
@@ -512,7 +520,9 @@ pub(crate) fn invoke_prepared(
     let mut roots = positional.clone();
     roots.extend(keywords.iter().map(|(_, value)| *value));
     roots.extend([callable, arguments]);
-    context.with_temporary_roots(&roots, |context| invoke(context, callable, &positional, &keywords))
+    context.with_temporary_roots(&roots, |context| {
+        invoke(context, callable, &positional, &keywords)
+    })
 }
 
 fn invoke_abs(
@@ -2440,6 +2450,260 @@ fn dictionary_lookup(
     }
 }
 
+fn pattern_attribute_get(
+    context: &mut RimeraContext,
+    receiver: RValue,
+    name: &str,
+) -> Result<Option<RValue>, String> {
+    match context.attribute_get(receiver, name) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) if context.consume_exception_type("AttributeError") => Ok(None),
+        Err(message) if context.raised.is_none() && message.contains("has no attribute") => {
+            Ok(None)
+        }
+        Err(message) => Err(message),
+    }
+}
+
+fn pattern_mapping_candidate(context: &mut RimeraContext, mapping: RValue) -> Result<bool, String> {
+    Ok(match context.heap.get(mapping) {
+        Some(
+            HeapObject::Dictionary(_)
+            | HeapObject::ValueDictionary(_)
+            | HeapObject::MappingProxy(_),
+        ) => true,
+        Some(HeapObject::Instance(instance)) => match instance.storage {
+            Some(storage) => matches!(
+                context.heap.get(storage),
+                Some(HeapObject::Dictionary(_) | HeapObject::ValueDictionary(_))
+            ),
+            None => pattern_attribute_get(context, mapping, "keys")?.is_some(),
+        },
+        _ => false,
+    })
+}
+
+pub(crate) fn pattern_mapping_check(
+    context: &mut RimeraContext,
+    mapping: RValue,
+    minimum_count: usize,
+) -> Result<RValue, String> {
+    context.with_temporary_roots(&[mapping], |context| {
+        if !pattern_mapping_candidate(context, mapping)? {
+            return Ok(RValue::boolean(false));
+        }
+        let length = crate::operations::length(context, mapping)?;
+        let length = crate::operations::integer(context, length)?;
+        if length.is_negative() {
+            return context.raise_error("ValueError", "__len__() should return >= 0");
+        }
+        let Some(length) = length.to_usize() else {
+            return context.raise_error(
+                "OverflowError",
+                "mapping length is too large for structural pattern matching",
+            );
+        };
+        Ok(RValue::boolean(length >= minimum_count))
+    })
+}
+
+pub(crate) fn pattern_mapping_extract(
+    context: &mut RimeraContext,
+    mapping: RValue,
+    keys: &[RValue],
+    include_rest: bool,
+) -> Result<Option<RValue>, String> {
+    let mut roots = Vec::with_capacity(keys.len() + 1);
+    roots.push(mapping);
+    roots.extend_from_slice(keys);
+    context.with_temporary_roots(&roots, |context| {
+        let sentinel = crate::operations::value_array(context, &[])?;
+        let get_method = context.attribute_get(mapping, "get")?;
+        let mut extracted = Vec::with_capacity(keys.len() + usize::from(include_rest));
+        for (index, key) in keys.iter().copied().enumerate() {
+            let hash = crate::operations::hash(context, key)?;
+            context.with_temporary_roots(&[hash], |_| Ok::<(), String>(()))?;
+            for prior in keys[..index].iter().copied() {
+                let equal = crate::operations::compare(context, 0, prior, key)?;
+                let duplicate = context.with_temporary_roots(&[equal], |context| {
+                    crate::operations::truthy(context, equal)
+                })?;
+                if duplicate {
+                    return context
+                        .raise_error("ValueError", "mapping pattern checks duplicate key");
+                }
+            }
+            let mut callback_roots = extracted.clone();
+            callback_roots.extend([sentinel, get_method, key]);
+            let value = context.with_temporary_roots(&callback_roots, |context| {
+                invoke(context, get_method, &[key, sentinel], &[])
+            })?;
+            if value == sentinel {
+                return Ok(None);
+            }
+            extracted.push(value);
+        }
+
+        if include_rest {
+            let rest = context.with_temporary_roots(&extracted, |context| {
+                crate::operations::dictionary(context, &[], &[])
+            })?;
+            let mut rest_roots = extracted.clone();
+            rest_roots.push(rest);
+            context.with_temporary_roots(&rest_roots, |context| {
+                dict_merge_mapping_source(context, rest, mapping)?;
+                for key in keys.iter().copied() {
+                    crate::operations::item_delete(context, rest, key)?;
+                }
+                Ok::<(), String>(())
+            })?;
+            extracted.push(rest);
+        }
+
+        context
+            .with_temporary_roots(&extracted, |context| {
+                crate::operations::value_array(context, &extracted)
+            })
+            .map(Some)
+    })
+}
+
+pub(crate) fn pattern_class_extract(
+    context: &mut RimeraContext,
+    subject: RValue,
+    class: RValue,
+    positional_count: usize,
+    keyword_names: &[String],
+) -> Result<Option<RValue>, String> {
+    let (class_name, class_flags) = match context.heap.get(class) {
+        Some(HeapObject::Type(object)) => (object.name.clone(), object.flags),
+        _ => {
+            return context.raise_error("TypeError", "called match pattern must be a type");
+        }
+    };
+    context.with_temporary_roots(&[subject, class], |context| {
+        if !context.is_instance(subject, class)? {
+            return Ok(None);
+        }
+
+        let builtin_match_self = class_flags & TYPE_FLAG_BUILTIN != 0
+            && matches!(
+                class_name.as_str(),
+                "bool"
+                    | "bytearray"
+                    | "bytes"
+                    | "dict"
+                    | "float"
+                    | "frozenset"
+                    | "int"
+                    | "list"
+                    | "set"
+                    | "str"
+                    | "tuple"
+            );
+        let mut selected_names = Vec::with_capacity(positional_count + keyword_names.len());
+        let mut extracted = Vec::with_capacity(positional_count + keyword_names.len());
+
+        if positional_count != 0 {
+            match pattern_attribute_get(context, class, "__match_args__")? {
+                Some(match_args) => {
+                    let items = match context.heap.get(match_args) {
+                        Some(HeapObject::Tuple(items)) => items.to_vec(),
+                        _ => {
+                            let actual = python_type_name(context, match_args)?;
+                            return context.raise_error(
+                                "TypeError",
+                                format!(
+                                    "{class_name}.__match_args__ must be a tuple (got {actual})"
+                                ),
+                            );
+                        }
+                    };
+                    if positional_count > items.len() {
+                        return context.raise_error(
+                            "TypeError",
+                            format!(
+                                "{class_name}() accepts {} positional sub-patterns ({} given)",
+                                items.len(), positional_count
+                            ),
+                        );
+                    }
+                    for item in items.into_iter().take(positional_count) {
+                        let Some(name) = crate::operations::string_value(context, item) else {
+                            let actual = python_type_name(context, item)?;
+                            return context.raise_error(
+                                "TypeError",
+                                format!("__match_args__ elements must be strings (got {actual})"),
+                            );
+                        };
+                        let name = name.to_owned();
+                        if selected_names.contains(&name) {
+                            return context.raise_error(
+                                "TypeError",
+                                format!(
+                                    "{class_name}() got multiple sub-patterns for attribute '{name}'"
+                                ),
+                            );
+                        }
+                        let value = context.with_temporary_roots(&extracted, |context| {
+                            pattern_attribute_get(context, subject, &name)
+                        })?;
+                        let Some(value) = value else {
+                            return Ok(None);
+                        };
+                        selected_names.push(name);
+                        extracted.push(value);
+                    }
+                }
+                None if builtin_match_self => {
+                    if positional_count > 1 {
+                        return context.raise_error(
+                            "TypeError",
+                            format!(
+                                "{class_name}() accepts 1 positional sub-pattern ({} given)",
+                                positional_count
+                            ),
+                        );
+                    }
+                    extracted.push(subject);
+                }
+                None => {
+                    return context.raise_error(
+                        "TypeError",
+                        format!(
+                            "{class_name}() accepts 0 positional sub-patterns ({} given)",
+                            positional_count
+                        ),
+                    );
+                }
+            }
+        }
+
+        for name in keyword_names {
+            if selected_names.contains(name) {
+                return context.raise_error(
+                    "TypeError",
+                    format!("{class_name}() got multiple sub-patterns for attribute '{name}'"),
+                );
+            }
+            let value = context.with_temporary_roots(&extracted, |context| {
+                pattern_attribute_get(context, subject, name)
+            })?;
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            selected_names.push(name.clone());
+            extracted.push(value);
+        }
+
+        context
+            .with_temporary_roots(&extracted, |context| {
+                crate::operations::value_array(context, &extracted)
+            })
+            .map(Some)
+    })
+}
+
 pub(crate) fn dict_merge_mapping_source(
     context: &mut RimeraContext,
     dictionary: RValue,
@@ -3573,25 +3837,7 @@ fn invoke_ascii(
     if !keywords.is_empty() || positional.len() != 1 {
         return Err("ascii() takes exactly one argument".to_owned());
     }
-    let rendered = crate::operations::repr(context, positional[0])?;
-    let rendered = match context.heap.get(rendered) {
-        Some(HeapObject::String(value)) => value.clone(),
-        _ => return Err("repr() returned non-string".to_owned()),
-    };
-    let mut escaped = String::with_capacity(rendered.len());
-    for character in rendered.chars() {
-        let codepoint = character as u32;
-        if character.is_ascii() {
-            escaped.push(character);
-        } else if codepoint <= 0xff {
-            escaped.push_str(&format!("\\x{codepoint:02x}"));
-        } else if codepoint <= 0xffff {
-            escaped.push_str(&format!("\\u{codepoint:04x}"));
-        } else {
-            escaped.push_str(&format!("\\U{codepoint:08x}"));
-        }
-    }
-    crate::operations::string(context, &escaped)
+    crate::operations::ascii(context, positional[0])
 }
 fn invoke_iter(
     context: &mut RimeraContext,

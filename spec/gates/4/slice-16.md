@@ -21,3 +21,20 @@ native list operations.
   walrus bindings, side effects, and exceptions.
 - Large growth under forced GC and configured heap limits.
 - Scope non-leakage and outermost-iterable evaluation order.
+
+## Completion evidence
+
+- `<listcomp>` activations allocate their result list inside the hidden native
+  function and append through `rimera_list_append`; the sink is a fallible MIR
+  safepoint whose precise roots include the result and produced element plus
+  loop-carried iterator state as required by liveness.
+- `gate4_list_comprehensions.py` and the former list-comprehension capability
+  fixture match CPython 3.12 for single/nested loops, filters, recursive and
+  starred destructuring, closure reads, nested activations, side effects, and
+  iterator/target/filter failure propagation.
+- `gate4_list_comprehension_growth.py` proves 4096-element growth normally and
+  deterministic `MemoryError: managed heap limit exceeded` under a configured
+  budget. Runtime ABI proof separately pins retained-vector managed-byte
+  refresh and heap-limit enforcement after in-place append.
+
+## DONE BY CHATGPT

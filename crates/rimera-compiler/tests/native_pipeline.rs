@@ -733,17 +733,8 @@ fn unsupported_and_malformed_source_emit_no_artifact() {
 }
 
 #[test]
-fn gate4_owned_later_slice_forms_have_stable_capability_diagnostics() {
-    for (fixture, code) in [
-        ("gate4_cap_multiple_star.py", "RIM-CAP-G4-02"),
-        ("gate4_cap_dict_unpack.py", "RIM-CAP-G4-06"),
-        ("gate4_cap_expanded_call.py", "RIM-CAP-G4-07"),
-        ("gate4_cap_compare_chain.py", "RIM-CAP-G4-09"),
-        ("gate4_cap_assert.py", "RIM-CAP-G4-11"),
-        ("gate4_cap_annotation.py", "RIM-CAP-G4-13"),
-        ("gate4_cap_list_comp.py", "RIM-CAP-G4-16"),
-        ("gate4_cap_match.py", "RIM-CAP-G4-19"),
-    ] {
+fn gate4_invalid_target_forms_have_stable_semantic_diagnostics() {
+    for (fixture, code) in [("gate4_cap_multiple_star.py", "RIM-SEMA-001")] {
         let output = output(fixture);
         let diagnostics = rimera_compiler::build(request(fixture, output.clone())).unwrap_err();
         let diagnostic = &diagnostics.as_slice()[0];
@@ -753,6 +744,273 @@ fn gate4_owned_later_slice_forms_have_stable_capability_diagnostics() {
             "fixture: {fixture}: {diagnostic:?}"
         );
         assert!(!output.exists(), "fixture emitted an artifact: {fixture}");
+    }
+}
+
+#[test]
+fn gate4_audit_defers_pep695_type_parameters_to_gate7() {
+    let fixture = "gate7_cap_type_params.py";
+    let output = output(fixture);
+    let diagnostics = rimera_compiler::build(request(fixture, output.clone())).unwrap_err();
+    let diagnostic = &diagnostics.as_slice()[0];
+    assert_eq!(diagnostic.code, "RIM-CAP-G7-01");
+    assert!(diagnostic.message.contains("Gate 7"));
+    assert!(diagnostic.span.end > diagnostic.span.start);
+    assert!(!output.exists());
+}
+
+fn assert_gate4_fixture_matches_cpython(fixture: &str) {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(fixture, None);
+}
+
+fn assert_gate4_fixture_matches_cpython_with_heap_limit(
+    fixture: &str,
+    heap_limit_bytes: Option<u64>,
+) {
+    let mut request = request(fixture, output(fixture));
+    request.heap_limit_bytes = heap_limit_bytes;
+    let artifact = rimera_compiler::build(request.clone()).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&request.entry)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code(), "{fixture}");
+    assert_eq!(native.stdout, python.stdout, "{fixture}");
+    assert_eq!(native.stderr, python.stderr, "{fixture}");
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate4_assignment_expressions_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate4_assignment_expressions.py");
+}
+
+#[test]
+fn gate4_annotations_match_cpython_312() {
+    for fixture in [
+        "gate4_annotations.py",
+        "gate4_cap_annotation.py",
+        "gate4_type_comments.py",
+    ] {
+        assert_gate4_fixture_matches_cpython(fixture);
+    }
+}
+
+#[test]
+fn gate4_fstrings_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate4_fstrings.py");
+}
+
+#[test]
+fn gate4_comprehension_scope_matches_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate4_comprehension_scope.py");
+}
+
+#[test]
+fn gate4_generator_expressions_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate4_generator_expressions.py");
+    assert_gate4_fixture_matches_cpython("gate4_cap_generator_expression.py");
+}
+
+#[test]
+fn gate4_generator_expression_state_survives_forced_gc() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate4_generator_gc.py", Some(32_768));
+}
+
+#[test]
+fn gate4_match_core_matches_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate4_match_core.py");
+    assert_gate4_fixture_matches_cpython("gate4_cap_match.py");
+}
+
+#[test]
+fn gate4_match_tentative_bindings_survive_forced_gc() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate4_match_gc.py", Some(32_768));
+}
+
+#[test]
+fn gate4_sequence_and_mapping_patterns_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate4_cap_match_sequence.py");
+    assert_gate4_fixture_matches_cpython("gate4_match_sequence_mapping.py");
+}
+
+#[test]
+fn gate4_sequence_and_mapping_patterns_survive_forced_gc() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate4_match_sequence_mapping_gc.py",
+        Some(32_768),
+    );
+}
+
+#[test]
+fn gate4_class_patterns_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate4_cap_match_class.py");
+    assert_gate4_fixture_matches_cpython("gate4_match_class_patterns.py");
+}
+
+#[test]
+fn gate4_class_patterns_survive_forced_gc() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate4_match_class_gc.py", Some(32_768));
+}
+
+#[test]
+fn gate4_cross_feature_composition_matches_cpython_312() {
+    for fixture in ["gate4_composition.py", "gate4_composition_failures.py"] {
+        assert_gate4_fixture_matches_cpython(fixture);
+    }
+}
+
+#[test]
+fn gate4_cross_feature_traceback_shape_matches_cpython_312() {
+    let fixture = "gate4_composition_traceback.py";
+    let request = request(fixture, output(fixture));
+    let artifact = rimera_compiler::build(request.clone()).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&request.entry)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    let native_stderr = String::from_utf8_lossy(&native.stderr);
+    let python_stderr = String::from_utf8_lossy(&python.stderr);
+    for frame in [
+        "line 10, in <module>",
+        "line 7, in render",
+        "line 3, in __format__",
+    ] {
+        assert!(
+            native_stderr.contains(frame),
+            "native traceback missed {frame}: {native_stderr}"
+        );
+        assert!(
+            python_stderr.contains(frame),
+            "CPython traceback missed {frame}: {python_stderr}"
+        );
+    }
+    assert!(!native_stderr.contains("in <listcomp>"), "{native_stderr}");
+    assert!(!python_stderr.contains("in <listcomp>"), "{python_stderr}");
+    assert!(native_stderr.ends_with("ValueError: composition traceback\n"));
+    assert!(python_stderr.ends_with("ValueError: composition traceback\n"));
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate4_cross_feature_composition_survives_forced_gc() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate4_composition_gc.py", Some(32_768));
+}
+
+#[test]
+fn gate4_heap_limit_failure_preserves_cross_feature_state() {
+    let fixture = "gate4_composition_heap_limit.py";
+    let mut request = request(fixture, output(fixture));
+    request.heap_limit_bytes = Some(90_000);
+    let artifact = rimera_compiler::build(request).unwrap();
+    let native = run(&artifact.executable);
+    assert_eq!(native.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "before {'stable': [1, 2], 'other': 3} 10 second-old third-old pattern-old\nmemory {'stable': [1, 2], 'other': 3} 10 second-old third-old pattern-old\nafter 2 2\n"
+    );
+    assert!(native.stderr.is_empty());
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate4_match_semantic_failures_are_stable_and_emit_no_artifact() {
+    for (fixture, expected_fragment) in [
+        ("gate4_match_duplicate_capture.py", "more than once"),
+        ("gate4_match_inconsistent_or.py", "must bind the same names"),
+        (
+            "gate4_match_unreachable_or.py",
+            "makes later alternatives unreachable",
+        ),
+    ] {
+        let output = output(fixture);
+        let diagnostics = rimera_compiler::build(request(fixture, output.clone())).unwrap_err();
+        let diagnostic = &diagnostics.as_slice()[0];
+        assert_eq!(diagnostic.code, "RIM-SEMA-001", "fixture: {fixture}");
+        assert!(
+            diagnostic.span.end > diagnostic.span.start,
+            "{diagnostic:?}"
+        );
+        assert!(
+            diagnostic.message.contains(expected_fragment),
+            "fixture: {fixture}: {diagnostic:?}"
+        );
+        assert!(!output.exists(), "fixture emitted an artifact: {fixture}");
+    }
+}
+
+#[test]
+fn gate4_list_comprehensions_match_cpython_312() {
+    for fixture in ["gate4_cap_list_comp.py", "gate4_list_comprehensions.py"] {
+        assert_gate4_fixture_matches_cpython(fixture);
+    }
+}
+
+#[test]
+fn gate4_list_comprehension_growth_obeys_managed_heap_limits() {
+    let fixture = "gate4_list_comprehension_growth.py";
+    let normal_request = request(fixture, output("gate4_list_comp_growth_ok"));
+    let normal_artifact = rimera_compiler::build(normal_request).unwrap();
+    let normal = run(&normal_artifact.executable);
+    assert_eq!(normal.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&normal.stdout), "4096\n");
+    assert!(normal.stderr.is_empty());
+    assert_native_only_artifact(&normal_artifact.executable);
+
+    let mut limited_request = request(fixture, output("gate4_list_comp_growth_limit"));
+    limited_request.heap_limit_bytes = Some(70_000);
+    let limited_artifact = rimera_compiler::build(limited_request).unwrap();
+    let limited = run(&limited_artifact.executable);
+    assert_eq!(limited.status.code(), Some(1));
+    assert!(limited.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&limited.stderr);
+    assert!(
+        stderr.ends_with("MemoryError: managed heap limit exceeded\n"),
+        "{stderr}"
+    );
+    assert_native_only_artifact(&limited_artifact.executable);
+}
+
+#[test]
+fn gate4_set_and_dictionary_comprehensions_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate4_set_dict_comprehensions.py");
+}
+
+#[test]
+fn gate4_dictionary_unpacking_matches_cpython_312() {
+    for fixture in ["gate4_dictionary_unpacking.py", "gate4_cap_dict_unpack.py"] {
+        let request = request(fixture, output(fixture));
+        let artifact = rimera_compiler::build(request.clone()).unwrap();
+        let native = run(&artifact.executable);
+        let python = Command::new("/opt/homebrew/bin/python3.12")
+            .arg(&request.entry)
+            .output()
+            .unwrap();
+        assert_eq!(native.status.code(), python.status.code(), "{fixture}");
+        assert_eq!(native.stdout, python.stdout, "{fixture}");
+        assert_eq!(native.stderr, python.stderr, "{fixture}");
+        assert_native_only_artifact(&artifact.executable);
+    }
+}
+
+#[test]
+fn gate4_expanded_calls_match_cpython_312() {
+    for fixture in ["gate4_expanded_calls.py", "gate4_cap_expanded_call.py"] {
+        let request = request(fixture, output(fixture));
+        let artifact = rimera_compiler::build(request.clone()).unwrap();
+        let native = run(&artifact.executable);
+        let python = Command::new("/opt/homebrew/bin/python3.12")
+            .arg(&request.entry)
+            .output()
+            .unwrap();
+        assert_eq!(native.status.code(), python.status.code(), "{fixture}");
+        assert_eq!(native.stdout, python.stdout, "{fixture}");
+        assert_eq!(native.stderr, python.stderr, "{fixture}");
+        assert_native_only_artifact(&artifact.executable);
     }
 }
 
@@ -771,6 +1029,105 @@ fn gate4_for_destructuring_matches_cpython_312() {
         assert_eq!(native.stderr, python.stderr, "{fixture}");
         assert_native_only_artifact(&artifact.executable);
     }
+}
+
+#[test]
+fn gate4_boolean_short_circuit_finishing_matches_cpython_312() {
+    for fixture in [
+        "boolean_short_circuit.py",
+        "gate4_boolean_short_circuit_finish.py",
+    ] {
+        let request = request(fixture, output(fixture));
+        let artifact = rimera_compiler::build(request.clone()).unwrap();
+        let native = run(&artifact.executable);
+        let python = Command::new("/opt/homebrew/bin/python3.12")
+            .arg(&request.entry)
+            .output()
+            .unwrap();
+        assert_eq!(native.status.code(), python.status.code(), "{fixture}");
+        assert_eq!(native.stdout, python.stdout, "{fixture}");
+        assert_eq!(native.stderr, python.stderr, "{fixture}");
+        assert_native_only_artifact(&artifact.executable);
+    }
+}
+
+#[test]
+fn gate4_comparison_chains_match_cpython_312() {
+    for fixture in ["gate4_comparison_chains.py", "gate4_cap_compare_chain.py"] {
+        let request = request(fixture, output(fixture));
+        let artifact = rimera_compiler::build(request.clone()).unwrap();
+        let native = run(&artifact.executable);
+        let python = Command::new("/opt/homebrew/bin/python3.12")
+            .arg(&request.entry)
+            .output()
+            .unwrap();
+        assert_eq!(native.status.code(), python.status.code(), "{fixture}");
+        assert_eq!(native.stdout, python.stdout, "{fixture}");
+        assert_eq!(native.stderr, python.stderr, "{fixture}");
+        assert_native_only_artifact(&artifact.executable);
+    }
+}
+
+#[test]
+fn gate4_slicing_and_extended_subscripts_match_cpython_312() {
+    let fixture = "gate4_slicing_extended.py";
+    let request = request(fixture, output(fixture));
+    let artifact = rimera_compiler::build(request.clone()).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&request.entry)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate4_augmented_deletion_and_assertions_match_cpython_312() {
+    for fixture in ["gate4_statements_slice11.py", "gate4_cap_assert.py"] {
+        let request = request(fixture, output(fixture));
+        let artifact = rimera_compiler::build(request.clone()).unwrap();
+        let native = run(&artifact.executable);
+        let python = Command::new("/opt/homebrew/bin/python3.12")
+            .arg(&request.entry)
+            .output()
+            .unwrap();
+        assert_eq!(native.status.code(), python.status.code(), "{fixture}");
+        assert_eq!(native.stdout, python.stdout, "{fixture}");
+        assert_eq!(native.stderr, python.stderr, "{fixture}");
+        assert_native_only_artifact(&artifact.executable);
+    }
+}
+
+#[test]
+fn gate4_assert_failure_pins_cpython_type_message_and_frame_positions() {
+    let fixture = "gate4_assert_failure.py";
+    let request = request(fixture, output(fixture));
+    let artifact = rimera_compiler::build(request.clone()).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&request.entry)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    let native_stderr = String::from_utf8_lossy(&native.stderr);
+    let python_stderr = String::from_utf8_lossy(&python.stderr);
+    for frame in ["line 5, in <module>", "line 2, in fail"] {
+        assert!(
+            native_stderr.contains(frame),
+            "native traceback missed {frame}: {native_stderr}"
+        );
+        assert!(
+            python_stderr.contains(frame),
+            "CPython traceback missed {frame}: {python_stderr}"
+        );
+    }
+    assert!(native_stderr.ends_with("AssertionError: boom\n"));
+    assert!(python_stderr.ends_with("AssertionError: boom\n"));
+    assert_native_only_artifact(&artifact.executable);
 }
 
 #[test]
@@ -807,6 +1164,11 @@ fn gate4_general_starred_unpacking_matches_cpython_312() {
     assert_eq!(native.stdout, python.stdout);
     assert_eq!(native.stderr, python.stderr);
     assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate4_class_body_recursive_and_chained_unpacking_matches_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate4_class_body_unpacking.py");
 }
 
 #[test]

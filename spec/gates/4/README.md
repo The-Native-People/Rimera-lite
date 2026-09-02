@@ -38,25 +38,25 @@ cleanup machinery must be extended rather than duplicated.
 - [x] Slice 2 — recursive targets
 - [x] Slice 3 — nested exact unpacking
 - [x] Slice 4 — general starred unpacking
-- [ ] Slice 5 — loop/comprehension destructuring
-- [ ] Slice 6 — dictionary unpacking
-- [ ] Slice 7 — expanded calls
-- [ ] Slice 8 — boolean short-circuit
-- [ ] Slice 9 — chained comparisons
-- [ ] Slice 10 — slicing and extended subscripts
-- [ ] Slice 11 — augmented assignment, deletion, assertions
-- [ ] Slice 12 — assignment expressions
-- [ ] Slice 13 — annotations
-- [ ] Slice 14 — f-strings
-- [ ] Slice 15 — comprehension scope/CFG
-- [ ] Slice 16 — list comprehensions
-- [ ] Slice 17 — set/dictionary comprehensions
-- [ ] Slice 18 — generator expressions
-- [ ] Slice 19 — pattern CFG/bindings
-- [ ] Slice 20 — core patterns
-- [ ] Slice 21 — sequence/mapping patterns
-- [ ] Slice 22 — class patterns
-- [ ] Slice 23 — composition/GC/failure proof
+- [x] Slice 5 — loop/comprehension destructuring
+- [x] Slice 6 — dictionary unpacking
+- [x] Slice 7 — expanded calls
+- [x] Slice 8 — boolean short-circuit
+- [x] Slice 9 — chained comparisons
+- [x] Slice 10 — slicing and extended subscripts
+- [x] Slice 11 — augmented assignment, deletion, assertions
+- [x] Slice 12 — assignment expressions
+- [x] Slice 13 — annotations
+- [x] Slice 14 — f-strings
+- [x] Slice 15 — comprehension scope/CFG
+- [x] Slice 16 — list comprehensions
+- [x] Slice 17 — set/dictionary comprehensions
+- [x] Slice 18 — generator expressions
+- [x] Slice 19 — pattern CFG/bindings
+- [x] Slice 20 — core patterns
+- [x] Slice 21 — sequence/mapping patterns
+- [x] Slice 22 — class patterns
+- [x] Slice 23 — composition/GC/failure proof
 - [ ] Slice 24 — final audit and tracker closure
 
 ## Slice order

@@ -7,9 +7,9 @@ def home:
     return {
         "status": "200"
     }
- # or use rimera short codes
+# or use rimera short codes
 
- app.get("/error")
+@app.get("/error")
  def error():
      return err(
          500,

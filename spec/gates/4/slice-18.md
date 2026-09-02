@@ -29,3 +29,24 @@ capability diagnostic for generator expressions.
 
 Public differentials prove laziness, evaluation order, exceptions, closure
 mutation, repeated exhaustion, and forced-GC survival.
+
+## Completion evidence
+
+- `lower::tests::gate4_generator_expression_mir_uses_yield_and_persists_only_live_state`
+  proves hidden `Generator` MIR, the `.0` outer iterator, explicit `Yield`,
+  liveness-derived persistence, and suspension roots without whole-frame
+  retention.
+- `mir::tests::generator_yield_verification_and_persistent_liveness_are_explicit`
+  proves the verifier rejects `Yield` outside generator functions and separates
+  yield-time roots from values that actually remain live after resumption.
+- `gate4_generator_expressions_match_cpython_312` covers immediate outer
+  iterable evaluation, lazy filters/elements/inner clauses, closure mutation,
+  nested iteration, exceptions, ordinary iteration, and repeated exhaustion.
+- `gate4_generator_expression_state_survives_forced_gc` runs the public native
+  artifact under a 32 KiB managed-heap limit while suspended state crosses
+  repeated allocation/collection pressure and compares stdout/stderr/status
+  with CPython 3.12.11.
+- Public artifacts are scanned by `assert_native_only_artifact` for CPython,
+  generated-C, `setjmp`, and `longjmp` symbols.
+
+## DONE BY CHATGPT

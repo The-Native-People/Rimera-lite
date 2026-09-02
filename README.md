@@ -1,4 +1,6 @@
 # Rimera (lite)
+### Rimera's goal is not to reimplement compiled python, we just want a performance first alternative that supports python
+PS; in my humble 16 year old opinon, agents write most of our code, so why change the syntax? why change whats already there? Instead let's build on these primitives with a better foundation.
 
 Rimera is a clean native Python compiler. Its implemented path is:
 

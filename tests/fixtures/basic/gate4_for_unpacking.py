@@ -1,33 +1,33 @@
 class RowIter:
-    def __init__(self):
+    def __init__(self, rows):
+        self.rows = rows
         self.index = 0
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        rows = [[1, 2], [3, 4, 5], [6, [7, 8]]]
-        if self.index == 3:
+        if self.index == len(self.rows):
             raise StopIteration
-        value = rows[self.index]
+        value = self.rows[self.index]
         self.index += 1
         return value
 
 
 pairs = []
-for left, right in [[1, 2], [3, 4]]:
+for left, right in RowIter([[1, 2], [3, 4]]):
     pairs.append((left, right))
 else:
     pairs.append(("else", 5))
 print(pairs)
 
 stars = []
-for first, *middle, last in [[1, 2, 3, 4], [5, 6]]:
+for first, *middle, last in RowIter([[1, 2, 3, 4], [5, 6]]):
     stars.append((first, middle, last))
 print(stars)
 
 nested = []
-for left, (middle, right) in [[1, [2, 3]], [4, [5, 6]]]:
+for left, (middle, right) in RowIter([[1, [2, 3]], [4, [5, 6]]]):
     nested.append((left, middle, right))
 print(nested)
 

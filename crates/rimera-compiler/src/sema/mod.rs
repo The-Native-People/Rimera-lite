@@ -19,6 +19,7 @@ pub fn analyze(path: &Path, module: &syntax::Module) -> Result<hir::Module, Diag
         in_except_star: false,
         handler_depth: 0,
         builtin_print_stable,
+        class_depth: 0,
     };
     Ok(hir::Module {
         filename: module.filename.clone(),
@@ -92,10 +93,31 @@ impl RawScope {
                         self.scan_target(target);
                     }
                 }
+                syntax::StatementKind::AnnAssign {
+                    target,
+                    annotation,
+                    value,
+                    ..
+                } => {
+                    self.scan_target(target);
+                    if let Some(value) = value {
+                        self.scan_expression(value);
+                    }
+                    if !self.is_function {
+                        self.scan_expression(annotation);
+                    }
+                }
+                syntax::StatementKind::Assert { test, message } => {
+                    self.scan_expression(test);
+                    if let Some(message) = message {
+                        self.scan_expression(message);
+                    }
+                }
                 syntax::StatementKind::FunctionDef {
                     name,
                     decorators,
                     parameters,
+                    return_annotation,
                     body,
                 } => {
                     self.assigned.insert(name.clone());
@@ -106,6 +128,14 @@ impl RawScope {
                         if let Some(default) = &parameter.default {
                             self.scan_expression(default);
                         }
+                    }
+                    for parameter in parameters {
+                        if let Some(annotation) = &parameter.annotation {
+                            self.scan_expression(annotation);
+                        }
+                    }
+                    if let Some(annotation) = return_annotation {
+                        self.scan_expression(annotation);
                     }
                     self.children.push(Self::function(parameters, body));
                 }
@@ -200,7 +230,71 @@ impl RawScope {
                     self.scan_statements(body);
                     self.scan_statements(else_body);
                 }
+                syntax::StatementKind::Match { subject, cases } => {
+                    self.scan_expression(subject);
+                    for case in cases {
+                        self.scan_pattern(&case.pattern);
+                        if let Some(guard) = &case.guard {
+                            self.scan_expression(guard);
+                        }
+                        self.scan_statements(&case.body);
+                    }
+                }
             }
+        }
+    }
+
+    fn scan_pattern(&mut self, pattern: &syntax::Pattern) {
+        match &pattern.kind {
+            syntax::PatternKind::Value(value) => self.scan_expression(value),
+            syntax::PatternKind::Capture(name) => {
+                self.assigned.insert(name.clone());
+            }
+            syntax::PatternKind::As { pattern, name } => {
+                self.scan_pattern(pattern);
+                self.assigned.insert(name.clone());
+            }
+            syntax::PatternKind::Or(patterns) | syntax::PatternKind::Sequence(patterns) => {
+                for pattern in patterns {
+                    self.scan_pattern(pattern);
+                }
+            }
+            syntax::PatternKind::Star(name) => {
+                if let Some(name) = name {
+                    self.assigned.insert(name.clone());
+                }
+            }
+            syntax::PatternKind::Mapping {
+                keys,
+                patterns,
+                rest,
+            } => {
+                for key in keys {
+                    self.scan_expression(key);
+                }
+                for pattern in patterns {
+                    self.scan_pattern(pattern);
+                }
+                if let Some(rest) = rest {
+                    self.assigned.insert(rest.clone());
+                }
+            }
+            syntax::PatternKind::Class {
+                class,
+                positional,
+                keywords,
+            } => {
+                self.scan_expression(class);
+                for pattern in positional {
+                    self.scan_pattern(pattern);
+                }
+                for (_, pattern) in keywords {
+                    self.scan_pattern(pattern);
+                }
+            }
+            syntax::PatternKind::SingletonNone
+            | syntax::PatternKind::SingletonBool(_)
+            | syntax::PatternKind::Wildcard => {}
         }
     }
 
@@ -267,6 +361,24 @@ impl RawScope {
                         self.scan_target_reads(target);
                     }
                 }
+                syntax::StatementKind::AnnAssign {
+                    target,
+                    annotation,
+                    value,
+                    ..
+                } => {
+                    self.scan_target_reads(target);
+                    if let Some(value) = value {
+                        self.scan_expression(value);
+                    }
+                    self.scan_expression(annotation);
+                }
+                syntax::StatementKind::Assert { test, message } => {
+                    self.scan_expression(test);
+                    if let Some(message) = message {
+                        self.scan_expression(message);
+                    }
+                }
                 syntax::StatementKind::If {
                     condition,
                     then_body,
@@ -298,6 +410,7 @@ impl RawScope {
                 syntax::StatementKind::FunctionDef {
                     decorators,
                     parameters,
+                    return_annotation,
                     body,
                     ..
                 } => {
@@ -308,6 +421,14 @@ impl RawScope {
                         if let Some(default) = &parameter.default {
                             self.scan_expression(default);
                         }
+                    }
+                    for parameter in parameters {
+                        if let Some(annotation) = &parameter.annotation {
+                            self.scan_expression(annotation);
+                        }
+                    }
+                    if let Some(annotation) = return_annotation {
+                        self.scan_expression(annotation);
                     }
                     self.children.push(Self::function(parameters, body));
                 }
@@ -362,10 +483,36 @@ impl RawScope {
             syntax::ExpressionKind::Boolean { values, .. } => {
                 values.iter().for_each(|value| self.scan_expression(value));
             }
-            syntax::ExpressionKind::Binary { left, right, .. }
-            | syntax::ExpressionKind::Compare { left, right, .. } => {
+            syntax::ExpressionKind::Binary { left, right, .. } => {
                 self.scan_expression(left);
                 self.scan_expression(right);
+            }
+            syntax::ExpressionKind::Compare { left, comparisons } => {
+                self.scan_expression(left);
+                comparisons
+                    .iter()
+                    .for_each(|(_, right)| self.scan_expression(right));
+            }
+            syntax::ExpressionKind::NamedExpression { name, value } => {
+                self.assigned.insert(name.clone());
+                self.scan_expression(value);
+            }
+            syntax::ExpressionKind::Comprehension {
+                element,
+                key,
+                clauses,
+                ..
+            } => self.scan_comprehension(element, key.as_deref(), clauses),
+            syntax::ExpressionKind::JoinedString(values) => {
+                values.iter().for_each(|value| self.scan_expression(value));
+            }
+            syntax::ExpressionKind::FormattedValue {
+                value, format_spec, ..
+            } => {
+                self.scan_expression(value);
+                if let Some(format_spec) = format_spec {
+                    self.scan_expression(format_spec);
+                }
             }
             syntax::ExpressionKind::Call { callable, parts } => {
                 self.scan_expression(callable);
@@ -385,6 +532,575 @@ impl RawScope {
             | syntax::ExpressionKind::Complex { .. } => {}
         }
     }
+
+    fn scan_comprehension(
+        &mut self,
+        element: &syntax::Expression,
+        key: Option<&syntax::Expression>,
+        clauses: &[syntax::ComprehensionClause],
+    ) {
+        let Some((first, _)) = clauses.split_first() else {
+            return;
+        };
+
+        // Python evaluates the outermost iterable in the containing scope and
+        // only then enters the implicit comprehension function.
+        self.scan_expression(&first.iterable);
+
+        let mut walrus = BTreeSet::new();
+        collect_comprehension_walrus_names(element, &mut walrus);
+        if let Some(key) = key {
+            collect_comprehension_walrus_names(key, &mut walrus);
+        }
+        for clause in clauses {
+            collect_comprehension_walrus_names(&clause.iterable, &mut walrus);
+            for filter in &clause.filters {
+                collect_comprehension_walrus_names(filter, &mut walrus);
+            }
+        }
+        self.assigned.extend(walrus.iter().cloned());
+        let globals = walrus
+            .iter()
+            .filter(|name| !self.is_function || self.explicit_globals.contains(*name))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let child = Self::comprehension_scope(element, key, clauses, &walrus, &globals);
+        self.children.push(child);
+    }
+
+    fn comprehension_scope(
+        element: &syntax::Expression,
+        key: Option<&syntax::Expression>,
+        clauses: &[syntax::ComprehensionClause],
+        walrus: &BTreeSet<String>,
+        globals: &BTreeSet<String>,
+    ) -> Self {
+        let mut scope = Self::empty(true);
+        scope.parameters.insert(".0".to_owned());
+        for (index, clause) in clauses.iter().enumerate() {
+            if index != 0 {
+                scope.scan_expression_in_comprehension(&clause.iterable, walrus, globals);
+            }
+            scope.scan_target(&clause.target);
+            for filter in &clause.filters {
+                scope.scan_expression_in_comprehension(filter, walrus, globals);
+            }
+        }
+        if let Some(key) = key {
+            scope.scan_expression_in_comprehension(key, walrus, globals);
+        }
+        scope.scan_expression_in_comprehension(element, walrus, globals);
+        scope
+    }
+
+    fn scan_expression_in_comprehension(
+        &mut self,
+        expression: &syntax::Expression,
+        walrus: &BTreeSet<String>,
+        globals: &BTreeSet<String>,
+    ) {
+        match &expression.kind {
+            syntax::ExpressionKind::NamedExpression { name, value } if walrus.contains(name) => {
+                self.used.insert(name.clone());
+                if globals.contains(name) {
+                    self.explicit_globals.insert(name.clone());
+                } else {
+                    self.nonlocals.insert(name.clone());
+                }
+                self.scan_expression_in_comprehension(value, walrus, globals);
+            }
+            syntax::ExpressionKind::Comprehension {
+                element,
+                key,
+                clauses,
+                ..
+            } => {
+                if let Some(first) = clauses.first() {
+                    self.scan_expression_in_comprehension(&first.iterable, walrus, globals);
+                    let child = Self::comprehension_scope(
+                        element,
+                        key.as_deref(),
+                        clauses,
+                        walrus,
+                        globals,
+                    );
+                    self.children.push(child);
+                }
+            }
+            syntax::ExpressionKind::Lambda { parameters, body } => {
+                for parameter in parameters {
+                    if let Some(default) = &parameter.default {
+                        self.scan_expression_in_comprehension(default, walrus, globals);
+                    }
+                }
+                let mut child = Self::empty(true);
+                child
+                    .parameters
+                    .extend(parameters.iter().map(|parameter| parameter.name.clone()));
+                child.scan_expression(body);
+                self.children.push(child);
+            }
+            syntax::ExpressionKind::Name(name) => {
+                self.used.insert(name.clone());
+            }
+            syntax::ExpressionKind::List(values)
+            | syntax::ExpressionKind::Tuple(values)
+            | syntax::ExpressionKind::Set(values)
+            | syntax::ExpressionKind::Boolean { values, .. }
+            | syntax::ExpressionKind::JoinedString(values) => {
+                for value in values {
+                    self.scan_expression_in_comprehension(value, walrus, globals);
+                }
+            }
+            syntax::ExpressionKind::Dictionary(entries) => {
+                for entry in entries {
+                    match entry {
+                        syntax::DictionaryEntry::Pair { key, value } => {
+                            self.scan_expression_in_comprehension(key, walrus, globals);
+                            self.scan_expression_in_comprehension(value, walrus, globals);
+                        }
+                        syntax::DictionaryEntry::Unpack(value) => {
+                            self.scan_expression_in_comprehension(value, walrus, globals);
+                        }
+                    }
+                }
+            }
+            syntax::ExpressionKind::Subscript { value, index } => {
+                self.scan_expression_in_comprehension(value, walrus, globals);
+                self.scan_expression_in_comprehension(index, walrus, globals);
+            }
+            syntax::ExpressionKind::Slice { start, stop, step } => {
+                for value in [start, stop, step].into_iter().flatten() {
+                    self.scan_expression_in_comprehension(value, walrus, globals);
+                }
+            }
+            syntax::ExpressionKind::Attribute { value, .. }
+            | syntax::ExpressionKind::Unary { operand: value, .. } => {
+                self.scan_expression_in_comprehension(value, walrus, globals);
+            }
+            syntax::ExpressionKind::Binary { left, right, .. } => {
+                self.scan_expression_in_comprehension(left, walrus, globals);
+                self.scan_expression_in_comprehension(right, walrus, globals);
+            }
+            syntax::ExpressionKind::Compare { left, comparisons } => {
+                self.scan_expression_in_comprehension(left, walrus, globals);
+                for (_, right) in comparisons {
+                    self.scan_expression_in_comprehension(right, walrus, globals);
+                }
+            }
+            syntax::ExpressionKind::FormattedValue {
+                value, format_spec, ..
+            } => {
+                self.scan_expression_in_comprehension(value, walrus, globals);
+                if let Some(format_spec) = format_spec {
+                    self.scan_expression_in_comprehension(format_spec, walrus, globals);
+                }
+            }
+            syntax::ExpressionKind::Call { callable, parts } => {
+                self.scan_expression_in_comprehension(callable, walrus, globals);
+                for part in parts {
+                    let value = match part {
+                        syntax::CallPart::Positional(value)
+                        | syntax::CallPart::Starred(value)
+                        | syntax::CallPart::Keyword { value, .. }
+                        | syntax::CallPart::KeywordUnpack(value) => value,
+                    };
+                    self.scan_expression_in_comprehension(value, walrus, globals);
+                }
+            }
+            syntax::ExpressionKind::NamedExpression { name, value } => {
+                self.assigned.insert(name.clone());
+                self.scan_expression_in_comprehension(value, walrus, globals);
+            }
+            syntax::ExpressionKind::None
+            | syntax::ExpressionKind::Bool(_)
+            | syntax::ExpressionKind::Int(_)
+            | syntax::ExpressionKind::Float(_)
+            | syntax::ExpressionKind::String(_)
+            | syntax::ExpressionKind::Bytes(_)
+            | syntax::ExpressionKind::Complex { .. } => {}
+        }
+    }
+}
+
+fn collect_comprehension_walrus_names(
+    expression: &syntax::Expression,
+    names: &mut BTreeSet<String>,
+) {
+    match &expression.kind {
+        syntax::ExpressionKind::NamedExpression { name, value } => {
+            names.insert(name.clone());
+            collect_comprehension_walrus_names(value, names);
+        }
+        syntax::ExpressionKind::Comprehension {
+            element,
+            key,
+            clauses,
+            ..
+        } => {
+            for clause in clauses {
+                collect_comprehension_walrus_names(&clause.iterable, names);
+                for filter in &clause.filters {
+                    collect_comprehension_walrus_names(filter, names);
+                }
+            }
+            if let Some(key) = key {
+                collect_comprehension_walrus_names(key, names);
+            }
+            collect_comprehension_walrus_names(element, names);
+        }
+        syntax::ExpressionKind::Lambda { parameters, .. } => {
+            for parameter in parameters {
+                if let Some(default) = &parameter.default {
+                    collect_comprehension_walrus_names(default, names);
+                }
+            }
+        }
+        syntax::ExpressionKind::List(values)
+        | syntax::ExpressionKind::Tuple(values)
+        | syntax::ExpressionKind::Set(values)
+        | syntax::ExpressionKind::Boolean { values, .. }
+        | syntax::ExpressionKind::JoinedString(values) => {
+            for value in values {
+                collect_comprehension_walrus_names(value, names);
+            }
+        }
+        syntax::ExpressionKind::Dictionary(entries) => {
+            for entry in entries {
+                match entry {
+                    syntax::DictionaryEntry::Pair { key, value } => {
+                        collect_comprehension_walrus_names(key, names);
+                        collect_comprehension_walrus_names(value, names);
+                    }
+                    syntax::DictionaryEntry::Unpack(value) => {
+                        collect_comprehension_walrus_names(value, names);
+                    }
+                }
+            }
+        }
+        syntax::ExpressionKind::Subscript { value, index } => {
+            collect_comprehension_walrus_names(value, names);
+            collect_comprehension_walrus_names(index, names);
+        }
+        syntax::ExpressionKind::Slice { start, stop, step } => {
+            for value in [start, stop, step].into_iter().flatten() {
+                collect_comprehension_walrus_names(value, names);
+            }
+        }
+        syntax::ExpressionKind::Attribute { value, .. }
+        | syntax::ExpressionKind::Unary { operand: value, .. } => {
+            collect_comprehension_walrus_names(value, names);
+        }
+        syntax::ExpressionKind::Binary { left, right, .. } => {
+            collect_comprehension_walrus_names(left, names);
+            collect_comprehension_walrus_names(right, names);
+        }
+        syntax::ExpressionKind::Compare { left, comparisons } => {
+            collect_comprehension_walrus_names(left, names);
+            for (_, right) in comparisons {
+                collect_comprehension_walrus_names(right, names);
+            }
+        }
+        syntax::ExpressionKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            collect_comprehension_walrus_names(value, names);
+            if let Some(format_spec) = format_spec {
+                collect_comprehension_walrus_names(format_spec, names);
+            }
+        }
+        syntax::ExpressionKind::Call { callable, parts } => {
+            collect_comprehension_walrus_names(callable, names);
+            for part in parts {
+                let value = match part {
+                    syntax::CallPart::Positional(value)
+                    | syntax::CallPart::Starred(value)
+                    | syntax::CallPart::Keyword { value, .. }
+                    | syntax::CallPart::KeywordUnpack(value) => value,
+                };
+                collect_comprehension_walrus_names(value, names);
+            }
+        }
+        syntax::ExpressionKind::Name(_)
+        | syntax::ExpressionKind::None
+        | syntax::ExpressionKind::Bool(_)
+        | syntax::ExpressionKind::Int(_)
+        | syntax::ExpressionKind::Float(_)
+        | syntax::ExpressionKind::String(_)
+        | syntax::ExpressionKind::Bytes(_)
+        | syntax::ExpressionKind::Complex { .. } => {}
+    }
+}
+
+fn comprehension_target_names(target: &syntax::Target, names: &mut BTreeSet<String>) {
+    match &target.kind {
+        syntax::TargetKind::Name(name) => {
+            names.insert(name.clone());
+        }
+        syntax::TargetKind::Sequence { elements, .. } => {
+            for element in elements {
+                comprehension_target_names(element, names);
+            }
+        }
+        syntax::TargetKind::Starred(target) => comprehension_target_names(target, names),
+        syntax::TargetKind::Attribute { .. } | syntax::TargetKind::Item { .. } => {}
+    }
+}
+
+fn validate_comprehension_expression(
+    path: &Path,
+    expression: &syntax::Expression,
+    iteration_names: &BTreeSet<String>,
+    in_iterable: bool,
+    in_class_body: bool,
+) -> Result<(), DiagnosticSet> {
+    match &expression.kind {
+        syntax::ExpressionKind::NamedExpression { name, value } => {
+            if in_iterable {
+                return Err(sema_error(
+                    path,
+                    "assignment expression cannot be used in a comprehension iterable expression",
+                ));
+            }
+            if iteration_names.contains(name) {
+                return Err(sema_error(
+                    path,
+                    format!(
+                        "assignment expression cannot rebind comprehension iteration variable `{name}`"
+                    ),
+                ));
+            }
+            if in_class_body {
+                return Err(sema_error(
+                    path,
+                    "assignment expression within a comprehension cannot be used in a class body",
+                ));
+            }
+            validate_comprehension_expression(
+                path,
+                value,
+                iteration_names,
+                in_iterable,
+                in_class_body,
+            )?;
+        }
+        syntax::ExpressionKind::Comprehension {
+            element,
+            key,
+            clauses,
+            ..
+        } => {
+            let mut nested_names = iteration_names.clone();
+            for clause in clauses {
+                comprehension_target_names(&clause.target, &mut nested_names);
+            }
+            for clause in clauses {
+                validate_comprehension_expression(
+                    path,
+                    &clause.iterable,
+                    &nested_names,
+                    true,
+                    in_class_body,
+                )?;
+                for filter in &clause.filters {
+                    validate_comprehension_expression(
+                        path,
+                        filter,
+                        &nested_names,
+                        false,
+                        in_class_body,
+                    )?;
+                }
+            }
+            if let Some(key) = key {
+                validate_comprehension_expression(path, key, &nested_names, false, in_class_body)?;
+            }
+            validate_comprehension_expression(path, element, &nested_names, false, in_class_body)?;
+        }
+        syntax::ExpressionKind::Lambda { parameters, .. } => {
+            for parameter in parameters {
+                if let Some(default) = &parameter.default {
+                    validate_comprehension_expression(
+                        path,
+                        default,
+                        iteration_names,
+                        in_iterable,
+                        in_class_body,
+                    )?;
+                }
+            }
+        }
+        syntax::ExpressionKind::List(values)
+        | syntax::ExpressionKind::Tuple(values)
+        | syntax::ExpressionKind::Set(values)
+        | syntax::ExpressionKind::Boolean { values, .. }
+        | syntax::ExpressionKind::JoinedString(values) => {
+            for value in values {
+                validate_comprehension_expression(
+                    path,
+                    value,
+                    iteration_names,
+                    in_iterable,
+                    in_class_body,
+                )?;
+            }
+        }
+        syntax::ExpressionKind::Dictionary(entries) => {
+            for entry in entries {
+                match entry {
+                    syntax::DictionaryEntry::Pair { key, value } => {
+                        validate_comprehension_expression(
+                            path,
+                            key,
+                            iteration_names,
+                            in_iterable,
+                            in_class_body,
+                        )?;
+                        validate_comprehension_expression(
+                            path,
+                            value,
+                            iteration_names,
+                            in_iterable,
+                            in_class_body,
+                        )?;
+                    }
+                    syntax::DictionaryEntry::Unpack(value) => {
+                        validate_comprehension_expression(
+                            path,
+                            value,
+                            iteration_names,
+                            in_iterable,
+                            in_class_body,
+                        )?;
+                    }
+                }
+            }
+        }
+        syntax::ExpressionKind::Subscript { value, index } => {
+            validate_comprehension_expression(
+                path,
+                value,
+                iteration_names,
+                in_iterable,
+                in_class_body,
+            )?;
+            validate_comprehension_expression(
+                path,
+                index,
+                iteration_names,
+                in_iterable,
+                in_class_body,
+            )?;
+        }
+        syntax::ExpressionKind::Slice { start, stop, step } => {
+            for value in [start, stop, step].into_iter().flatten() {
+                validate_comprehension_expression(
+                    path,
+                    value,
+                    iteration_names,
+                    in_iterable,
+                    in_class_body,
+                )?;
+            }
+        }
+        syntax::ExpressionKind::Attribute { value, .. }
+        | syntax::ExpressionKind::Unary { operand: value, .. } => {
+            validate_comprehension_expression(
+                path,
+                value,
+                iteration_names,
+                in_iterable,
+                in_class_body,
+            )?;
+        }
+        syntax::ExpressionKind::Binary { left, right, .. } => {
+            validate_comprehension_expression(
+                path,
+                left,
+                iteration_names,
+                in_iterable,
+                in_class_body,
+            )?;
+            validate_comprehension_expression(
+                path,
+                right,
+                iteration_names,
+                in_iterable,
+                in_class_body,
+            )?;
+        }
+        syntax::ExpressionKind::Compare { left, comparisons } => {
+            validate_comprehension_expression(
+                path,
+                left,
+                iteration_names,
+                in_iterable,
+                in_class_body,
+            )?;
+            for (_, right) in comparisons {
+                validate_comprehension_expression(
+                    path,
+                    right,
+                    iteration_names,
+                    in_iterable,
+                    in_class_body,
+                )?;
+            }
+        }
+        syntax::ExpressionKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            validate_comprehension_expression(
+                path,
+                value,
+                iteration_names,
+                in_iterable,
+                in_class_body,
+            )?;
+            if let Some(format_spec) = format_spec {
+                validate_comprehension_expression(
+                    path,
+                    format_spec,
+                    iteration_names,
+                    in_iterable,
+                    in_class_body,
+                )?;
+            }
+        }
+        syntax::ExpressionKind::Call { callable, parts } => {
+            validate_comprehension_expression(
+                path,
+                callable,
+                iteration_names,
+                in_iterable,
+                in_class_body,
+            )?;
+            for part in parts {
+                let value = match part {
+                    syntax::CallPart::Positional(value)
+                    | syntax::CallPart::Starred(value)
+                    | syntax::CallPart::Keyword { value, .. }
+                    | syntax::CallPart::KeywordUnpack(value) => value,
+                };
+                validate_comprehension_expression(
+                    path,
+                    value,
+                    iteration_names,
+                    in_iterable,
+                    in_class_body,
+                )?;
+            }
+        }
+        syntax::ExpressionKind::Name(_)
+        | syntax::ExpressionKind::None
+        | syntax::ExpressionKind::Bool(_)
+        | syntax::ExpressionKind::Int(_)
+        | syntax::ExpressionKind::Float(_)
+        | syntax::ExpressionKind::String(_)
+        | syntax::ExpressionKind::Bytes(_)
+        | syntax::ExpressionKind::Complex { .. } => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -482,6 +1198,7 @@ struct Analyzer<'a> {
     in_except_star: bool,
     handler_depth: usize,
     builtin_print_stable: bool,
+    class_depth: usize,
 }
 
 impl Analyzer<'_> {
@@ -535,10 +1252,36 @@ impl Analyzer<'_> {
                 }
                 hir::StatementKind::Delete { targets }
             }
+            syntax::StatementKind::AnnAssign {
+                target,
+                annotation,
+                value,
+                simple,
+            } => {
+                let target = self.target(target)?;
+                self.validate_augmented_target(&target)?;
+                hir::StatementKind::AnnAssign {
+                    target,
+                    annotation: self.expression(annotation)?,
+                    value: value
+                        .as_ref()
+                        .map(|value| self.expression(value))
+                        .transpose()?,
+                    simple: *simple,
+                }
+            }
+            syntax::StatementKind::Assert { test, message } => hir::StatementKind::Assert {
+                test: self.expression(test)?,
+                message: message
+                    .as_ref()
+                    .map(|message| self.expression(message))
+                    .transpose()?,
+            },
             syntax::StatementKind::FunctionDef {
                 name,
                 decorators,
                 parameters,
+                return_annotation,
                 body,
             } => {
                 if !decorators.is_empty() {
@@ -557,6 +1300,20 @@ impl Analyzer<'_> {
                             .transpose()
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let parameter_annotations = parameters
+                    .iter()
+                    .map(|parameter| {
+                        parameter
+                            .annotation
+                            .as_ref()
+                            .map(|annotation| self.expression(annotation))
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let return_annotation = return_annotation
+                    .as_ref()
+                    .map(|annotation| self.expression(annotation))
+                    .transpose()?;
                 let child = self
                     .plan
                     .children
@@ -572,11 +1329,13 @@ impl Analyzer<'_> {
                     in_except_star: false,
                     handler_depth: 0,
                     builtin_print_stable: self.builtin_print_stable,
+                    class_depth: 0,
                 };
                 let parameters = parameters
                     .iter()
                     .zip(defaults)
-                    .map(|(parameter, default)| hir::Parameter {
+                    .zip(parameter_annotations)
+                    .map(|((parameter, default), annotation)| hir::Parameter {
                         name: parameter.name.clone(),
                         kind: match parameter.kind {
                             syntax::ParameterKind::PositionalOnly => RParameterKind::PositionalOnly,
@@ -588,6 +1347,7 @@ impl Analyzer<'_> {
                             syntax::ParameterKind::VarKeywords => RParameterKind::VarKeywords,
                         },
                         default,
+                        annotation,
                     })
                     .collect();
                 hir::StatementKind::FunctionDef {
@@ -595,6 +1355,7 @@ impl Analyzer<'_> {
                     binding: self.binding(name),
                     decorators: Vec::new(),
                     parameters,
+                    return_annotation,
                     body: analyzer.statements(body)?,
                     locals: child.locals.iter().cloned().collect(),
                     cells: child.cells.iter().cloned().collect(),
@@ -685,12 +1446,10 @@ impl Analyzer<'_> {
                 hir::StatementKind::Continue
             }
             syntax::StatementKind::Expression(expression) => {
-                if let syntax::ExpressionKind::Call {
-                    callable,
-                    positional,
-                    keywords,
-                } = &expression.kind
-                    && keywords.is_empty()
+                if let syntax::ExpressionKind::Call { callable, parts } = &expression.kind
+                    && parts
+                        .iter()
+                        .all(|part| matches!(part, syntax::CallPart::Positional(_)))
                     && self.builtin_print_stable
                     && self.binding("print") == hir::Binding::Global
                     && matches!(
@@ -699,9 +1458,12 @@ impl Analyzer<'_> {
                     )
                 {
                     hir::StatementKind::Print {
-                        values: positional
+                        values: parts
                             .iter()
-                            .map(|value| self.expression(value))
+                            .map(|part| match part {
+                                syntax::CallPart::Positional(value) => self.expression(value),
+                                _ => unreachable!("print fast path checked positional-only parts"),
+                            })
                             .collect::<Result<_, _>>()?,
                     }
                 } else {
@@ -812,6 +1574,23 @@ impl Analyzer<'_> {
                     else_body: self.statements(else_body)?,
                 }
             }
+            syntax::StatementKind::Match { subject, cases } => hir::StatementKind::Match {
+                subject: self.expression(subject)?,
+                cases: cases
+                    .iter()
+                    .map(|case| {
+                        Ok(hir::MatchCase {
+                            pattern: self.pattern(&case.pattern)?,
+                            guard: case
+                                .guard
+                                .as_ref()
+                                .map(|guard| self.expression(guard))
+                                .transpose()?,
+                            body: self.statements(&case.body)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DiagnosticSet>>()?,
+            },
         };
         Ok(Some(hir::Statement {
             span: statement.span,
@@ -823,99 +1602,70 @@ impl Analyzer<'_> {
         &mut self,
         statements: &[syntax::Statement],
     ) -> Result<Vec<hir::ClassMember>, DiagnosticSet> {
+        self.class_depth += 1;
+        let result = self.class_members_inner(statements);
+        self.class_depth -= 1;
+        result
+    }
+
+    fn class_members_inner(
+        &mut self,
+        statements: &[syntax::Statement],
+    ) -> Result<Vec<hir::ClassMember>, DiagnosticSet> {
         let mut members = Vec::with_capacity(statements.len());
         for statement in statements {
             let member = match &statement.kind {
-                syntax::StatementKind::Assign { targets, value } => {
-                    let [target] = targets.as_slice() else {
-                        return Err(capability_error(
-                            self.path,
-                            statement.span,
-                            "RIM-CAP-G4-03",
-                            "chained class-body target writes are owned by Gate 4 target execution slices",
-                        ));
-                    };
-                    match &target.kind {
-                        syntax::TargetKind::Name(name) => hir::ClassMember::Assign {
-                            name: name.clone(),
-                            value: self.expression(value)?,
-                        },
-                        syntax::TargetKind::Item { collection, index } => {
-                            hir::ClassMember::ItemAssign {
-                                collection: self.expression(collection)?,
-                                index: self.expression(index)?,
-                                value: self.expression(value)?,
-                            }
-                        }
-                        syntax::TargetKind::Attribute { receiver, name } => {
-                            hir::ClassMember::AttributeAssign {
-                                receiver: self.expression(receiver)?,
-                                name: name.clone(),
-                                value: self.expression(value)?,
-                            }
-                        }
-                        syntax::TargetKind::Sequence { .. } => {
-                            return Err(capability_error(
-                                self.path,
-                                target.span,
-                                "RIM-CAP-G4-03",
-                                "nested class-body unpacking is owned by Gate 4 Slice 3",
-                            ));
-                        }
-                        syntax::TargetKind::Starred(_) => {
-                            return Err(capability_error(
-                                self.path,
-                                target.span,
-                                "RIM-CAP-G4-04",
-                                "starred class-body unpacking is owned by Gate 4 Slice 4",
-                            ));
-                        }
-                    }
-                }
-                syntax::StatementKind::AugAssign { target, op, value } => match &target.kind {
-                    syntax::TargetKind::Name(name) => hir::ClassMember::AugAssign {
-                        name: name.clone(),
+                syntax::StatementKind::Assign { targets, value } => hir::ClassMember::Assign {
+                    targets: targets
+                        .iter()
+                        .map(|target| self.target(target))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    value: self.expression(value)?,
+                },
+                syntax::StatementKind::AugAssign { target, op, value } => {
+                    let target = self.target(target)?;
+                    self.validate_augmented_target(&target)?;
+                    hir::ClassMember::AugAssign {
+                        target,
                         op: *op,
                         value: self.expression(value)?,
-                    },
-                    _ => {
-                        return Err(capability_error(
-                            self.path,
-                            target.span,
-                            "RIM-CAP-G4-11",
-                            "non-name augmented class-body targets are owned by Gate 4 Slice 11",
-                        ));
-                    }
-                },
-                syntax::StatementKind::Delete { targets } => {
-                    let [target] = targets.as_slice() else {
-                        return Err(capability_error(
-                            self.path,
-                            statement.span,
-                            "RIM-CAP-G4-11",
-                            "general deletion targets are owned by Gate 4 Slice 11",
-                        ));
-                    };
-                    match &target.kind {
-                        syntax::TargetKind::Name(name) => {
-                            hir::ClassMember::Delete { name: name.clone() }
-                        }
-                        syntax::TargetKind::Attribute { receiver, name } => {
-                            hir::ClassMember::AttributeDelete {
-                                receiver: self.expression(receiver)?,
-                                name: name.clone(),
-                            }
-                        }
-                        _ => {
-                            return Err(capability_error(
-                                self.path,
-                                target.span,
-                                "RIM-CAP-G4-11",
-                                "general deletion targets are owned by Gate 4 Slice 11",
-                            ));
-                        }
                     }
                 }
+                syntax::StatementKind::Delete { targets } => {
+                    let targets = targets
+                        .iter()
+                        .map(|target| self.target(target))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for target in &targets {
+                        self.validate_delete_target(target)?;
+                    }
+                    hir::ClassMember::Delete { targets }
+                }
+                syntax::StatementKind::AnnAssign {
+                    target,
+                    annotation,
+                    value,
+                    simple,
+                } => {
+                    let target = self.target(target)?;
+                    self.validate_augmented_target(&target)?;
+                    hir::ClassMember::AnnAssign {
+                        target,
+                        annotation: self.expression(annotation)?,
+                        value: value
+                            .as_ref()
+                            .map(|value| self.expression(value))
+                            .transpose()?,
+                        simple: *simple,
+                    }
+                }
+                syntax::StatementKind::Assert { test, message } => hir::ClassMember::Assert {
+                    test: self.expression(test)?,
+                    message: message
+                        .as_ref()
+                        .map(|message| self.expression(message))
+                        .transpose()?,
+                },
                 syntax::StatementKind::Raise { exception, cause } => hir::ClassMember::Raise {
                     exception: exception
                         .as_ref()
@@ -998,6 +1748,7 @@ impl Analyzer<'_> {
                     name,
                     decorators,
                     parameters,
+                    return_annotation,
                     body,
                 } => {
                     let defaults = parameters
@@ -1010,6 +1761,20 @@ impl Analyzer<'_> {
                                 .transpose()
                         })
                         .collect::<Result<Vec<_>, _>>()?;
+                    let parameter_annotations = parameters
+                        .iter()
+                        .map(|parameter| {
+                            parameter
+                                .annotation
+                                .as_ref()
+                                .map(|annotation| self.expression(annotation))
+                                .transpose()
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let return_annotation = return_annotation
+                        .as_ref()
+                        .map(|annotation| self.expression(annotation))
+                        .transpose()?;
                     let child =
                         self.plan.children.get(self.child_index).ok_or_else(|| {
                             sema_error(self.path, "function scope plan is missing")
@@ -1024,11 +1789,13 @@ impl Analyzer<'_> {
                         in_except_star: false,
                         handler_depth: 0,
                         builtin_print_stable: self.builtin_print_stable,
+                        class_depth: 0,
                     };
                     let parameters = parameters
                         .iter()
                         .zip(defaults)
-                        .map(|(parameter, default)| hir::Parameter {
+                        .zip(parameter_annotations)
+                        .map(|((parameter, default), annotation)| hir::Parameter {
                             name: parameter.name.clone(),
                             kind: match parameter.kind {
                                 syntax::ParameterKind::PositionalOnly => {
@@ -1042,6 +1809,7 @@ impl Analyzer<'_> {
                                 syntax::ParameterKind::VarKeywords => RParameterKind::VarKeywords,
                             },
                             default,
+                            annotation,
                         })
                         .collect();
                     hir::ClassMember::FunctionDef {
@@ -1052,6 +1820,7 @@ impl Analyzer<'_> {
                             .collect::<Result<Vec<_>, _>>()?,
                         uses_zero_argument_super: contains_zero_argument_super(body),
                         parameters,
+                        return_annotation,
                         body: analyzer.statements(body)?,
                         locals: child.locals.iter().cloned().collect(),
                         cells: child.cells.iter().cloned().collect(),
@@ -1164,7 +1933,7 @@ impl Analyzer<'_> {
                     return Err(capability_error(
                         self.path,
                         target.span,
-                        "RIM-CAP-G4-02",
+                        "RIM-SEMA-001",
                         "a recursive assignment target may contain at most one star per sequence level",
                     ));
                 }
@@ -1203,8 +1972,8 @@ impl Analyzer<'_> {
             _ => Err(capability_error(
                 self.path,
                 target.span,
-                "RIM-CAP-G4-11",
-                "this augmented-assignment target shape is owned by Gate 4 Slice 11",
+                "RIM-SEMA-001",
+                "invalid augmented-assignment target shape",
             )),
         }
     }
@@ -1214,11 +1983,17 @@ impl Analyzer<'_> {
             hir::TargetKind::Name { .. }
             | hir::TargetKind::Attribute { .. }
             | hir::TargetKind::Item { .. } => Ok(()),
-            _ => Err(capability_error(
+            hir::TargetKind::Sequence { elements, .. } => {
+                for element in elements {
+                    self.validate_delete_target(element)?;
+                }
+                Ok(())
+            }
+            hir::TargetKind::Starred(_) => Err(capability_error(
                 self.path,
                 target.span,
-                "RIM-CAP-G4-11",
-                "general deletion targets are owned by Gate 4 Slice 11",
+                "RIM-SEMA-001",
+                "starred deletion targets are invalid",
             )),
         }
     }
@@ -1327,6 +2102,7 @@ impl Analyzer<'_> {
                     in_except_star: false,
                     handler_depth: 0,
                     builtin_print_stable: self.builtin_print_stable,
+                    class_depth: 0,
                 };
                 let parameters = parameters
                     .iter()
@@ -1343,6 +2119,7 @@ impl Analyzer<'_> {
                             syntax::ParameterKind::VarKeywords => RParameterKind::VarKeywords,
                         },
                         default,
+                        annotation: None,
                     })
                     .collect();
                 hir::ExpressionKind::Lambda {
@@ -1381,21 +2158,177 @@ impl Analyzer<'_> {
                 left: Box::new(self.expression(left)?),
                 right: Box::new(self.expression(right)?),
             },
-            syntax::ExpressionKind::Compare { op, left, right } => hir::ExpressionKind::Compare {
-                op: match op {
-                    syntax::CompareOperator::Equal => hir::CompareOperator::Equal,
-                    syntax::CompareOperator::NotEqual => hir::CompareOperator::NotEqual,
-                    syntax::CompareOperator::Less => hir::CompareOperator::Less,
-                    syntax::CompareOperator::LessEqual => hir::CompareOperator::LessEqual,
-                    syntax::CompareOperator::Greater => hir::CompareOperator::Greater,
-                    syntax::CompareOperator::GreaterEqual => hir::CompareOperator::GreaterEqual,
-                    syntax::CompareOperator::In => hir::CompareOperator::In,
-                    syntax::CompareOperator::NotIn => hir::CompareOperator::NotIn,
-                    syntax::CompareOperator::Is => hir::CompareOperator::Is,
-                    syntax::CompareOperator::IsNot => hir::CompareOperator::IsNot,
-                },
+            syntax::ExpressionKind::Compare { left, comparisons } => hir::ExpressionKind::Compare {
                 left: Box::new(self.expression(left)?),
-                right: Box::new(self.expression(right)?),
+                comparisons: comparisons
+                    .iter()
+                    .map(|(op, right)| {
+                        let op = match op {
+                            syntax::CompareOperator::Equal => hir::CompareOperator::Equal,
+                            syntax::CompareOperator::NotEqual => hir::CompareOperator::NotEqual,
+                            syntax::CompareOperator::Less => hir::CompareOperator::Less,
+                            syntax::CompareOperator::LessEqual => hir::CompareOperator::LessEqual,
+                            syntax::CompareOperator::Greater => hir::CompareOperator::Greater,
+                            syntax::CompareOperator::GreaterEqual => {
+                                hir::CompareOperator::GreaterEqual
+                            }
+                            syntax::CompareOperator::In => hir::CompareOperator::In,
+                            syntax::CompareOperator::NotIn => hir::CompareOperator::NotIn,
+                            syntax::CompareOperator::Is => hir::CompareOperator::Is,
+                            syntax::CompareOperator::IsNot => hir::CompareOperator::IsNot,
+                        };
+                        Ok((op, self.expression(right)?))
+                    })
+                    .collect::<Result<Vec<_>, DiagnosticSet>>()?,
+            },
+            syntax::ExpressionKind::NamedExpression { name, value } => {
+                hir::ExpressionKind::NamedExpression {
+                    name: name.clone(),
+                    binding: self.binding(name),
+                    value: Box::new(self.expression(value)?),
+                }
+            }
+            syntax::ExpressionKind::Comprehension {
+                kind,
+                element,
+                key,
+                clauses,
+            } => {
+                let Some(first) = clauses.first() else {
+                    return Err(sema_error(
+                        self.path,
+                        "comprehension has no generator clause",
+                    ));
+                };
+                let mut iteration_names = BTreeSet::new();
+                for clause in clauses {
+                    comprehension_target_names(&clause.target, &mut iteration_names);
+                }
+                for clause in clauses {
+                    validate_comprehension_expression(
+                        self.path,
+                        &clause.iterable,
+                        &iteration_names,
+                        true,
+                        self.class_depth != 0,
+                    )?;
+                    for filter in &clause.filters {
+                        validate_comprehension_expression(
+                            self.path,
+                            filter,
+                            &iteration_names,
+                            false,
+                            self.class_depth != 0,
+                        )?;
+                    }
+                }
+                if let Some(key) = key {
+                    validate_comprehension_expression(
+                        self.path,
+                        key,
+                        &iteration_names,
+                        false,
+                        self.class_depth != 0,
+                    )?;
+                }
+                validate_comprehension_expression(
+                    self.path,
+                    element,
+                    &iteration_names,
+                    false,
+                    self.class_depth != 0,
+                )?;
+
+                let outer_iterable = self.expression(&first.iterable)?;
+                let child =
+                    self.plan.children.get(self.child_index).ok_or_else(|| {
+                        sema_error(self.path, "comprehension scope plan is missing")
+                    })?;
+                self.child_index += 1;
+                let mut analyzer = Analyzer {
+                    path: self.path,
+                    plan: child,
+                    child_index: 0,
+                    in_function: true,
+                    loop_depth: 0,
+                    in_except_star: false,
+                    handler_depth: 0,
+                    builtin_print_stable: self.builtin_print_stable,
+                    class_depth: 0,
+                };
+                let clauses = clauses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, clause)| {
+                        let iterable = if index == 0 {
+                            None
+                        } else {
+                            Some(analyzer.expression(&clause.iterable)?)
+                        };
+                        let target = analyzer.target(&clause.target)?;
+                        analyzer.validate_loop_target(&target)?;
+                        let filters = clause
+                            .filters
+                            .iter()
+                            .map(|filter| analyzer.expression(filter))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(hir::ComprehensionClause {
+                            target,
+                            iterable,
+                            filters,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DiagnosticSet>>()?;
+                let key = key
+                    .as_deref()
+                    .map(|key| analyzer.expression(key))
+                    .transpose()?
+                    .map(Box::new);
+                let element = Box::new(analyzer.expression(element)?);
+                hir::ExpressionKind::Comprehension {
+                    kind: match kind {
+                        syntax::ComprehensionKind::List => hir::ComprehensionKind::List,
+                        syntax::ComprehensionKind::Set => hir::ComprehensionKind::Set,
+                        syntax::ComprehensionKind::Dictionary => hir::ComprehensionKind::Dictionary,
+                        syntax::ComprehensionKind::Generator => hir::ComprehensionKind::Generator,
+                    },
+                    outer_iterable: Box::new(outer_iterable),
+                    element,
+                    key,
+                    clauses,
+                    locals: child
+                        .locals
+                        .iter()
+                        .filter(|name| name.as_str() != ".0")
+                        .cloned()
+                        .collect(),
+                    cells: child.cells.iter().cloned().collect(),
+                    free: child.free.iter().cloned().collect(),
+                }
+            }
+            syntax::ExpressionKind::JoinedString(values) => hir::ExpressionKind::JoinedString(
+                values
+                    .iter()
+                    .map(|value| self.expression(value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            syntax::ExpressionKind::FormattedValue {
+                value,
+                conversion,
+                format_spec,
+            } => hir::ExpressionKind::FormattedValue {
+                value: Box::new(self.expression(value)?),
+                conversion: match conversion {
+                    syntax::FormatConversion::None => hir::FormatConversion::None,
+                    syntax::FormatConversion::Str => hir::FormatConversion::Str,
+                    syntax::FormatConversion::Repr => hir::FormatConversion::Repr,
+                    syntax::FormatConversion::Ascii => hir::FormatConversion::Ascii,
+                },
+                format_spec: format_spec
+                    .as_deref()
+                    .map(|spec| self.expression(spec))
+                    .transpose()?
+                    .map(Box::new),
             },
             syntax::ExpressionKind::Call { callable, parts } => hir::ExpressionKind::Call {
                 callable: Box::new(self.expression(callable)?),
@@ -1425,6 +2358,78 @@ impl Analyzer<'_> {
         })
     }
 
+    fn pattern(&mut self, pattern: &syntax::Pattern) -> Result<hir::Pattern, DiagnosticSet> {
+        pattern_capture_set(self.path, pattern)?;
+        self.pattern_inner(pattern)
+    }
+
+    fn pattern_inner(&mut self, pattern: &syntax::Pattern) -> Result<hir::Pattern, DiagnosticSet> {
+        let kind = match &pattern.kind {
+            syntax::PatternKind::Value(value) => hir::PatternKind::Value(self.expression(value)?),
+            syntax::PatternKind::SingletonNone => hir::PatternKind::SingletonNone,
+            syntax::PatternKind::SingletonBool(value) => hir::PatternKind::SingletonBool(*value),
+            syntax::PatternKind::Capture(name) => hir::PatternKind::Capture {
+                name: name.clone(),
+                binding: self.binding(name),
+            },
+            syntax::PatternKind::Wildcard => hir::PatternKind::Wildcard,
+            syntax::PatternKind::As { pattern, name } => hir::PatternKind::As {
+                pattern: Box::new(self.pattern_inner(pattern)?),
+                name: name.clone(),
+                binding: self.binding(name),
+            },
+            syntax::PatternKind::Or(patterns) => hir::PatternKind::Or(
+                patterns
+                    .iter()
+                    .map(|pattern| self.pattern_inner(pattern))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            syntax::PatternKind::Sequence(patterns) => hir::PatternKind::Sequence(
+                patterns
+                    .iter()
+                    .map(|pattern| self.pattern_inner(pattern))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            syntax::PatternKind::Star(name) => {
+                hir::PatternKind::Star(name.as_ref().map(|name| (name.clone(), self.binding(name))))
+            }
+            syntax::PatternKind::Mapping {
+                keys,
+                patterns,
+                rest,
+            } => hir::PatternKind::Mapping {
+                keys: keys
+                    .iter()
+                    .map(|key| self.expression(key))
+                    .collect::<Result<Vec<_>, _>>()?,
+                patterns: patterns
+                    .iter()
+                    .map(|pattern| self.pattern_inner(pattern))
+                    .collect::<Result<Vec<_>, _>>()?,
+                rest: rest.as_ref().map(|name| (name.clone(), self.binding(name))),
+            },
+            syntax::PatternKind::Class {
+                class,
+                positional,
+                keywords,
+            } => hir::PatternKind::Class {
+                class: self.expression(class)?,
+                positional: positional
+                    .iter()
+                    .map(|pattern| self.pattern_inner(pattern))
+                    .collect::<Result<Vec<_>, _>>()?,
+                keywords: keywords
+                    .iter()
+                    .map(|(name, pattern)| Ok((name.clone(), self.pattern_inner(pattern)?)))
+                    .collect::<Result<Vec<_>, DiagnosticSet>>()?,
+            },
+        };
+        Ok(hir::Pattern {
+            span: pattern.span,
+            kind,
+        })
+    }
+
     fn binding(&self, name: &str) -> hir::Binding {
         if !self.plan.is_function || self.plan.explicit_globals.contains(name) {
             hir::Binding::Global
@@ -1437,6 +2442,127 @@ impl Analyzer<'_> {
         } else {
             hir::Binding::Global
         }
+    }
+}
+
+fn pattern_capture_set(
+    path: &Path,
+    pattern: &syntax::Pattern,
+) -> Result<BTreeSet<String>, DiagnosticSet> {
+    match &pattern.kind {
+        syntax::PatternKind::Value(_)
+        | syntax::PatternKind::SingletonNone
+        | syntax::PatternKind::SingletonBool(_)
+        | syntax::PatternKind::Wildcard => Ok(BTreeSet::new()),
+        syntax::PatternKind::Capture(name) => Ok(BTreeSet::from([name.clone()])),
+        syntax::PatternKind::As {
+            pattern: inner,
+            name,
+        } => {
+            let mut captures = pattern_capture_set(path, inner)?;
+            if !captures.insert(name.clone()) {
+                return Err(DiagnosticSet::one(Diagnostic::new(
+                    "RIM-SEMA-001",
+                    format!("pattern captures `{name}` more than once"),
+                    path,
+                    pattern.span,
+                )));
+            }
+            Ok(captures)
+        }
+        syntax::PatternKind::Or(patterns) => {
+            let mut expected: Option<BTreeSet<String>> = None;
+            for (index, alternative) in patterns.iter().enumerate() {
+                if index + 1 < patterns.len() && pattern_is_irrefutable(alternative) {
+                    return Err(DiagnosticSet::one(Diagnostic::new(
+                        "RIM-SEMA-001",
+                        "irrefutable OR-pattern alternative makes later alternatives unreachable",
+                        path,
+                        alternative.span,
+                    )));
+                }
+                let captures = pattern_capture_set(path, alternative)?;
+                if let Some(expected) = &expected {
+                    if expected != &captures {
+                        return Err(DiagnosticSet::one(Diagnostic::new(
+                            "RIM-SEMA-001",
+                            "OR-pattern alternatives must bind the same names",
+                            path,
+                            pattern.span,
+                        )));
+                    }
+                } else {
+                    expected = Some(captures);
+                }
+            }
+            Ok(expected.unwrap_or_default())
+        }
+        syntax::PatternKind::Sequence(patterns) => {
+            merge_pattern_capture_sets(path, pattern.span, patterns.iter(), None)
+        }
+        syntax::PatternKind::Star(name) => Ok(name.iter().cloned().collect()),
+        syntax::PatternKind::Mapping { patterns, rest, .. } => {
+            merge_pattern_capture_sets(path, pattern.span, patterns.iter(), rest.as_ref())
+        }
+        syntax::PatternKind::Class {
+            positional,
+            keywords,
+            ..
+        } => merge_pattern_capture_sets(
+            path,
+            pattern.span,
+            positional
+                .iter()
+                .chain(keywords.iter().map(|(_, pattern)| pattern)),
+            None,
+        ),
+    }
+}
+
+fn merge_pattern_capture_sets<'a>(
+    path: &Path,
+    span: Span,
+    patterns: impl Iterator<Item = &'a syntax::Pattern>,
+    extra: Option<&String>,
+) -> Result<BTreeSet<String>, DiagnosticSet> {
+    let mut captures = BTreeSet::new();
+    for child in patterns {
+        for name in pattern_capture_set(path, child)? {
+            if !captures.insert(name.clone()) {
+                return Err(DiagnosticSet::one(Diagnostic::new(
+                    "RIM-SEMA-001",
+                    format!("pattern captures `{name}` more than once"),
+                    path,
+                    child.span,
+                )));
+            }
+        }
+    }
+    if let Some(name) = extra
+        && !captures.insert(name.clone())
+    {
+        return Err(DiagnosticSet::one(Diagnostic::new(
+            "RIM-SEMA-001",
+            format!("pattern captures `{name}` more than once"),
+            path,
+            span,
+        )));
+    }
+    Ok(captures)
+}
+
+fn pattern_is_irrefutable(pattern: &syntax::Pattern) -> bool {
+    match &pattern.kind {
+        syntax::PatternKind::Capture(_) | syntax::PatternKind::Wildcard => true,
+        syntax::PatternKind::As { pattern, .. } => pattern_is_irrefutable(pattern),
+        syntax::PatternKind::Or(patterns) => patterns.iter().any(pattern_is_irrefutable),
+        syntax::PatternKind::Star(_) => true,
+        syntax::PatternKind::Value(_)
+        | syntax::PatternKind::SingletonNone
+        | syntax::PatternKind::SingletonBool(_)
+        | syntax::PatternKind::Sequence(_)
+        | syntax::PatternKind::Mapping { .. }
+        | syntax::PatternKind::Class { .. } => false,
     }
 }
 
@@ -1480,6 +2606,24 @@ fn statement_contains_zero_argument_super(statement: &syntax::Statement) -> bool
         }
         syntax::StatementKind::Delete { targets } => {
             targets.iter().any(target_contains_zero_argument_super)
+        }
+        syntax::StatementKind::AnnAssign {
+            target,
+            annotation,
+            value,
+            ..
+        } => {
+            target_contains_zero_argument_super(target)
+                || expression_contains_zero_argument_super(annotation)
+                || value
+                    .as_ref()
+                    .is_some_and(expression_contains_zero_argument_super)
+        }
+        syntax::StatementKind::Assert { test, message } => {
+            expression_contains_zero_argument_super(test)
+                || message
+                    .as_ref()
+                    .is_some_and(expression_contains_zero_argument_super)
         }
         syntax::StatementKind::Expression(value)
         | syntax::StatementKind::Return { value: Some(value) } => {
@@ -1536,6 +2680,17 @@ fn statement_contains_zero_argument_super(statement: &syntax::Statement) -> bool
                 || contains_zero_argument_super(body)
                 || contains_zero_argument_super(else_body)
         }
+        syntax::StatementKind::Match { subject, cases } => {
+            expression_contains_zero_argument_super(subject)
+                || cases.iter().any(|case| {
+                    pattern_contains_zero_argument_super(&case.pattern)
+                        || case
+                            .guard
+                            .as_ref()
+                            .is_some_and(expression_contains_zero_argument_super)
+                        || contains_zero_argument_super(&case.body)
+                })
+        }
         syntax::StatementKind::FunctionDef { .. }
         | syntax::StatementKind::ClassDef { .. }
         | syntax::StatementKind::Return { value: None }
@@ -1543,6 +2698,36 @@ fn statement_contains_zero_argument_super(statement: &syntax::Statement) -> bool
         | syntax::StatementKind::Continue
         | syntax::StatementKind::Global(_)
         | syntax::StatementKind::Nonlocal(_) => false,
+    }
+}
+
+fn pattern_contains_zero_argument_super(pattern: &syntax::Pattern) -> bool {
+    match &pattern.kind {
+        syntax::PatternKind::Value(value) => expression_contains_zero_argument_super(value),
+        syntax::PatternKind::As { pattern, .. } => pattern_contains_zero_argument_super(pattern),
+        syntax::PatternKind::Or(patterns) | syntax::PatternKind::Sequence(patterns) => {
+            patterns.iter().any(pattern_contains_zero_argument_super)
+        }
+        syntax::PatternKind::Mapping { keys, patterns, .. } => {
+            keys.iter().any(expression_contains_zero_argument_super)
+                || patterns.iter().any(pattern_contains_zero_argument_super)
+        }
+        syntax::PatternKind::Class {
+            class,
+            positional,
+            keywords,
+        } => {
+            expression_contains_zero_argument_super(class)
+                || positional.iter().any(pattern_contains_zero_argument_super)
+                || keywords
+                    .iter()
+                    .any(|(_, pattern)| pattern_contains_zero_argument_super(pattern))
+        }
+        syntax::PatternKind::SingletonNone
+        | syntax::PatternKind::SingletonBool(_)
+        | syntax::PatternKind::Capture(_)
+        | syntax::PatternKind::Wildcard
+        | syntax::PatternKind::Star(_) => false,
     }
 }
 
@@ -1581,6 +2766,7 @@ fn expression_contains_zero_argument_super(expression: &syntax::Expression) -> b
         syntax::ExpressionKind::List(values)
         | syntax::ExpressionKind::Tuple(values)
         | syntax::ExpressionKind::Set(values)
+        | syntax::ExpressionKind::JoinedString(values)
         | syntax::ExpressionKind::Boolean { values, .. } => {
             values.iter().any(expression_contains_zero_argument_super)
         }
@@ -1589,7 +2775,9 @@ fn expression_contains_zero_argument_super(expression: &syntax::Expression) -> b
                 expression_contains_zero_argument_super(key)
                     || expression_contains_zero_argument_super(value)
             }
-            syntax::DictionaryEntry::Unpack(value) => expression_contains_zero_argument_super(value),
+            syntax::DictionaryEntry::Unpack(value) => {
+                expression_contains_zero_argument_super(value)
+            }
         }),
         syntax::ExpressionKind::Subscript { value, index } => {
             expression_contains_zero_argument_super(value)
@@ -1612,10 +2800,45 @@ fn expression_contains_zero_argument_super(expression: &syntax::Expression) -> b
         | syntax::ExpressionKind::Bytes(_)
         | syntax::ExpressionKind::Complex { .. }
         | syntax::ExpressionKind::Name(_) => false,
-        syntax::ExpressionKind::Binary { left, right, .. }
-        | syntax::ExpressionKind::Compare { left, right, .. } => {
+        syntax::ExpressionKind::Binary { left, right, .. } => {
             expression_contains_zero_argument_super(left)
                 || expression_contains_zero_argument_super(right)
+        }
+        syntax::ExpressionKind::NamedExpression { value, .. } => {
+            expression_contains_zero_argument_super(value)
+        }
+        syntax::ExpressionKind::Comprehension {
+            element,
+            key,
+            clauses,
+            ..
+        } => {
+            expression_contains_zero_argument_super(element)
+                || key
+                    .as_deref()
+                    .is_some_and(expression_contains_zero_argument_super)
+                || clauses.iter().any(|clause| {
+                    target_contains_zero_argument_super(&clause.target)
+                        || expression_contains_zero_argument_super(&clause.iterable)
+                        || clause
+                            .filters
+                            .iter()
+                            .any(expression_contains_zero_argument_super)
+                })
+        }
+        syntax::ExpressionKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            expression_contains_zero_argument_super(value)
+                || format_spec
+                    .as_ref()
+                    .is_some_and(|spec| expression_contains_zero_argument_super(spec))
+        }
+        syntax::ExpressionKind::Compare { left, comparisons } => {
+            expression_contains_zero_argument_super(left)
+                || comparisons
+                    .iter()
+                    .any(|(_, right)| expression_contains_zero_argument_super(right))
         }
     }
 }
@@ -1642,6 +2865,7 @@ mod tests {
             in_except_star: false,
             handler_depth: 0,
             builtin_print_stable,
+            class_depth: 0,
         };
         let syntax::StatementKind::Assign { targets, .. } = &module.statements[0].kind else {
             panic!("expected assignment");
@@ -1712,7 +2936,135 @@ mod tests {
         let module = syntax::parse(path(), source).unwrap();
         let diagnostics = analyze(path(), &module).unwrap_err();
         let diagnostic = &diagnostics.as_slice()[0];
-        assert_eq!(diagnostic.code, "RIM-CAP-G4-02");
+        assert_eq!(diagnostic.code, "RIM-SEMA-001");
         assert!(diagnostic.span.end > diagnostic.span.start);
+    }
+
+    #[test]
+    fn comprehension_scope_keeps_targets_local_and_walrus_targets_in_the_owner_scope() {
+        let source = r#"
+def f():
+    outer = 10
+    captured = -1
+    return [outer + (captured := item) for item in [1, 2]]
+"#;
+        let module = syntax::parse(path(), source).unwrap();
+        let hir = analyze(path(), &module).unwrap();
+        let hir::StatementKind::FunctionDef { body, cells, .. } = &hir.statements[0].kind else {
+            panic!("expected function definition");
+        };
+        assert!(cells.iter().any(|name| name == "outer"));
+        assert!(cells.iter().any(|name| name == "captured"));
+        let hir::StatementKind::Return { value: Some(value) } = &body[2].kind else {
+            panic!("expected comprehension return");
+        };
+        let hir::ExpressionKind::Comprehension {
+            locals,
+            free,
+            clauses,
+            ..
+        } = &value.kind
+        else {
+            panic!("expected comprehension HIR");
+        };
+        assert!(locals.iter().any(|name| name == "item"));
+        assert!(
+            !locals
+                .iter()
+                .any(|name| name == "outer" || name == "captured")
+        );
+        assert!(free.iter().any(|name| name == "outer"));
+        assert!(free.iter().any(|name| name == "captured"));
+        assert!(matches!(
+            clauses[0].target.kind,
+            hir::TargetKind::Name {
+                ref name,
+                binding: hir::Binding::Local
+            } if name == "item"
+        ));
+    }
+
+    #[test]
+    fn match_capture_sets_reject_duplicates_inconsistent_or_and_unreachable_alternatives() {
+        for (source, expected_fragment) in [
+            (
+                "match 1:\n    case (1 as value) as value:\n        result = value\n",
+                "more than once",
+            ),
+            (
+                "match 1:\n    case (1 as left) | (2 as right):\n        result = 1\n",
+                "must bind the same names",
+            ),
+            (
+                "match 1:\n    case captured | 1:\n        result = captured\n",
+                "makes later alternatives unreachable",
+            ),
+        ] {
+            let module = syntax::parse(path(), source).unwrap_or_else(|diagnostics| {
+                panic!("source should parse: {source}: {diagnostics:?}")
+            });
+            let diagnostics = analyze(path(), &module).unwrap_err();
+            let diagnostic = &diagnostics.as_slice()[0];
+            assert_eq!(diagnostic.code, "RIM-SEMA-001", "source: {source}");
+            assert!(
+                diagnostic.span.end > diagnostic.span.start,
+                "{diagnostic:?}"
+            );
+            assert!(
+                diagnostic.message.contains(expected_fragment),
+                "source: {source}: {diagnostic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn comprehension_walrus_restrictions_and_generator_scope_are_explicit() {
+        for (source, expected_fragment) in [
+            (
+                "[value for value in (owner := [1, 2])]\n",
+                "cannot be used in a comprehension iterable expression",
+            ),
+            (
+                "[(value := 3) for value in [1, 2]]\n",
+                "cannot rebind comprehension iteration variable",
+            ),
+            (
+                "class C:\n    [(owner := value) for value in [1, 2]]\n",
+                "cannot be used in a class body",
+            ),
+        ] {
+            let module = syntax::parse(path(), source).unwrap();
+            let diagnostics = analyze(path(), &module).unwrap_err();
+            let diagnostic = &diagnostics.as_slice()[0];
+            assert_eq!(diagnostic.code, "RIM-SEMA-001", "source: {source}");
+            assert!(
+                diagnostic.message.contains(expected_fragment),
+                "{diagnostic:?}"
+            );
+        }
+
+        let module = syntax::parse(path(), "(value for value in [1, 2])\n").unwrap();
+        let hir = analyze(path(), &module).unwrap();
+        let hir::StatementKind::Expression(hir::Expression {
+            kind:
+                hir::ExpressionKind::Comprehension {
+                    kind: hir::ComprehensionKind::Generator,
+                    locals,
+                    clauses,
+                    ..
+                },
+            ..
+        }) = &hir.statements[0].kind
+        else {
+            panic!("expected generator-expression HIR");
+        };
+        assert_eq!(locals, &["value".to_owned()]);
+        assert!(matches!(
+            clauses[0].target.kind,
+            hir::TargetKind::Name {
+                ref name,
+                binding: hir::Binding::Local
+            } if name == "value"
+        ));
     }
 }

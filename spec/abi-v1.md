@@ -68,9 +68,28 @@ emergency `MemoryError` that remains usable when the heap cannot allocate.
   `RNativeFunction(context, function, bound, count, output) -> RStatus`
   signature.
 - `rimera_function_new` creates traceable function objects containing native
-  code, the complete parameter specification, defaults, and closure cells.
+  code, the complete parameter specification, defaults, closure cells, and an
+  optional traced annotations dictionary. Function `__annotations__` is
+  exposed through the ordinary attribute path: reading lazily materializes an
+  empty dictionary, assignment accepts a dictionary or `None` reset, and
+  deletion resets it to the lazy-empty state. Generated annotation lowering
+  installs an evaluated dictionary through `rimera_attr_set`; there is no
+  compiler-visible function metadata pointer.
   `rimera_call` is the authoritative binder for positional-only,
   positional-or-keyword, keyword-only, `*args`, and `**kwargs` parameters.
+- Gate 4 expanded call sites preserve source-order parts with
+  `RCallArgumentKind` (`Positional`, `Starred`, `Keyword`, and
+  `KeywordUnpack`). `rimera_call_arguments_new` allocates an internal traced
+  accumulator rooted to its callable; `rimera_call_argument_add` appends or
+  expands one already-evaluated part through the generic iterator/mapping
+  protocols; and `rimera_call_prepared` sends the accumulated positional and
+  keyword values through the same authoritative `rimera_call` binder rather
+  than implementing a second binding algorithm. The accumulator traces its
+  callable and every accumulated value, charges retained vector/string
+  capacity through managed-size accounting, and each mutating ABI return
+  refreshes that accounting before heap-limit enforcement. Duplicate expanded
+  keyword names and non-string mapping keys fail before callee entry at the
+  CPython 3.12 callback point.
 - `rimera_generator_function_new` creates a traceable callable with the same
   binding metadata plus a persistent-slot count. Calling it through
   `rimera_call` performs ordinary argument binding but only allocates a
@@ -81,9 +100,19 @@ emergency `MemoryError` that remains usable when the heap cannot allocate.
   `RGeneratorOutcome::Returned`. The generator's persistent slots, delegate,
   saved handled-exception state, and terminal result are traced by its owning
   context. Codegen must preserve every value live across suspension in those
-  explicit slots and clear obsolete slots on terminal completion. Source
-  `yield`, `iter`/`next`, `StopIteration`, and lifecycle semantics remain
-  separately gated until they have verified compiler lowering and public proof.
+  explicit slots and clear obsolete slots on terminal completion. Gate 4
+  generator expressions are the first source feature using this resume ABI:
+  they compile to hidden `Generator` MIR functions with explicit `Yield`
+  terminators, ordinary `iter`/`next` behavior, repeated exhaustion, exception
+  termination, and public forced-GC proof. General source `yield`, `send`,
+  `throw`, `close`, and `yield from` remain Gate 6-owned.
+- Generated generator-resume code keeps the heap representation opaque through
+  the narrow `rimera_generator_function_get`, `rimera_generator_state_get`,
+  `rimera_generator_state_set`, `rimera_generator_slot_get`, and
+  `rimera_generator_slot_set` helpers. A suspension saves every liveness-selected
+  persistent value before publishing the next state; resumption restores those
+  slots before entering the compiler-selected continuation. These helpers expose
+  neither heap pointers nor generator layout and are not a runtime MIR evaluator.
 - `rimera_cell_*`, `rimera_global_*`, and
   `rimera_function_closure_get` implement mutable lexical cells, module
   globals, and builtins fallback without exposing heap pointers to generated
@@ -112,7 +141,13 @@ emergency `MemoryError` that remains usable when the heap cannot allocate.
   constructor after validating `str`, tuple, and dictionary inputs.
 - `rimera_namespace_new`, `rimera_namespace_set`, `rimera_namespace_get`,
   `rimera_class_name_get`, and `rimera_namespace_delete` build and mutate the ordered,
-  traceable namespace used by compiled class bodies. `rimera_attr_get`,
+  traceable namespace used by compiled class bodies. Gate 4 annotations add
+  `rimera_annotations_ensure(context, namespace_or_null)`: a null namespace
+  selects module globals, while a non-null value selects the prepared class
+  namespace. It preserves an existing `__annotations__` value and otherwise
+  creates the native dictionary through normal namespace/mapping operations,
+  so custom `__prepare__` mappings keep their ordinary `__getitem__` and
+  `__setitem__` semantics. `rimera_attr_get`,
   `rimera_attr_set`, and `rimera_attr_delete` operate on opaque values and
   UTF-8 attribute names. Attribute lookup applies a type-MRO data descriptor,
   then an instance dictionary, then an MRO non-data descriptor or ordinary
@@ -177,7 +212,12 @@ emergency `MemoryError` that remains usable when the heap cannot allocate.
   through `rimera_call`. Hash results must be integers and normalize `-1` to
   `-2`; a class defining `__eq__` without `__hash__` receives the unhashable
   sentinel. `repr`/`str`/`format` invoke user protocol methods through the
-  normal call path and require string returns. Native representation covers
+  normal call path and require string returns. Gate 4 formatted strings use the
+  additive `RFormatConversion` (`None`, `Str`, `Repr`, `Ascii`) identifier and
+  `rimera_format_value(context, conversion, value, spec, output)`. The runtime
+  applies the selected ordinary conversion and then the same generic formatting
+  protocol used by `format`; generated code retains the value, nested spec,
+  and accumulated prefix through its precise safepoint roots. Native representation covers
   CPython-shaped float/complex display, Unicode 15.0 printability escapes, and
   recursive dictionary-view cycle markers. Native formatting covers the
   supported int/float/complex/string mini-language including alignment, sign,
@@ -248,17 +288,65 @@ emergency `MemoryError` that remains usable when the heap cannot allocate.
   fixed ABI result bundles.
 - `rimera_unpack_ex(context, value, before_count, after_count, starred, output)`
   is the additive extended-unpack ABI used by Gate 4 recursive assignment
-  targets. It consumes the generic iterator exactly once, returns fixed prefix
-  and suffix values in source-target order, and places a newly allocated native
-  list in the starred result slot. The original `rimera_unpack` entry point is
-  retained for ABI-v1 compatibility and maps to the trailing-star/exact subset.
+  targets. The source expression is evaluated once and one current iterator is
+  advanced monotonically. For extended unpacking, the runtime intentionally
+  applies `iter()` to that current iterator again before draining the starred
+  remainder, matching CPython's observable `UNPACK_EX` callback order without
+  rewinding or re-evaluating the source. Fixed prefix/suffix values are returned
+  in source-target order and the starred slot contains a newly allocated native
+  list. The original `rimera_unpack` entry point is retained for ABI-v1
+  compatibility and maps to the trailing-star/exact subset.
+- `rimera_pattern_sequence(context, value, before_count, after_count, starred,
+  output, matched)` is the Gate 4 structural-sequence extractor. It performs the
+  Python match-sequence eligibility/length preflight, excludes string and
+  byte-oriented values, then reuses the generic iterator/unpack path to publish
+  a managed value-array only after structural success. Length mismatch writes
+  `matched = 0`; protocol exceptions remain managed exceptions.
+- `rimera_pattern_mapping_check(context, mapping, minimum_count, output)` runs
+  the mapping eligibility/length preflight before pattern key expressions are
+  evaluated, preserving CPython ordering. `rimera_pattern_mapping(context,
+  mapping, keys, key_count, include_rest, output, matched)` then hashes/checks
+  dynamic keys left-to-right, invokes ordinary mapping `get`, treats a missing
+  key as `matched = 0`, rejects runtime-equal duplicate keys with `ValueError`,
+  and optionally appends a freshly allocated `**rest` dictionary without
+  mutating the source mapping. Both operations retain opaque managed handles
+  and root all live mapping/key/extracted values across callbacks.
+- `rimera_pattern_class(context, subject, class, positional_count, keyword_blob,
+  keyword_blob_len, output, matched)` is the Gate 4 class-pattern extractor.
+  `class` must be a runtime type and matching uses the ordinary native
+  `isinstance`/subtype contract. Positional fields resolve `__match_args__`
+  through normal class/metaclass attribute lookup, require a tuple of strings,
+  enforce positional count and duplicate-attribute rules, and preserve the
+  builtin single-self match convention for Python's match-self builtin types.
+  Keyword fields use ordinary descriptor-aware instance attribute lookup;
+  missing attributes write `matched = 0` while descriptor and validation
+  exceptions propagate unchanged. Keyword identifiers are encoded only inside
+  the compiler/runtime ABI as one NUL-separated UTF-8 metadata blob; an empty
+  keyword set is represented by a null pointer and zero length. Extracted
+  values are returned as the same opaque managed value-array bundle used by
+  the other structural-pattern helpers and remain rooted across callbacks.
 - `rimera_list_new` creates a traceable managed list from a contiguous input
   array. The constructor temporarily roots every input until the list has been
   allocated and published; generated code still observes only opaque handles.
+  Gate 4 comprehensions add `rimera_list_append(context, list, value)`, a
+  fallible in-place sink over the same managed list storage. Every successful
+  mutating ABI return refreshes retained-capacity accounting before the common
+  managed-heap limit check, so comprehension growth cannot bypass the budget.
 - `rimera_dict_new` and `rimera_set_new` create insertion-ordered traced
-  collections from contiguous ABI arrays. Key validation uses the native hash
-  protocol, including user `__hash__` values and the equality-without-hash
-  unhashable sentinel. Bool/int/float/complex equality and hashing use one
+  collections from contiguous ABI arrays. Gate 4 comprehensions add
+  `rimera_set_insert(context, set, value)` and
+  `rimera_dictionary_insert(context, dictionary, key, value)`. Both route
+  through the same generic hash/equality protocol and ordered hash table as
+  ordinary set/dict mutation, preserve callback exceptions, and publish no
+  partial entry on failed hashing/equality. Dictionary comprehension code
+  evaluates its key before its mapped value, then calls the insert sink.
+  `rimera_dictionary_merge` is the
+  additive Gate 4 mapping-display operation for `{**mapping}`: it accepts
+  mappings only (not iterable-pair fallback), obtains keys/values through the
+  generic mapping protocol, and applies each entry immediately so source
+  expression, hash/equality callback, replacement, and failure order remain
+  left-to-right. Key validation uses the native hash protocol, including user
+  `__hash__` values and the equality-without-hash unhashable sentinel. Bool/int/float/complex equality and hashing use one
   exact numeric domain so equal mixed numeric keys always share a hash,
   including arbitrary-size integers and finite binary64 values. Duplicate
   dictionary keys replace their value without moving or replacing the original
@@ -267,6 +355,21 @@ emergency `MemoryError` that remains usable when the heap cannot allocate.
   callbacks mutate the collection. Native dict `|` and dict-source `|=` reuse
   the hashes already stored in the source table while preserving order; the
   ordinary in-place update path also accepts mappings and iterable pairs.
+- Gate 4 list/set/dictionary comprehensions compile as ordinary hidden native
+  functions named `<listcomp>`, `<setcomp>`, or `<dictcomp>` using the existing
+  `RNativeFunction` call ABI. The containing scope evaluates the outermost
+  iterable and creates its iterator before invoking the hidden function as
+  positional parameter `.0`; targets, later iterables, filters, and sinks run
+  inside that activation. Closure cells/free variables use the normal function
+  closure ABI, and generated MIR publishes precise roots at every iterator,
+  truth, target-unpack, callback, and collection-sink safepoint. These hidden
+  list/set/dictionary activations are traceback-transparent on failure so
+  Python 3.12 user tracebacks reflect the inlined-comprehension frame model
+  rather than exposing Rimera's implementation helper. Generator expressions
+  reuse the same implicit-scope/clause lowering but create a hidden `<genexpr>`
+  `Generator` function instead: its sink is an explicit `Yield`, its generator
+  frame remains Python-visible, and liveness-derived values cross suspension
+  through the generator slots documented above.
 - `rimera_unpack` consumes a supported native iterable and returns a traced
   internal value array for flat assignment unpacking. It implements exact and
   final-starred target arity without exposing iterator internals to codegen.
@@ -298,11 +401,12 @@ without changing the stable runtime ABI.
   processing.
 - `rimera_exception_new` is structured-exception runtime scaffolding; generated
   source raises through the higher-level exception operations documented below.
-- `rimera_generator_function_new`, `rimera_generator_new`, and
-  `rimera_generator_resume` are intentionally retained Gate 6 ABI foundation.
-  They are not evidence that source `yield` or generator suspension is complete;
-  those remain Gate 6-owned until compiler lowering and public source proofs
-  exist.
+- `rimera_generator_function_new`, `rimera_generator_new`,
+  `rimera_generator_resume`, and the state/slot accessors are the single native
+  generator ABI. Gate 4 generator expressions now exercise that ABI through
+  verified suspension MIR and public native source tests. This does not imply
+  general generator completion: source `yield`, `send`, `throw`, `close`, and
+  `yield from` remain Gate 6-owned.
 
 ## Structured exceptions
 

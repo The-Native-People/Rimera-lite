@@ -49,14 +49,25 @@ pub fn emit_object(
         .functions
         .iter()
         .enumerate()
-        .map(|(index, _)| {
+        .map(|(index, function)| {
             if index == program.mir.entry.0 as usize {
                 return Ok(None);
             }
             let mut signature = module.make_signature();
-            signature
-                .params
-                .extend((0..5).map(|_| AbiParam::new(pointer)));
+            if function.kind == mir::FunctionKind::Generator {
+                signature.params.extend([
+                    AbiParam::new(pointer),
+                    AbiParam::new(pointer),
+                    AbiParam::new(types::I8),
+                    AbiParam::new(pointer),
+                    AbiParam::new(pointer),
+                    AbiParam::new(pointer),
+                ]);
+            } else {
+                signature
+                    .params
+                    .extend((0..5).map(|_| AbiParam::new(pointer)));
+            }
             signature.returns.push(AbiParam::new(types::I32));
             module
                 .declare_function(
@@ -107,6 +118,314 @@ pub fn emit_object(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn define_generator_function(
+    module: &mut ObjectModule,
+    module_program: &mir::Program,
+    program: &mir::Function,
+    function_id: cranelift_module::FuncId,
+    root_plan: &mir::SafepointPlan,
+    pointer: cranelift_codegen::ir::Type,
+    imports: &Imports,
+    data: &ConstantData,
+    native_functions: &[Option<cranelift_module::FuncId>],
+    function_index: u32,
+) -> Result<(), String> {
+    let persistent = mir::generator_persistent_values(program)?;
+    let mut slots = BTreeMap::new();
+    for (index, parameter) in program.parameters.iter().enumerate() {
+        slots.insert(parameter.value, index);
+    }
+    let mut next_slot = program.parameters.len();
+    for value in persistent {
+        if let std::collections::btree_map::Entry::Vacant(entry) = slots.entry(value) {
+            entry.insert(next_slot);
+            next_slot += 1;
+        }
+    }
+
+    let mut signature = module.make_signature();
+    signature.params.extend([
+        AbiParam::new(pointer),
+        AbiParam::new(pointer),
+        AbiParam::new(types::I8),
+        AbiParam::new(pointer),
+        AbiParam::new(pointer),
+        AbiParam::new(pointer),
+    ]);
+    signature.returns.push(AbiParam::new(types::I32));
+    let mut context = module.make_context();
+    context.func.signature = signature;
+    let mut builder_context = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+        let prologue = builder.create_block();
+        builder.append_block_params_for_function_params(prologue);
+        builder.switch_to_block(prologue);
+        let parameters = builder.block_params(prologue).to_vec();
+        let context_value = parameters[0];
+        let generator = parameters[1];
+        let _operation = parameters[2];
+        let _input = parameters[3];
+        let output = parameters[4];
+        let outcome = parameters[5];
+
+        let value_bytes = program.value_count.max(1) * VALUE_SIZE;
+        let values_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            value_bytes,
+            3,
+        ));
+        for offset in (0..value_bytes).step_by(8) {
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.ins().stack_store(
+                zero,
+                values_slot,
+                i32::try_from(offset).map_err(|_| "value frame is too large")?,
+            );
+        }
+        let root_capacity = root_plan.max_roots();
+        let root_bytes = u32::try_from(root_capacity.max(1).saturating_mul(VALUE_SIZE as usize))
+            .map_err(|_| "root frame is too large")?;
+        let roots_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            root_bytes,
+            3,
+        ));
+        for offset in (0..root_bytes).step_by(8) {
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.ins().stack_store(
+                zero,
+                roots_slot,
+                i32::try_from(offset).map_err(|_| "root frame is too large")?,
+            );
+        }
+        let frame_slot =
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3));
+        let failure_line_slot =
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
+        let function_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            VALUE_SIZE,
+            3,
+        ));
+        let state_slot =
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
+        let initial_line = builder.ins().iconst(types::I32, 1);
+        builder
+            .ins()
+            .stack_store(initial_line, failure_line_slot, 0);
+        let roots_pointer = builder.ins().stack_addr(pointer, roots_slot, 0);
+        let null = builder.ins().iconst(pointer, 0);
+        builder.ins().stack_store(null, frame_slot, 0);
+        builder.ins().stack_store(roots_pointer, frame_slot, 8);
+        let root_count = builder.ins().iconst(
+            pointer,
+            i64::try_from(root_capacity).map_err(|_| "too many GC roots")?,
+        );
+        builder.ins().stack_store(root_count, frame_slot, 16);
+        let frame_pointer = builder.ins().stack_addr(pointer, frame_slot, 0);
+        let failure = builder.create_block();
+        let invalid_state = builder.create_block();
+        let push_ref = module.declare_func_in_func(imports.roots_push, builder.func);
+        emit_status_call(
+            &mut builder,
+            push_ref,
+            &[context_value, frame_pointer],
+            failure,
+        );
+        let function_pointer = builder.ins().stack_addr(pointer, function_slot, 0);
+        let get_function =
+            module.declare_func_in_func(imports.generator_function_get, builder.func);
+        emit_status_call(
+            &mut builder,
+            get_function,
+            &[context_value, generator, function_pointer],
+            failure,
+        );
+        let state_pointer = builder.ins().stack_addr(pointer, state_slot, 0);
+        let get_state = module.declare_func_in_func(imports.generator_state_get, builder.func);
+        emit_status_call(
+            &mut builder,
+            get_state,
+            &[context_value, generator, state_pointer],
+            failure,
+        );
+        let state = builder.ins().stack_load(types::I32, state_slot, 0);
+        let refs = FunctionRefs::new(module, builder.func, imports);
+        let block_map = program
+            .blocks
+            .iter()
+            .map(|_| builder.create_block())
+            .collect::<Vec<_>>();
+
+        let initial_dispatch = builder.create_block();
+        let is_initial = builder.ins().icmp_imm(IntCC::Equal, state, 0);
+        builder
+            .ins()
+            .brif(is_initial, initial_dispatch, &[], invalid_state, &[]);
+        builder.switch_to_block(initial_dispatch);
+        for (index, parameter) in program.parameters.iter().enumerate() {
+            let slot_index = builder.ins().iconst(
+                pointer,
+                i64::try_from(index).map_err(|_| "generator slot index is too large")?,
+            );
+            let destination = value_pointer(&mut builder, pointer, values_slot, parameter.value);
+            let slot_get = module.declare_func_in_func(imports.generator_slot_get, builder.func);
+            emit_status_call(
+                &mut builder,
+                slot_get,
+                &[context_value, generator, slot_index, destination],
+                failure,
+            );
+        }
+        builder.ins().jump(block_map[program.entry.0 as usize], &[]);
+
+        let yield_states = program
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| match block.terminator {
+                Terminator::Yield { resume_target, .. } => Some((index, resume_target)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut check_state = invalid_state;
+        for (yield_block, resume_target) in yield_states.iter().copied() {
+            builder.switch_to_block(check_state);
+            let dispatch = builder.create_block();
+            let next_check = builder.create_block();
+            let state_id =
+                u32::try_from(yield_block + 1).map_err(|_| "too many generator states")?;
+            let matches = builder
+                .ins()
+                .icmp_imm(IntCC::Equal, state, i64::from(state_id));
+            builder.ins().brif(matches, dispatch, &[], next_check, &[]);
+            builder.switch_to_block(dispatch);
+            if let Some(roots) = root_plan.terminator_roots(yield_block) {
+                for value in roots {
+                    let Some(slot) = slots.get(value).copied() else {
+                        continue;
+                    };
+                    let slot_index = builder.ins().iconst(
+                        pointer,
+                        i64::try_from(slot).map_err(|_| "generator slot index is too large")?,
+                    );
+                    let destination = value_pointer(&mut builder, pointer, values_slot, *value);
+                    let slot_get =
+                        module.declare_func_in_func(imports.generator_slot_get, builder.func);
+                    emit_status_call(
+                        &mut builder,
+                        slot_get,
+                        &[context_value, generator, slot_index, destination],
+                        failure,
+                    );
+                }
+            }
+            builder.ins().jump(block_map[resume_target.0 as usize], &[]);
+            check_state = next_check;
+        }
+        builder.switch_to_block(check_state);
+        let invalid = builder.ins().iconst(types::I32, 2);
+        builder
+            .ins()
+            .call(refs.roots_pop, &[context_value, frame_pointer]);
+        builder.ins().return_(&[invalid]);
+
+        for (block_index, block) in program.blocks.iter().enumerate() {
+            builder.switch_to_block(block_map[block_index]);
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                let line = source_line(&module_program.line_starts, operation.span.start);
+                let line = builder.ins().iconst(types::I32, i64::from(line));
+                builder.ins().stack_store(line, failure_line_slot, 0);
+                let operation_failure = program
+                    .exception_edges
+                    .get(&(block_index as u32, operation_index as u32))
+                    .map_or(failure, |target| block_map[target.0 as usize]);
+                emit_operation(
+                    &mut builder,
+                    module,
+                    imports,
+                    data,
+                    module_program,
+                    native_functions,
+                    function_index,
+                    block_index as u32,
+                    operation_index,
+                    operation,
+                    pointer,
+                    values_slot,
+                    roots_slot,
+                    root_capacity,
+                    root_plan.operation_roots(block_index, operation_index),
+                    context_value,
+                    Some(function_pointer),
+                    operation_failure,
+                )?;
+            }
+            emit_generator_terminator(
+                &mut builder,
+                module,
+                imports,
+                &refs,
+                program,
+                &block_map,
+                block_index,
+                &block.terminator,
+                pointer,
+                values_slot,
+                roots_slot,
+                root_capacity,
+                root_plan.terminator_roots(block_index),
+                &slots,
+                context_value,
+                generator,
+                output,
+                outcome,
+                frame_pointer,
+                failure,
+            )?;
+        }
+
+        builder.switch_to_block(failure);
+        let (filename, filename_len) = metadata_pointer(
+            &mut builder,
+            module,
+            data,
+            &module_program.filename,
+            pointer,
+        )?;
+        let (function_name, function_name_len) =
+            metadata_pointer(&mut builder, module, data, &program.name, pointer)?;
+        let line = builder.ins().stack_load(types::I32, failure_line_slot, 0);
+        let column = builder.ins().iconst(types::I32, 0);
+        builder.ins().call(
+            refs.traceback_append,
+            &[
+                context_value,
+                filename,
+                filename_len,
+                function_name,
+                function_name_len,
+                line,
+                column,
+            ],
+        );
+        builder
+            .ins()
+            .call(refs.roots_pop, &[context_value, frame_pointer]);
+        let exception = builder.ins().iconst(types::I32, 1);
+        builder.ins().return_(&[exception]);
+        builder.seal_all_blocks();
+        builder.finalize();
+    }
+    module
+        .define_function(function_id, &mut context)
+        .map_err(|error| error.to_string())?;
+    module.clear_context(&mut context);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn define_native_function(
     module: &mut ObjectModule,
     module_program: &mir::Program,
@@ -119,6 +438,20 @@ fn define_native_function(
     native_functions: &[Option<cranelift_module::FuncId>],
     function_index: u32,
 ) -> Result<(), String> {
+    if program.kind == mir::FunctionKind::Generator {
+        return define_generator_function(
+            module,
+            module_program,
+            program,
+            function_id,
+            root_plan,
+            pointer,
+            imports,
+            data,
+            native_functions,
+            function_index,
+        );
+    }
     let mut signature = module.make_signature();
     signature
         .params
@@ -287,29 +620,35 @@ fn define_native_function(
             )?;
         }
         builder.switch_to_block(failure);
-        let (filename, filename_len) = metadata_pointer(
-            &mut builder,
-            module,
-            data,
-            &module_program.filename,
-            pointer,
-        )?;
-        let (function_name, function_name_len) =
-            metadata_pointer(&mut builder, module, data, &program.name, pointer)?;
-        let line = builder.ins().stack_load(types::I32, failure_line_slot, 0);
-        let column = builder.ins().iconst(types::I32, 0);
-        builder.ins().call(
-            refs.traceback_append,
-            &[
-                context_value,
-                filename,
-                filename_len,
-                function_name,
-                function_name_len,
-                line,
-                column,
-            ],
+        let traceback_transparent_comprehension = matches!(
+            program.name.as_str(),
+            "<listcomp>" | "<setcomp>" | "<dictcomp>"
         );
+        if !traceback_transparent_comprehension {
+            let (filename, filename_len) = metadata_pointer(
+                &mut builder,
+                module,
+                data,
+                &module_program.filename,
+                pointer,
+            )?;
+            let (function_name, function_name_len) =
+                metadata_pointer(&mut builder, module, data, &program.name, pointer)?;
+            let line = builder.ins().stack_load(types::I32, failure_line_slot, 0);
+            let column = builder.ins().iconst(types::I32, 0);
+            builder.ins().call(
+                refs.traceback_append,
+                &[
+                    context_value,
+                    filename,
+                    filename_len,
+                    function_name,
+                    function_name_len,
+                    line,
+                    column,
+                ],
+            );
+        }
         builder
             .ins()
             .call(refs.roots_pop, &[context_value, frame_pointer]);
@@ -336,6 +675,16 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
         "rimera_render_error",
     ]);
     for function in &program.functions {
+        if function.kind == mir::FunctionKind::Generator {
+            required.extend([
+                "rimera_generator_function_new",
+                "rimera_generator_function_get",
+                "rimera_generator_state_get",
+                "rimera_generator_state_set",
+                "rimera_generator_slot_get",
+                "rimera_generator_slot_set",
+            ]);
+        }
         for block in &function.blocks {
             if matches!(block.terminator, Terminator::Branch { .. }) {
                 required.insert("rimera_truthy");
@@ -355,11 +704,16 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                     OperationKind::Binary { .. } => Some("rimera_binary"),
                     OperationKind::InPlace { .. } => Some("rimera_inplace"),
                     OperationKind::Compare { .. } => Some("rimera_compare"),
+                    OperationKind::FormatValue { .. } => Some("rimera_format_value"),
                     OperationKind::ValueArray { .. } => Some("rimera_value_array_new"),
                     OperationKind::Tuple { .. } => Some("rimera_tuple_new"),
                     OperationKind::List { .. } => Some("rimera_list_new"),
+                    OperationKind::ListAppend { .. } => Some("rimera_list_append"),
                     OperationKind::Dictionary { .. } => Some("rimera_dict_new"),
+                    OperationKind::DictionaryMerge { .. } => Some("rimera_dictionary_merge"),
+                    OperationKind::DictionaryInsert { .. } => Some("rimera_dictionary_insert"),
                     OperationKind::Set { .. } => Some("rimera_set_new"),
+                    OperationKind::SetInsert { .. } => Some("rimera_set_insert"),
                     OperationKind::SliceNew { .. } => Some("rimera_slice_new"),
                     OperationKind::Contains { .. } => Some("rimera_contains"),
                     OperationKind::Unpack { .. } => Some("rimera_unpack_ex"),
@@ -371,8 +725,15 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                     OperationKind::ItemSet { .. } => Some("rimera_item_set"),
                     OperationKind::ItemDelete { .. } => Some("rimera_item_delete"),
                     OperationKind::ValueArrayGet { .. } => Some("rimera_value_array_get"),
+                    OperationKind::PatternSequence { .. } => Some("rimera_pattern_sequence"),
+                    OperationKind::PatternMappingCheck { .. } => {
+                        Some("rimera_pattern_mapping_check")
+                    }
+                    OperationKind::PatternMapping { .. } => Some("rimera_pattern_mapping"),
+                    OperationKind::PatternClass { .. } => Some("rimera_pattern_class"),
                     OperationKind::MakeFunction { .. } => Some("rimera_function_new"),
                     OperationKind::ClassNamespaceNew { .. } => Some("rimera_namespace_new"),
+                    OperationKind::AnnotationsEnsure { .. } => Some("rimera_annotations_ensure"),
                     OperationKind::ClassNamespaceSet { .. } => Some("rimera_namespace_set"),
                     OperationKind::ClassNamespaceGet { .. } => Some("rimera_namespace_get"),
                     OperationKind::ClassNameGet { .. } => Some("rimera_class_name_get"),
@@ -382,6 +743,9 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                     OperationKind::AttributeSet { .. } => Some("rimera_attr_set"),
                     OperationKind::AttributeDelete { .. } => Some("rimera_attr_delete"),
                     OperationKind::Call { .. } => Some("rimera_call"),
+                    OperationKind::CallArgumentsNew { .. } => Some("rimera_call_arguments_new"),
+                    OperationKind::CallArgumentAdd { .. } => Some("rimera_call_argument_add"),
+                    OperationKind::CallPrepared { .. } => Some("rimera_call_prepared"),
                     OperationKind::CellNew { .. } => Some("rimera_cell_new"),
                     OperationKind::CellGet { name, .. } => Some(if name.is_some() {
                         "rimera_cell_get_named"
@@ -435,8 +799,12 @@ struct Imports {
     value_array_new: cranelift_module::FuncId,
     tuple_new: cranelift_module::FuncId,
     list_new: cranelift_module::FuncId,
+    list_append: cranelift_module::FuncId,
     dict_new: cranelift_module::FuncId,
+    dict_merge: cranelift_module::FuncId,
+    dict_insert: cranelift_module::FuncId,
     set_new: cranelift_module::FuncId,
+    set_insert: cranelift_module::FuncId,
     contains: cranelift_module::FuncId,
     unpack: cranelift_module::FuncId,
     item_get: cranelift_module::FuncId,
@@ -447,7 +815,17 @@ struct Imports {
     iterator_new: cranelift_module::FuncId,
     iterator_next: cranelift_module::FuncId,
     value_array_get: cranelift_module::FuncId,
+    pattern_sequence: cranelift_module::FuncId,
+    pattern_mapping_check: cranelift_module::FuncId,
+    pattern_mapping: cranelift_module::FuncId,
+    pattern_class: cranelift_module::FuncId,
     function_new: cranelift_module::FuncId,
+    generator_function_new: cranelift_module::FuncId,
+    generator_function_get: cranelift_module::FuncId,
+    generator_state_get: cranelift_module::FuncId,
+    generator_state_set: cranelift_module::FuncId,
+    generator_slot_get: cranelift_module::FuncId,
+    generator_slot_set: cranelift_module::FuncId,
     namespace_new: cranelift_module::FuncId,
     namespace_set: cranelift_module::FuncId,
     namespace_get: cranelift_module::FuncId,
@@ -458,6 +836,9 @@ struct Imports {
     attr_set: cranelift_module::FuncId,
     attr_delete: cranelift_module::FuncId,
     call: cranelift_module::FuncId,
+    call_arguments_new: cranelift_module::FuncId,
+    call_argument_add: cranelift_module::FuncId,
+    call_prepared: cranelift_module::FuncId,
     cell_new: cranelift_module::FuncId,
     cell_get: cranelift_module::FuncId,
     cell_get_named: cranelift_module::FuncId,
@@ -484,6 +865,8 @@ struct Imports {
     binary: cranelift_module::FuncId,
     inplace: cranelift_module::FuncId,
     compare: cranelift_module::FuncId,
+    format_value: cranelift_module::FuncId,
+    annotations_ensure: cranelift_module::FuncId,
     truthy: cranelift_module::FuncId,
     print: cranelift_module::FuncId,
     print_literal: cranelift_module::FuncId,
@@ -594,16 +977,40 @@ impl Imports {
                 &[pointer, pointer, pointer, pointer],
                 true,
             )?,
+            list_append: declaration(
+                module,
+                "rimera_list_append",
+                &[pointer, pointer, pointer],
+                true,
+            )?,
             dict_new: declaration(
                 module,
                 "rimera_dict_new",
                 &[pointer, pointer, pointer, pointer, pointer],
                 true,
             )?,
+            dict_merge: declaration(
+                module,
+                "rimera_dictionary_merge",
+                &[pointer, pointer, pointer],
+                true,
+            )?,
+            dict_insert: declaration(
+                module,
+                "rimera_dictionary_insert",
+                &[pointer, pointer, pointer, pointer],
+                true,
+            )?,
             set_new: declaration(
                 module,
                 "rimera_set_new",
                 &[pointer, pointer, pointer, pointer],
+                true,
+            )?,
+            set_insert: declaration(
+                module,
+                "rimera_set_insert",
+                &[pointer, pointer, pointer],
                 true,
             )?,
             contains: declaration(
@@ -661,6 +1068,48 @@ impl Imports {
                 &[pointer, pointer, pointer, pointer],
                 true,
             )?,
+            pattern_sequence: declaration(
+                module,
+                "rimera_pattern_sequence",
+                &[
+                    pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                    types::I8,
+                    pointer,
+                    pointer,
+                ],
+                true,
+            )?,
+            pattern_mapping_check: declaration(
+                module,
+                "rimera_pattern_mapping_check",
+                &[pointer, pointer, pointer, pointer],
+                true,
+            )?,
+            pattern_mapping: declaration(
+                module,
+                "rimera_pattern_mapping",
+                &[
+                    pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                    types::I8,
+                    pointer,
+                    pointer,
+                ],
+                true,
+            )?,
+            pattern_class: declaration(
+                module,
+                "rimera_pattern_class",
+                &[
+                    pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+                ],
+                true,
+            )?,
             function_new: declaration(
                 module,
                 "rimera_function_new",
@@ -670,7 +1119,52 @@ impl Imports {
                 ],
                 true,
             )?,
+            generator_function_new: declaration(
+                module,
+                "rimera_generator_function_new",
+                &[
+                    pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+                    pointer, pointer, pointer, pointer,
+                ],
+                true,
+            )?,
+            generator_function_get: declaration(
+                module,
+                "rimera_generator_function_get",
+                &[pointer, pointer, pointer],
+                true,
+            )?,
+            generator_state_get: declaration(
+                module,
+                "rimera_generator_state_get",
+                &[pointer, pointer, pointer],
+                true,
+            )?,
+            generator_state_set: declaration(
+                module,
+                "rimera_generator_state_set",
+                &[pointer, pointer, types::I32],
+                true,
+            )?,
+            generator_slot_get: declaration(
+                module,
+                "rimera_generator_slot_get",
+                &[pointer, pointer, pointer, pointer],
+                true,
+            )?,
+            generator_slot_set: declaration(
+                module,
+                "rimera_generator_slot_set",
+                &[pointer, pointer, pointer, pointer],
+                true,
+            )?,
             namespace_new: declaration(module, "rimera_namespace_new", &[pointer, pointer], true)?,
+            annotations_ensure: declaration(
+                module,
+                "rimera_annotations_ensure",
+                &[pointer, pointer],
+                true,
+            )?,
             namespace_set: declaration(
                 module,
                 "rimera_namespace_set",
@@ -724,6 +1218,24 @@ impl Imports {
             call: declaration(
                 module,
                 "rimera_call",
+                &[pointer, pointer, pointer, pointer],
+                true,
+            )?,
+            call_arguments_new: declaration(
+                module,
+                "rimera_call_arguments_new",
+                &[pointer, pointer, pointer],
+                true,
+            )?,
+            call_argument_add: declaration(
+                module,
+                "rimera_call_argument_add",
+                &[pointer, pointer, types::I8, pointer, pointer, pointer],
+                true,
+            )?,
+            call_prepared: declaration(
+                module,
+                "rimera_call_prepared",
                 &[pointer, pointer, pointer, pointer],
                 true,
             )?,
@@ -866,6 +1378,12 @@ impl Imports {
                 &[pointer, types::I8, pointer, pointer, pointer],
                 true,
             )?,
+            format_value: declaration(
+                module,
+                "rimera_format_value",
+                &[pointer, types::I8, pointer, pointer, pointer],
+                true,
+            )?,
             truthy: declaration(module, "rimera_truthy", &[pointer, pointer, pointer], true)?,
             print: declaration(module, "rimera_print", &[pointer, pointer, pointer], true)?,
             print_literal: declaration(
@@ -938,6 +1456,11 @@ fn define_constants(
                             define_string(module, &mut data, name)?;
                         }
                     }
+                    OperationKind::CallArgumentAdd {
+                        name: Some(name), ..
+                    } => {
+                        define_string(module, &mut data, name)?;
+                    }
                     OperationKind::GlobalGet { name, .. }
                     | OperationKind::GlobalSet { name, .. }
                     | OperationKind::GlobalDelete { name }
@@ -955,6 +1478,11 @@ fn define_constants(
                         name: Some(name), ..
                     } => {
                         define_string(module, &mut data, name)?;
+                    }
+                    OperationKind::PatternClass { keyword_names, .. }
+                        if !keyword_names.is_empty() =>
+                    {
+                        define_string(module, &mut data, &keyword_names.join("\0"))?;
                     }
                     _ => {}
                 }
@@ -1444,6 +1972,26 @@ fn emit_operation(
                 failure,
             );
         }
+        OperationKind::FormatValue {
+            dest,
+            value,
+            conversion,
+            spec,
+        } => {
+            let value = value_pointer(builder, pointer, values_slot, *value);
+            let spec = value_pointer(builder, pointer, values_slot, *spec);
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let conversion = builder
+                .ins()
+                .iconst(types::I8, i64::from(*conversion as u8));
+            let runtime_call = module.declare_func_in_func(imports.format_value, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, conversion, value, spec, output],
+                failure,
+            );
+        }
         OperationKind::ValueArray { dest, values }
         | OperationKind::Tuple { dest, values }
         | OperationKind::List { dest, values }
@@ -1537,6 +2085,45 @@ fn emit_operation(
                 failure,
             );
         }
+        OperationKind::ListAppend { list, value } => {
+            let list = value_pointer(builder, pointer, values_slot, *list);
+            let value = value_pointer(builder, pointer, values_slot, *value);
+            let runtime_call = module.declare_func_in_func(imports.list_append, builder.func);
+            emit_status_call(builder, runtime_call, &[context, list, value], failure);
+        }
+        OperationKind::DictionaryMerge { dictionary, source } => {
+            let dictionary = value_pointer(builder, pointer, values_slot, *dictionary);
+            let source = value_pointer(builder, pointer, values_slot, *source);
+            let runtime_call = module.declare_func_in_func(imports.dict_merge, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, dictionary, source],
+                failure,
+            );
+        }
+        OperationKind::DictionaryInsert {
+            dictionary,
+            key,
+            value,
+        } => {
+            let dictionary = value_pointer(builder, pointer, values_slot, *dictionary);
+            let key = value_pointer(builder, pointer, values_slot, *key);
+            let value = value_pointer(builder, pointer, values_slot, *value);
+            let runtime_call = module.declare_func_in_func(imports.dict_insert, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, dictionary, key, value],
+                failure,
+            );
+        }
+        OperationKind::SetInsert { set, value } => {
+            let set = value_pointer(builder, pointer, values_slot, *set);
+            let value = value_pointer(builder, pointer, values_slot, *value);
+            let runtime_call = module.declare_func_in_func(imports.set_insert, builder.func);
+            emit_status_call(builder, runtime_call, &[context, set, value], failure);
+        }
         OperationKind::Contains {
             dest,
             collection,
@@ -1603,6 +2190,183 @@ fn emit_operation(
                 &[context, array, index, output],
                 failure,
             );
+        }
+        OperationKind::PatternSequence {
+            values,
+            matched,
+            subject,
+            before_count,
+            after_count,
+            starred,
+        } => {
+            let flag = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                1,
+                0,
+            ));
+            let subject = value_pointer(builder, pointer, values_slot, *subject);
+            let before = builder.ins().iconst(pointer, i64::from(*before_count));
+            let after = builder.ins().iconst(pointer, i64::from(*after_count));
+            let starred = builder.ins().iconst(types::I8, i64::from(*starred));
+            let output = value_pointer(builder, pointer, values_slot, *values);
+            let flag_pointer = builder.ins().stack_addr(pointer, flag, 0);
+            let runtime_call = module.declare_func_in_func(imports.pattern_sequence, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[
+                    context,
+                    subject,
+                    before,
+                    after,
+                    starred,
+                    output,
+                    flag_pointer,
+                ],
+                failure,
+            );
+            let tag = builder.ins().iconst(types::I64, 1);
+            let loaded = builder.ins().stack_load(types::I8, flag, 0);
+            let payload = builder.ins().uextend(types::I64, loaded);
+            builder
+                .ins()
+                .stack_store(tag, values_slot, value_offset(*matched));
+            builder
+                .ins()
+                .stack_store(payload, values_slot, value_offset(*matched) + 8);
+        }
+        OperationKind::PatternMappingCheck {
+            matched,
+            subject,
+            minimum_count,
+        } => {
+            let subject = value_pointer(builder, pointer, values_slot, *subject);
+            let minimum_count = builder.ins().iconst(pointer, i64::from(*minimum_count));
+            let output = value_pointer(builder, pointer, values_slot, *matched);
+            let runtime_call =
+                module.declare_func_in_func(imports.pattern_mapping_check, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, subject, minimum_count, output],
+                failure,
+            );
+        }
+        OperationKind::PatternMapping {
+            values,
+            matched,
+            subject,
+            keys,
+            rest,
+        } => {
+            let key_bytes = u32::try_from(keys.len().max(1) * VALUE_SIZE as usize)
+                .map_err(|_| "mapping pattern key array is too large")?;
+            let key_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                key_bytes,
+                3,
+            ));
+            for (index, key) in keys.iter().enumerate() {
+                copy_between_slots(
+                    builder,
+                    values_slot,
+                    value_offset(*key),
+                    key_slot,
+                    i32::try_from(index * VALUE_SIZE as usize)
+                        .map_err(|_| "mapping pattern key offset is too large")?,
+                );
+            }
+            let flag = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                1,
+                0,
+            ));
+            let subject = value_pointer(builder, pointer, values_slot, *subject);
+            let key_pointer = builder.ins().stack_addr(pointer, key_slot, 0);
+            let key_count = builder.ins().iconst(
+                pointer,
+                i64::try_from(keys.len()).map_err(|_| "too many mapping pattern keys")?,
+            );
+            let rest = builder.ins().iconst(types::I8, i64::from(*rest));
+            let output = value_pointer(builder, pointer, values_slot, *values);
+            let flag_pointer = builder.ins().stack_addr(pointer, flag, 0);
+            let runtime_call = module.declare_func_in_func(imports.pattern_mapping, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[
+                    context,
+                    subject,
+                    key_pointer,
+                    key_count,
+                    rest,
+                    output,
+                    flag_pointer,
+                ],
+                failure,
+            );
+            let tag = builder.ins().iconst(types::I64, 1);
+            let loaded = builder.ins().stack_load(types::I8, flag, 0);
+            let payload = builder.ins().uextend(types::I64, loaded);
+            builder
+                .ins()
+                .stack_store(tag, values_slot, value_offset(*matched));
+            builder
+                .ins()
+                .stack_store(payload, values_slot, value_offset(*matched) + 8);
+        }
+        OperationKind::PatternClass {
+            values,
+            matched,
+            subject,
+            class,
+            positional_count,
+            keyword_names,
+        } => {
+            let flag = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                1,
+                0,
+            ));
+            let subject = value_pointer(builder, pointer, values_slot, *subject);
+            let class = value_pointer(builder, pointer, values_slot, *class);
+            let positional_count = builder.ins().iconst(pointer, i64::from(*positional_count));
+            let keyword_blob = keyword_names.join("\0");
+            let (keyword_pointer, keyword_len) = if keyword_blob.is_empty() {
+                (
+                    builder.ins().iconst(pointer, 0),
+                    builder.ins().iconst(pointer, 0),
+                )
+            } else {
+                metadata_pointer(builder, module, data, &keyword_blob, pointer)?
+            };
+            let output = value_pointer(builder, pointer, values_slot, *values);
+            let flag_pointer = builder.ins().stack_addr(pointer, flag, 0);
+            let runtime_call = module.declare_func_in_func(imports.pattern_class, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[
+                    context,
+                    subject,
+                    class,
+                    positional_count,
+                    keyword_pointer,
+                    keyword_len,
+                    output,
+                    flag_pointer,
+                ],
+                failure,
+            );
+            let tag = builder.ins().iconst(types::I64, 1);
+            let loaded = builder.ins().stack_load(types::I8, flag, 0);
+            let payload = builder.ins().uextend(types::I64, loaded);
+            builder
+                .ins()
+                .stack_store(tag, values_slot, value_offset(*matched));
+            builder
+                .ins()
+                .stack_store(payload, values_slot, value_offset(*matched) + 8);
         }
         OperationKind::ItemGet {
             dest,
@@ -1804,32 +2568,79 @@ fn emit_operation(
                 i64::try_from(closure.len()).map_err(|_| "too many closure cells")?,
             );
             let output = value_pointer(builder, pointer, values_slot, *dest);
-            let runtime_call = module.declare_func_in_func(imports.function_new, builder.func);
-
-            emit_status_call(
-                builder,
-                runtime_call,
-                &[
-                    context,
-                    code,
-                    name,
-                    name_len,
-                    qualified_name,
-                    qualified_name_len,
-                    parameter_pointer,
-                    parameter_count,
-                    closure_pointer,
-                    closure_count,
-                    output,
-                ],
-                failure,
-            );
+            if target.kind == mir::FunctionKind::Generator {
+                let persistent = mir::generator_persistent_values(target)?;
+                let parameter_values = target
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.value)
+                    .collect::<BTreeSet<_>>();
+                let persistent_slot_count = target.parameters.len()
+                    + persistent
+                        .iter()
+                        .filter(|value| !parameter_values.contains(value))
+                        .count();
+                let persistent_slot_count = builder.ins().iconst(
+                    pointer,
+                    i64::try_from(persistent_slot_count)
+                        .map_err(|_| "too many generator persistent slots")?,
+                );
+                let runtime_call =
+                    module.declare_func_in_func(imports.generator_function_new, builder.func);
+                emit_status_call(
+                    builder,
+                    runtime_call,
+                    &[
+                        context,
+                        code,
+                        name,
+                        name_len,
+                        qualified_name,
+                        qualified_name_len,
+                        parameter_pointer,
+                        parameter_count,
+                        closure_pointer,
+                        closure_count,
+                        persistent_slot_count,
+                        output,
+                    ],
+                    failure,
+                );
+            } else {
+                let runtime_call = module.declare_func_in_func(imports.function_new, builder.func);
+                emit_status_call(
+                    builder,
+                    runtime_call,
+                    &[
+                        context,
+                        code,
+                        name,
+                        name_len,
+                        qualified_name,
+                        qualified_name_len,
+                        parameter_pointer,
+                        parameter_count,
+                        closure_pointer,
+                        closure_count,
+                        output,
+                    ],
+                    failure,
+                );
+            }
         }
         OperationKind::ClassNamespaceNew { dest } => {
             let output = value_pointer(builder, pointer, values_slot, *dest);
             let runtime_call = module.declare_func_in_func(imports.namespace_new, builder.func);
 
             emit_status_call(builder, runtime_call, &[context, output], failure);
+        }
+        OperationKind::AnnotationsEnsure { namespace } => {
+            let namespace = namespace
+                .map(|value| value_pointer(builder, pointer, values_slot, value))
+                .unwrap_or_else(|| builder.ins().iconst(pointer, 0));
+            let runtime_call =
+                module.declare_func_in_func(imports.annotations_ensure, builder.func);
+            emit_status_call(builder, runtime_call, &[context, namespace], failure);
         }
         OperationKind::ClassNamespaceSet {
             namespace,
@@ -2065,6 +2876,52 @@ fn emit_operation(
                 builder,
                 runtime_call,
                 &[context, callable, descriptor, output],
+                failure,
+            );
+        }
+        OperationKind::CallArgumentsNew { dest, callable } => {
+            let callable = value_pointer(builder, pointer, values_slot, *callable);
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call =
+                module.declare_func_in_func(imports.call_arguments_new, builder.func);
+            emit_status_call(builder, runtime_call, &[context, callable, output], failure);
+        }
+        OperationKind::CallArgumentAdd {
+            arguments,
+            kind,
+            name,
+            value,
+        } => {
+            let arguments = value_pointer(builder, pointer, values_slot, *arguments);
+            let value = value_pointer(builder, pointer, values_slot, *value);
+            let kind = builder.ins().iconst(types::I8, i64::from(*kind as u8));
+            let null = builder.ins().iconst(pointer, 0);
+            let (name_pointer, name_len) = if let Some(name) = name {
+                metadata_pointer(builder, module, data, name, pointer)?
+            } else {
+                (null, null)
+            };
+            let runtime_call = module.declare_func_in_func(imports.call_argument_add, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, arguments, kind, name_pointer, name_len, value],
+                failure,
+            );
+        }
+        OperationKind::CallPrepared {
+            dest,
+            callable,
+            arguments,
+        } => {
+            let callable = value_pointer(builder, pointer, values_slot, *callable);
+            let arguments = value_pointer(builder, pointer, values_slot, *arguments);
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call = module.declare_func_in_func(imports.call_prepared, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, callable, arguments, output],
                 failure,
             );
         }
@@ -2354,6 +3211,184 @@ fn emit_operation(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_generator_terminator(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut ObjectModule,
+    imports: &Imports,
+    refs: &FunctionRefs,
+    program: &mir::Function,
+    blocks: &[cranelift_codegen::ir::Block],
+    block_index: usize,
+    terminator: &Terminator,
+    pointer: cranelift_codegen::ir::Type,
+    values_slot: StackSlot,
+    roots_slot: StackSlot,
+    root_capacity: usize,
+    roots: Option<&[mir::ValueId]>,
+    slots: &BTreeMap<mir::ValueId, usize>,
+    context: Value,
+    generator: Value,
+    output: Value,
+    outcome: Value,
+    frame: Value,
+    failure: cranelift_codegen::ir::Block,
+) -> Result<(), String> {
+    match terminator {
+        Terminator::Jump { target, arguments } => {
+            copy_edge_arguments(
+                builder,
+                values_slot,
+                arguments,
+                &program.blocks[target.0 as usize].parameters,
+            )?;
+            builder.ins().jump(blocks[target.0 as usize], &[]);
+        }
+        Terminator::Branch {
+            condition,
+            then_target,
+            then_arguments,
+            else_target,
+            else_arguments,
+        } => {
+            let roots = roots.ok_or_else(|| {
+                "internal error: branch is missing its GC safepoint roots".to_owned()
+            })?;
+            publish_roots(builder, values_slot, roots_slot, root_capacity, roots)?;
+            let truth = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                VALUE_SIZE,
+                3,
+            ));
+            let input = value_pointer(builder, pointer, values_slot, *condition);
+            let truth_output = builder.ins().stack_addr(pointer, truth, 0);
+            emit_status_call(
+                builder,
+                refs.truthy,
+                &[context, input, truth_output],
+                failure,
+            );
+            let payload = builder.ins().stack_load(types::I64, truth, 8);
+            let condition = builder.ins().icmp_imm(IntCC::NotEqual, payload, 0);
+            let then_edge = builder.create_block();
+            let else_edge = builder.create_block();
+            builder
+                .ins()
+                .brif(condition, then_edge, &[], else_edge, &[]);
+            builder.switch_to_block(then_edge);
+            copy_edge_arguments(
+                builder,
+                values_slot,
+                then_arguments,
+                &program.blocks[then_target.0 as usize].parameters,
+            )?;
+            builder.ins().jump(blocks[then_target.0 as usize], &[]);
+            builder.switch_to_block(else_edge);
+            copy_edge_arguments(
+                builder,
+                values_slot,
+                else_arguments,
+                &program.blocks[else_target.0 as usize].parameters,
+            )?;
+            builder.ins().jump(blocks[else_target.0 as usize], &[]);
+        }
+        Terminator::Yield { value, .. } => {
+            let roots = roots.ok_or_else(|| {
+                "internal error: yield is missing its persistent root set".to_owned()
+            })?;
+            publish_roots(builder, values_slot, roots_slot, root_capacity, roots)?;
+            for persistent in roots {
+                let Some(slot) = slots.get(persistent).copied() else {
+                    continue;
+                };
+                let slot_index = builder.ins().iconst(
+                    pointer,
+                    i64::try_from(slot).map_err(|_| "generator slot index is too large")?,
+                );
+                let value_pointer = value_pointer(builder, pointer, values_slot, *persistent);
+                let slot_set =
+                    module.declare_func_in_func(imports.generator_slot_set, builder.func);
+                emit_status_call(
+                    builder,
+                    slot_set,
+                    &[context, generator, slot_index, value_pointer],
+                    failure,
+                );
+            }
+            let state_id =
+                u32::try_from(block_index + 1).map_err(|_| "too many generator states")?;
+            let state = builder.ins().iconst(types::I32, i64::from(state_id));
+            let state_set = module.declare_func_in_func(imports.generator_state_set, builder.func);
+            emit_status_call(builder, state_set, &[context, generator, state], failure);
+            let source = value_offset(*value);
+            let first = builder.ins().stack_load(types::I64, values_slot, source);
+            let second = builder
+                .ins()
+                .stack_load(types::I64, values_slot, source + 8);
+            builder
+                .ins()
+                .store(cranelift_codegen::ir::MemFlags::trusted(), first, output, 0);
+            builder.ins().store(
+                cranelift_codegen::ir::MemFlags::trusted(),
+                second,
+                output,
+                8,
+            );
+            let yielded = builder.ins().iconst(types::I8, 0);
+            builder.ins().store(
+                cranelift_codegen::ir::MemFlags::trusted(),
+                yielded,
+                outcome,
+                0,
+            );
+            builder.ins().call(refs.roots_pop, &[context, frame]);
+            let ok = builder.ins().iconst(types::I32, 0);
+            builder.ins().return_(&[ok]);
+        }
+        Terminator::ReturnValue { value } => {
+            if let Some(value) = value {
+                let source = value_offset(*value);
+                let first = builder.ins().stack_load(types::I64, values_slot, source);
+                let second = builder
+                    .ins()
+                    .stack_load(types::I64, values_slot, source + 8);
+                builder
+                    .ins()
+                    .store(cranelift_codegen::ir::MemFlags::trusted(), first, output, 0);
+                builder.ins().store(
+                    cranelift_codegen::ir::MemFlags::trusted(),
+                    second,
+                    output,
+                    8,
+                );
+            } else {
+                let zero = builder.ins().iconst(types::I64, 0);
+                builder
+                    .ins()
+                    .store(cranelift_codegen::ir::MemFlags::trusted(), zero, output, 0);
+                builder
+                    .ins()
+                    .store(cranelift_codegen::ir::MemFlags::trusted(), zero, output, 8);
+            }
+            let returned = builder.ins().iconst(types::I8, 1);
+            builder.ins().store(
+                cranelift_codegen::ir::MemFlags::trusted(),
+                returned,
+                outcome,
+                0,
+            );
+            builder.ins().call(refs.roots_pop, &[context, frame]);
+            let ok = builder.ins().iconst(types::I32, 0);
+            builder.ins().return_(&[ok]);
+        }
+        Terminator::Return { .. } => {
+            return Err("exit-code return cannot terminate a generator".to_owned());
+        }
+        Terminator::Unreachable => return Err("cannot emit unterminated MIR block".to_owned()),
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_terminator(
     builder: &mut FunctionBuilder<'_>,
     refs: &FunctionRefs,
@@ -2465,6 +3500,9 @@ fn emit_terminator(
             builder.ins().call(refs.roots_pop, &[context, frame]);
             let ok = builder.ins().iconst(types::I32, 0);
             builder.ins().return_(&[ok]);
+        }
+        Terminator::Yield { .. } => {
+            return Err("yield terminator reached the non-generator code path".to_owned());
         }
         Terminator::Unreachable => return Err("cannot emit unterminated MIR block".to_owned()),
     }

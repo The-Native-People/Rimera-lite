@@ -39,7 +39,7 @@ pub fn lower(module: &hir::Module) -> Result<mir::Program, String> {
                 .map_or(Span::default(), |statement| statement.span);
             chunks.push((function, span));
         }
-        program.lower_module_driver(&chunks)?
+        program.lower_module_driver(&chunks, statements_need_annotations(&module.statements))?
     };
     let functions = program
         .functions
@@ -92,6 +92,14 @@ impl ProgramLowerer {
             lowerer.cells.insert(name.clone(), cell);
         }
         lowerer.class_scopes.push(ClassScope { namespace });
+        if class_members_need_annotations(body) {
+            lowerer.emit(
+                Span::default(),
+                mir::OperationKind::AnnotationsEnsure {
+                    namespace: Some(namespace),
+                },
+            );
+        }
         if class_members_need_class_cell(body) {
             let cell = lowerer.value();
             lowerer.emit(
@@ -132,12 +140,20 @@ impl ProgramLowerer {
     fn lower_module_driver(
         &mut self,
         chunks: &[(mir::FunctionId, Span)],
+        has_annotations: bool,
     ) -> Result<mir::FunctionId, String> {
         let id = mir::FunctionId(
             u32::try_from(self.functions.len()).map_err(|_| "too many MIR functions")?,
         );
         self.functions.push(None);
         let mut lowerer = Lowerer::new(self);
+        lowerer.module_semantics = true;
+        if has_annotations {
+            lowerer.emit(
+                Span::default(),
+                mir::OperationKind::AnnotationsEnsure { namespace: None },
+            );
+        }
         for (function, span) in chunks {
             lowerer.emit(
                 *span,
@@ -176,6 +192,7 @@ impl ProgramLowerer {
         );
         self.functions.push(None);
         let mut lowerer = Lowerer::new(self);
+        lowerer.module_semantics = name == "<module>";
         let mut mir_parameters = Vec::with_capacity(parameters.len());
         let mut parameter_values = BTreeMap::new();
         for parameter in parameters {
@@ -212,6 +229,12 @@ impl ProgramLowerer {
                 lowerer.cells.insert(local.clone(), cell);
             }
         }
+        if module_scope && statements_need_annotations(statements) {
+            lowerer.emit(
+                Span::default(),
+                mir::OperationKind::AnnotationsEnsure { namespace: None },
+            );
+        }
         let entry = lowerer.current;
         lowerer.statements(statements)?;
         if lowerer.is_open() {
@@ -238,6 +261,116 @@ impl ProgramLowerer {
         self.functions[id.0 as usize] = Some(function);
         Ok(id)
     }
+
+    fn lower_comprehension(
+        &mut self,
+        kind: hir::ComprehensionKind,
+        element: &hir::Expression,
+        key: Option<&hir::Expression>,
+        clauses: &[hir::ComprehensionClause],
+        locals: &[String],
+        free: &[String],
+    ) -> Result<mir::FunctionId, String> {
+        let id = mir::FunctionId(
+            u32::try_from(self.functions.len()).map_err(|_| "too many MIR functions")?,
+        );
+        self.functions.push(None);
+        let mut lowerer = Lowerer::new(self);
+        let outer_iterator = lowerer.value();
+        let parameter = mir::Parameter {
+            value: outer_iterator,
+            name: ".0".to_owned(),
+            kind: rimera_abi::RParameterKind::PositionalOnly,
+            has_default: false,
+        };
+        for (index, name) in free.iter().enumerate() {
+            let cell = lowerer.value();
+            lowerer.emit(
+                Span::default(),
+                mir::OperationKind::ClosureGet {
+                    dest: cell,
+                    index: u32::try_from(index).map_err(|_| "too many closure cells")?,
+                },
+            );
+            lowerer.cells.insert(name.clone(), cell);
+        }
+        for local in locals {
+            let cell = lowerer.value();
+            lowerer.emit(
+                Span::default(),
+                mir::OperationKind::CellNew {
+                    dest: cell,
+                    initial: None,
+                },
+            );
+            lowerer.cells.insert(local.clone(), cell);
+        }
+        let result = lowerer.value();
+        let (name, initial) = match kind {
+            hir::ComprehensionKind::List => (
+                "<listcomp>",
+                Some(mir::OperationKind::List {
+                    dest: result,
+                    values: Vec::new(),
+                }),
+            ),
+            hir::ComprehensionKind::Set => (
+                "<setcomp>",
+                Some(mir::OperationKind::Set {
+                    dest: result,
+                    values: Vec::new(),
+                }),
+            ),
+            hir::ComprehensionKind::Dictionary => (
+                "<dictcomp>",
+                Some(mir::OperationKind::Dictionary {
+                    dest: result,
+                    keys: Vec::new(),
+                    values: Vec::new(),
+                }),
+            ),
+            hir::ComprehensionKind::Generator => (
+                "<genexpr>",
+                Some(mir::OperationKind::Constant {
+                    dest: result,
+                    value: mir::Constant::None,
+                }),
+            ),
+        };
+        if let Some(initial) = initial {
+            lowerer.emit(Span::default(), initial);
+        }
+        let finish = lowerer.new_block();
+        lowerer.lower_comprehension_level(
+            kind,
+            element,
+            key,
+            clauses,
+            0,
+            Some(outer_iterator),
+            result,
+            finish,
+        )?;
+        lowerer.current = finish;
+        lowerer.terminate(mir::Terminator::ReturnValue {
+            value: (kind != hir::ComprehensionKind::Generator).then_some(result),
+        })?;
+        self.functions[id.0 as usize] = Some(mir::Function {
+            kind: if kind == hir::ComprehensionKind::Generator {
+                mir::FunctionKind::Generator
+            } else {
+                mir::FunctionKind::Python
+            },
+            name: name.to_owned(),
+            qualified_name: name.to_owned(),
+            parameters: vec![parameter],
+            entry: mir::BlockId(0),
+            blocks: lowerer.blocks,
+            value_count: lowerer.next_value,
+            exception_edges: lowerer.exception_edges,
+        });
+        Ok(id)
+    }
 }
 
 struct Lowerer<'a> {
@@ -251,6 +384,7 @@ struct Lowerer<'a> {
     cleanups: Vec<CleanupAction>,
     loops: Vec<LoopTargets>,
     class_scopes: Vec<ClassScope>,
+    module_semantics: bool,
 }
 
 #[derive(Clone)]
@@ -284,6 +418,68 @@ struct LoopTargets {
 
 struct ClassScope {
     namespace: mir::ValueId,
+}
+
+fn statements_need_annotations(statements: &[hir::Statement]) -> bool {
+    statements.iter().any(|statement| match &statement.kind {
+        hir::StatementKind::AnnAssign { .. } => true,
+        hir::StatementKind::If {
+            then_body,
+            else_body,
+            ..
+        } => statements_need_annotations(then_body) || statements_need_annotations(else_body),
+        hir::StatementKind::While { body, .. } => statements_need_annotations(body),
+        hir::StatementKind::For {
+            body, else_body, ..
+        } => statements_need_annotations(body) || statements_need_annotations(else_body),
+        hir::StatementKind::Try {
+            body,
+            handlers,
+            else_body,
+            finally_body,
+            ..
+        } => {
+            statements_need_annotations(body)
+                || handlers
+                    .iter()
+                    .any(|handler| statements_need_annotations(&handler.body))
+                || statements_need_annotations(else_body)
+                || statements_need_annotations(finally_body)
+        }
+        hir::StatementKind::FunctionDef { .. } | hir::StatementKind::ClassDef { .. } => false,
+        _ => false,
+    })
+}
+
+fn class_members_need_annotations(members: &[hir::ClassMember]) -> bool {
+    members.iter().any(|member| match member {
+        hir::ClassMember::AnnAssign { .. } => true,
+        hir::ClassMember::If {
+            then_body,
+            else_body,
+            ..
+        } => class_members_need_annotations(then_body) || class_members_need_annotations(else_body),
+        hir::ClassMember::While { body, .. } => class_members_need_annotations(body),
+        hir::ClassMember::For {
+            body, else_body, ..
+        } => class_members_need_annotations(body) || class_members_need_annotations(else_body),
+        hir::ClassMember::Try {
+            body,
+            handlers,
+            else_body,
+            finally_body,
+            ..
+        } => {
+            class_members_need_annotations(body)
+                || handlers
+                    .iter()
+                    .any(|handler| class_members_need_annotations(&handler.body))
+                || class_members_need_annotations(else_body)
+                || class_members_need_annotations(finally_body)
+        }
+        hir::ClassMember::FunctionDef { .. } | hir::ClassMember::ClassDef { .. } => false,
+        _ => false,
+    })
 }
 
 fn class_members_need_class_cell(members: &[hir::ClassMember]) -> bool {
@@ -337,6 +533,7 @@ impl<'a> Lowerer<'a> {
             cleanups: Vec::new(),
             loops: Vec::new(),
             class_scopes: Vec::new(),
+            module_semantics: false,
         }
     }
 
@@ -367,11 +564,34 @@ impl<'a> Lowerer<'a> {
                     self.delete_target(target)?;
                 }
             }
+            hir::StatementKind::AnnAssign {
+                target,
+                annotation,
+                value,
+                simple,
+            } => {
+                if let Some(value) = value {
+                    let value = self.expression(value)?;
+                    self.write_target(target, value)?;
+                } else {
+                    self.evaluate_annotation_target(target)?;
+                }
+                if self.module_semantics {
+                    let annotation = self.expression(annotation)?;
+                    if *simple && let hir::TargetKind::Name { name, .. } = &target.kind {
+                        self.record_annotation(statement.span, None, name, annotation)?;
+                    }
+                }
+            }
+            hir::StatementKind::Assert { test, message } => {
+                self.lower_assert(statement.span, test, message.as_ref())?;
+            }
             hir::StatementKind::FunctionDef {
                 name,
                 binding,
                 decorators: _,
                 parameters,
+                return_annotation,
                 body,
                 locals,
                 cells: _,
@@ -396,6 +616,11 @@ impl<'a> Lowerer<'a> {
                         ));
                     }
                 }
+                let annotations = self.lower_function_annotations(
+                    statement.span,
+                    parameters,
+                    return_annotation.as_ref(),
+                )?;
                 let closure =
                     free.iter()
                         .map(|name| {
@@ -414,6 +639,16 @@ impl<'a> Lowerer<'a> {
                         closure,
                     },
                 );
+                if let Some(annotations) = annotations {
+                    self.emit(
+                        statement.span,
+                        mir::OperationKind::AttributeSet {
+                            receiver: value,
+                            name: "__annotations__".to_owned(),
+                            value: annotations,
+                        },
+                    );
+                }
                 self.store_name(statement.span, name, *binding, value)?;
             }
             hir::StatementKind::ClassDef {
@@ -529,76 +764,29 @@ impl<'a> Lowerer<'a> {
                 // shared by the hidden class-body lowerer.
                 for member in body.iter().take(0) {
                     match member {
-                        hir::ClassMember::Assign { name, value } => {
+                        hir::ClassMember::Assign { targets, value } => {
                             let value = self.expression(value)?;
-                            self.emit(
-                                statement.span,
-                                mir::OperationKind::ClassNamespaceSet {
-                                    namespace,
-                                    name: name.clone(),
-                                    value,
-                                },
-                            );
-                            self.record_class_name(name);
+                            for target in targets {
+                                self.write_class_target(namespace, target, value)?;
+                            }
                         }
-                        hir::ClassMember::AugAssign { name, op, value } => {
-                            self.lower_class_augmented_assignment(
+                        hir::ClassMember::AugAssign { target, op, value } => {
+                            self.lower_class_augmented_target(
                                 statement.span,
                                 namespace,
-                                name,
+                                target,
                                 *op,
                                 value,
                             )?;
                         }
-                        hir::ClassMember::Delete { name } => self.emit(
-                            statement.span,
-                            mir::OperationKind::ClassNamespaceDelete {
-                                namespace,
-                                name: name.clone(),
-                            },
-                        ),
-                        hir::ClassMember::ItemAssign {
-                            collection,
-                            index,
-                            value,
-                        } => {
-                            let collection = self.expression(collection)?;
-                            let index = self.expression(index)?;
-                            let value = self.expression(value)?;
-                            self.emit(
-                                statement.span,
-                                mir::OperationKind::ItemSet {
-                                    collection,
-                                    index,
-                                    value,
-                                },
-                            );
+                        hir::ClassMember::Delete { targets } => {
+                            for target in targets {
+                                self.delete_class_target(namespace, target)?;
+                            }
                         }
-                        hir::ClassMember::AttributeAssign {
-                            receiver,
-                            name,
-                            value,
-                        } => {
-                            let receiver = self.expression(receiver)?;
-                            let value = self.expression(value)?;
-                            self.emit(
-                                statement.span,
-                                mir::OperationKind::AttributeSet {
-                                    receiver,
-                                    name: name.clone(),
-                                    value,
-                                },
-                            );
-                        }
-                        hir::ClassMember::AttributeDelete { receiver, name } => {
-                            let receiver = self.expression(receiver)?;
-                            self.emit(
-                                statement.span,
-                                mir::OperationKind::AttributeDelete {
-                                    receiver,
-                                    name: name.clone(),
-                                },
-                            );
+                        hir::ClassMember::AnnAssign { .. } => {}
+                        hir::ClassMember::Assert { test, message } => {
+                            self.lower_assert(statement.span, test, message.as_ref())?;
                         }
                         hir::ClassMember::Raise { exception, cause } => {
                             if let Some(exception) = exception {
@@ -684,6 +872,7 @@ impl<'a> Lowerer<'a> {
                             decorators,
                             uses_zero_argument_super,
                             parameters,
+                            return_annotation: _,
                             body,
                             locals,
                             cells: _,
@@ -973,6 +1162,9 @@ impl<'a> Lowerer<'a> {
                 body,
                 else_body,
             } => self.lower_for(statement.span, target, iterable, body, else_body)?,
+            hir::StatementKind::Match { subject, cases } => {
+                self.lower_match(statement.span, subject, cases)?;
+            }
         }
         Ok(())
     }
@@ -1166,10 +1358,56 @@ impl<'a> Lowerer<'a> {
                     mir::OperationKind::ItemDelete { collection, index },
                 );
             }
-            hir::TargetKind::Sequence { .. } | hir::TargetKind::Starred(_) => {
-                return Err(
-                    "sequence deletion target reached MIR before Gate 4 Slice 11".to_owned(),
+            hir::TargetKind::Sequence { elements, .. } => {
+                for element in elements {
+                    self.delete_target(element)?;
+                }
+            }
+            hir::TargetKind::Starred(_) => {
+                return Err("starred deletion target reached MIR".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_class_target(
+        &mut self,
+        namespace: mir::ValueId,
+        target: &hir::Target,
+    ) -> Result<(), String> {
+        match &target.kind {
+            hir::TargetKind::Name { name, .. } => self.emit(
+                target.span,
+                mir::OperationKind::ClassNamespaceDelete {
+                    namespace,
+                    name: name.clone(),
+                },
+            ),
+            hir::TargetKind::Attribute { receiver, name } => {
+                let receiver = self.expression(receiver)?;
+                self.emit(
+                    target.span,
+                    mir::OperationKind::AttributeDelete {
+                        receiver,
+                        name: name.clone(),
+                    },
                 );
+            }
+            hir::TargetKind::Item { collection, index } => {
+                let collection = self.expression(collection)?;
+                let index = self.expression(index)?;
+                self.emit(
+                    target.span,
+                    mir::OperationKind::ItemDelete { collection, index },
+                );
+            }
+            hir::TargetKind::Sequence { elements, .. } => {
+                for element in elements {
+                    self.delete_class_target(namespace, element)?;
+                }
+            }
+            hir::TargetKind::Starred(_) => {
+                return Err("starred class deletion target reached MIR".to_owned());
             }
         }
         Ok(())
@@ -1268,10 +1506,177 @@ impl<'a> Lowerer<'a> {
             }
             hir::TargetKind::Sequence { .. } | hir::TargetKind::Starred(_) => {
                 return Err(
-                    "sequence augmented target reached MIR before Gate 4 Slice 11".to_owned(),
+                    "invalid sequence augmented-assignment target reached MIR after semantic validation"
+                        .to_owned(),
                 );
             }
         }
+        Ok(())
+    }
+
+    fn lower_class_augmented_target(
+        &mut self,
+        span: Span,
+        namespace: mir::ValueId,
+        target: &hir::Target,
+        op: hir::BinaryOperator,
+        value: &hir::Expression,
+    ) -> Result<(), String> {
+        match &target.kind {
+            hir::TargetKind::Name { name, .. } => {
+                let current = self.value();
+                self.emit(
+                    target.span,
+                    mir::OperationKind::ClassNamespaceGet {
+                        dest: current,
+                        namespace,
+                        name: name.clone(),
+                    },
+                );
+                let right = self.expression(value)?;
+                let result = self.value();
+                self.emit(
+                    span,
+                    mir::OperationKind::InPlace {
+                        dest: result,
+                        op,
+                        left: current,
+                        right,
+                    },
+                );
+                self.emit(
+                    target.span,
+                    mir::OperationKind::ClassNamespaceSet {
+                        namespace,
+                        name: name.clone(),
+                        value: result,
+                    },
+                );
+            }
+            hir::TargetKind::Attribute { receiver, name } => {
+                let receiver = self.expression(receiver)?;
+                let current = self.value();
+                self.emit(
+                    target.span,
+                    mir::OperationKind::AttributeGet {
+                        dest: current,
+                        receiver,
+                        name: name.clone(),
+                    },
+                );
+                let right = self.expression(value)?;
+                let result = self.value();
+                self.emit(
+                    span,
+                    mir::OperationKind::InPlace {
+                        dest: result,
+                        op,
+                        left: current,
+                        right,
+                    },
+                );
+                self.emit(
+                    target.span,
+                    mir::OperationKind::AttributeSet {
+                        receiver,
+                        name: name.clone(),
+                        value: result,
+                    },
+                );
+            }
+            hir::TargetKind::Item { collection, index } => {
+                let collection = self.expression(collection)?;
+                let index = self.expression(index)?;
+                let current = self.value();
+                self.emit(
+                    target.span,
+                    mir::OperationKind::ItemGet {
+                        dest: current,
+                        collection,
+                        index,
+                    },
+                );
+                let right = self.expression(value)?;
+                let result = self.value();
+                self.emit(
+                    span,
+                    mir::OperationKind::InPlace {
+                        dest: result,
+                        op,
+                        left: current,
+                        right,
+                    },
+                );
+                self.emit(
+                    target.span,
+                    mir::OperationKind::ItemSet {
+                        collection,
+                        index,
+                        value: result,
+                    },
+                );
+            }
+            hir::TargetKind::Sequence { .. } | hir::TargetKind::Starred(_) => {
+                return Err("invalid augmented class target reached MIR".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_assert(
+        &mut self,
+        span: Span,
+        test: &hir::Expression,
+        message: Option<&hir::Expression>,
+    ) -> Result<(), String> {
+        let condition = self.expression(test)?;
+        let passed = self.new_block();
+        let failed = self.new_block();
+        self.terminate(mir::Terminator::Branch {
+            condition,
+            then_target: passed,
+            then_arguments: vec![],
+            else_target: failed,
+            else_arguments: vec![],
+        })?;
+        self.current = failed;
+        let assertion_error = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::GlobalGet {
+                dest: assertion_error,
+                name: "AssertionError".to_owned(),
+            },
+        );
+        let positional = message
+            .map(|message| self.expression(message).map(|value| vec![value]))
+            .transpose()?
+            .unwrap_or_default();
+        let exception = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::Call {
+                dest: exception,
+                callable: assertion_error,
+                positional,
+                keywords: Vec::new(),
+            },
+        );
+        self.emit(
+            span,
+            mir::OperationKind::Raise {
+                exception,
+                cause: None,
+                suppress_context: false,
+            },
+        );
+        if self.is_open() {
+            self.terminate(mir::Terminator::Jump {
+                target: passed,
+                arguments: vec![],
+            })?;
+        }
+        self.current = passed;
         Ok(())
     }
 
@@ -1300,6 +1705,119 @@ impl<'a> Lowerer<'a> {
             }
         }
         Ok(())
+    }
+
+    fn evaluate_annotation_target(&mut self, target: &hir::Target) -> Result<(), String> {
+        match &target.kind {
+            hir::TargetKind::Name { .. } => {}
+            hir::TargetKind::Attribute { receiver, .. } => {
+                self.expression(receiver)?;
+            }
+            hir::TargetKind::Item { collection, index } => {
+                self.expression(collection)?;
+                self.expression(index)?;
+            }
+            hir::TargetKind::Sequence { .. } | hir::TargetKind::Starred(_) => {
+                return Err("invalid annotated-assignment target reached MIR".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn record_annotation(
+        &mut self,
+        span: Span,
+        namespace: Option<mir::ValueId>,
+        name: &str,
+        annotation: mir::ValueId,
+    ) -> Result<(), String> {
+        let mapping = self.value();
+        if let Some(namespace) = namespace {
+            self.emit(
+                span,
+                mir::OperationKind::ClassNamespaceGet {
+                    dest: mapping,
+                    namespace,
+                    name: "__annotations__".to_owned(),
+                },
+            );
+        } else {
+            self.emit(
+                span,
+                mir::OperationKind::GlobalGet {
+                    dest: mapping,
+                    name: "__annotations__".to_owned(),
+                },
+            );
+        }
+        let key = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::Constant {
+                dest: key,
+                value: mir::Constant::String(name.to_owned()),
+            },
+        );
+        self.emit(
+            span,
+            mir::OperationKind::ItemSet {
+                collection: mapping,
+                index: key,
+                value: annotation,
+            },
+        );
+        Ok(())
+    }
+
+    fn lower_function_annotations(
+        &mut self,
+        span: Span,
+        parameters: &[hir::Parameter],
+        return_annotation: Option<&hir::Expression>,
+    ) -> Result<Option<mir::ValueId>, String> {
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        for parameter in parameters {
+            if let Some(annotation) = &parameter.annotation {
+                let value = self.expression(annotation)?;
+                let key = self.value();
+                self.emit(
+                    span,
+                    mir::OperationKind::Constant {
+                        dest: key,
+                        value: mir::Constant::String(parameter.name.clone()),
+                    },
+                );
+                keys.push(key);
+                values.push(value);
+            }
+        }
+        if let Some(annotation) = return_annotation {
+            let value = self.expression(annotation)?;
+            let key = self.value();
+            self.emit(
+                span,
+                mir::OperationKind::Constant {
+                    dest: key,
+                    value: mir::Constant::String("return".to_owned()),
+                },
+            );
+            keys.push(key);
+            values.push(value);
+        }
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let annotations = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::Dictionary {
+                dest: annotations,
+                keys,
+                values,
+            },
+        );
+        Ok(Some(annotations))
     }
 
     fn lower_class_conditional_assignments(
@@ -1349,70 +1867,39 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), String> {
         for member in members {
             match member {
-                hir::ClassMember::Assign { name, value } => {
+                hir::ClassMember::Assign { targets, value } => {
                     let value = self.expression(value)?;
-                    self.emit(
-                        span,
-                        mir::OperationKind::ClassNamespaceSet {
-                            namespace,
-                            name: name.clone(),
-                            value,
-                        },
-                    );
-                    self.record_class_name(name);
+                    for target in targets {
+                        self.write_class_target(namespace, target, value)?;
+                    }
                 }
-                hir::ClassMember::AugAssign { name, op, value } => {
-                    self.lower_class_augmented_assignment(span, namespace, name, *op, value)?;
+                hir::ClassMember::AugAssign { target, op, value } => {
+                    self.lower_class_augmented_target(span, namespace, target, *op, value)?;
                 }
-                hir::ClassMember::Delete { name } => self.emit(
-                    span,
-                    mir::OperationKind::ClassNamespaceDelete {
-                        namespace,
-                        name: name.clone(),
-                    },
-                ),
-                hir::ClassMember::ItemAssign {
-                    collection,
-                    index,
+                hir::ClassMember::Delete { targets } => {
+                    for target in targets {
+                        self.delete_class_target(namespace, target)?;
+                    }
+                }
+                hir::ClassMember::AnnAssign {
+                    target,
+                    annotation,
                     value,
+                    simple,
                 } => {
-                    let collection = self.expression(collection)?;
-                    let index = self.expression(index)?;
-                    let value = self.expression(value)?;
-                    self.emit(
-                        span,
-                        mir::OperationKind::ItemSet {
-                            collection,
-                            index,
-                            value,
-                        },
-                    );
+                    if let Some(value) = value {
+                        let value = self.expression(value)?;
+                        self.write_class_target(namespace, target, value)?;
+                    } else {
+                        self.evaluate_annotation_target(target)?;
+                    }
+                    let annotation = self.expression(annotation)?;
+                    if *simple && let hir::TargetKind::Name { name, .. } = &target.kind {
+                        self.record_annotation(span, Some(namespace), name, annotation)?;
+                    }
                 }
-                hir::ClassMember::AttributeAssign {
-                    receiver,
-                    name,
-                    value,
-                } => {
-                    let receiver = self.expression(receiver)?;
-                    let value = self.expression(value)?;
-                    self.emit(
-                        span,
-                        mir::OperationKind::AttributeSet {
-                            receiver,
-                            name: name.clone(),
-                            value,
-                        },
-                    );
-                }
-                hir::ClassMember::AttributeDelete { receiver, name } => {
-                    let receiver = self.expression(receiver)?;
-                    self.emit(
-                        span,
-                        mir::OperationKind::AttributeDelete {
-                            receiver,
-                            name: name.clone(),
-                        },
-                    );
+                hir::ClassMember::Assert { test, message } => {
+                    self.lower_assert(span, test, message.as_ref())?;
                 }
                 hir::ClassMember::Raise { exception, cause } => {
                     if let Some(exception) = exception {
@@ -1518,6 +2005,7 @@ impl<'a> Lowerer<'a> {
                     decorators,
                     uses_zero_argument_super,
                     parameters,
+                    return_annotation,
                     body,
                     locals,
                     cells: _,
@@ -1547,6 +2035,11 @@ impl<'a> Lowerer<'a> {
                             ));
                         }
                     }
+                    let annotations = self.lower_function_annotations(
+                        span,
+                        parameters,
+                        return_annotation.as_ref(),
+                    )?;
                     let closure = method_free
                         .iter()
                         .map(|free_name| {
@@ -1565,6 +2058,16 @@ impl<'a> Lowerer<'a> {
                             closure,
                         },
                     );
+                    if let Some(annotations) = annotations {
+                        self.emit(
+                            span,
+                            mir::OperationKind::AttributeSet {
+                                receiver: method,
+                                name: "__annotations__".to_owned(),
+                                value: annotations,
+                            },
+                        );
+                    }
                     let mut decorated = method;
                     for decorator in decorators.iter().rev() {
                         let callable = self.class_decorator_expression(decorator, namespace)?;
@@ -1946,46 +2449,6 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    fn lower_class_augmented_assignment(
-        &mut self,
-        span: Span,
-        namespace: mir::ValueId,
-        name: &str,
-        op: hir::BinaryOperator,
-        value: &hir::Expression,
-    ) -> Result<(), String> {
-        let current = self.value();
-        self.emit(
-            span,
-            mir::OperationKind::ClassNamespaceGet {
-                dest: current,
-                namespace,
-                name: name.to_owned(),
-            },
-        );
-        let value = self.expression(value)?;
-        let result = self.value();
-        self.emit(
-            span,
-            mir::OperationKind::Binary {
-                dest: result,
-                op,
-                left: current,
-                right: value,
-            },
-        );
-        self.emit(
-            span,
-            mir::OperationKind::ClassNamespaceSet {
-                namespace,
-                name: name.to_owned(),
-                value: result,
-            },
-        );
-        self.record_class_name(name);
-        Ok(())
-    }
-
     fn record_class_name(&mut self, _name: &str) {}
 
     fn lower_if(
@@ -2064,6 +2527,428 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    fn lower_match(
+        &mut self,
+        span: Span,
+        subject: &hir::Expression,
+        cases: &[hir::MatchCase],
+    ) -> Result<(), String> {
+        let subject = self.expression(subject)?;
+        let finish = self.new_block();
+        for case in cases {
+            let tentative = self.value();
+            self.emit(
+                case.pattern.span,
+                mir::OperationKind::Dictionary {
+                    dest: tentative,
+                    keys: vec![],
+                    values: vec![],
+                },
+            );
+            let matched = self.new_block();
+            let next_case = self.new_block();
+            self.lower_pattern_test(subject, &case.pattern, tentative, matched, next_case)?;
+
+            self.current = matched;
+            let mut bindings = Vec::new();
+            collect_pattern_bindings(&case.pattern, &mut bindings);
+            for (name, binding, binding_span) in bindings {
+                let key = self.value();
+                self.emit(
+                    binding_span,
+                    mir::OperationKind::Constant {
+                        dest: key,
+                        value: mir::Constant::String(name.to_owned()),
+                    },
+                );
+                let value = self.value();
+                self.emit(
+                    binding_span,
+                    mir::OperationKind::ItemGet {
+                        dest: value,
+                        collection: tentative,
+                        index: key,
+                    },
+                );
+                self.store_name(binding_span, name, binding, value)?;
+            }
+
+            if let Some(guard) = &case.guard {
+                let body = self.new_block();
+                let guard_value = self.expression(guard)?;
+                self.terminate(mir::Terminator::Branch {
+                    condition: guard_value,
+                    then_target: body,
+                    then_arguments: vec![],
+                    else_target: next_case,
+                    else_arguments: vec![],
+                })?;
+                self.current = body;
+            }
+            self.statements(&case.body)?;
+            if self.is_open() {
+                self.terminate(mir::Terminator::Jump {
+                    target: finish,
+                    arguments: vec![],
+                })?;
+            }
+            self.current = next_case;
+        }
+        if self.is_open() {
+            self.terminate(mir::Terminator::Jump {
+                target: finish,
+                arguments: vec![],
+            })?;
+        }
+        self.current = finish;
+        let _ = span;
+        Ok(())
+    }
+
+    fn lower_pattern_test(
+        &mut self,
+        subject: mir::ValueId,
+        pattern: &hir::Pattern,
+        tentative: mir::ValueId,
+        success: mir::BlockId,
+        failure: mir::BlockId,
+    ) -> Result<(), String> {
+        match &pattern.kind {
+            hir::PatternKind::Value(value) => {
+                let value = self.expression(value)?;
+                let matched = self.value();
+                self.emit(
+                    pattern.span,
+                    mir::OperationKind::Compare {
+                        dest: matched,
+                        op: mir::CompareOperator::Equal,
+                        left: subject,
+                        right: value,
+                    },
+                );
+                self.terminate(mir::Terminator::Branch {
+                    condition: matched,
+                    then_target: success,
+                    then_arguments: vec![],
+                    else_target: failure,
+                    else_arguments: vec![],
+                })?;
+            }
+            hir::PatternKind::SingletonNone | hir::PatternKind::SingletonBool(_) => {
+                let expected = self.value();
+                let value = match pattern.kind {
+                    hir::PatternKind::SingletonNone => mir::Constant::None,
+                    hir::PatternKind::SingletonBool(value) => mir::Constant::Bool(value),
+                    _ => unreachable!(),
+                };
+                self.emit(
+                    pattern.span,
+                    mir::OperationKind::Constant {
+                        dest: expected,
+                        value,
+                    },
+                );
+                let matched = self.value();
+                self.emit(
+                    pattern.span,
+                    mir::OperationKind::Compare {
+                        dest: matched,
+                        op: mir::CompareOperator::Is,
+                        left: subject,
+                        right: expected,
+                    },
+                );
+                self.terminate(mir::Terminator::Branch {
+                    condition: matched,
+                    then_target: success,
+                    then_arguments: vec![],
+                    else_target: failure,
+                    else_arguments: vec![],
+                })?;
+            }
+            hir::PatternKind::Capture { name, .. } => {
+                self.record_pattern_capture(pattern.span, tentative, name, subject)?;
+                self.terminate(mir::Terminator::Jump {
+                    target: success,
+                    arguments: vec![],
+                })?;
+            }
+            hir::PatternKind::Wildcard => {
+                self.terminate(mir::Terminator::Jump {
+                    target: success,
+                    arguments: vec![],
+                })?;
+            }
+            hir::PatternKind::As {
+                pattern: inner,
+                name,
+                ..
+            } => {
+                let inner_success = self.new_block();
+                self.lower_pattern_test(subject, inner, tentative, inner_success, failure)?;
+                self.current = inner_success;
+                self.record_pattern_capture(pattern.span, tentative, name, subject)?;
+                self.terminate(mir::Terminator::Jump {
+                    target: success,
+                    arguments: vec![],
+                })?;
+            }
+            hir::PatternKind::Or(patterns) => {
+                for (index, alternative) in patterns.iter().enumerate() {
+                    let alternative_failure = if index + 1 == patterns.len() {
+                        failure
+                    } else {
+                        self.new_block()
+                    };
+                    self.lower_pattern_test(
+                        subject,
+                        alternative,
+                        tentative,
+                        success,
+                        alternative_failure,
+                    )?;
+                    if index + 1 != patterns.len() {
+                        self.current = alternative_failure;
+                    }
+                }
+            }
+            hir::PatternKind::Sequence(patterns) => {
+                let star = patterns
+                    .iter()
+                    .position(|pattern| matches!(pattern.kind, hir::PatternKind::Star(_)));
+                let before_count = u32::try_from(star.unwrap_or(patterns.len()))
+                    .map_err(|_| "sequence pattern is too large")?;
+                let after_count =
+                    u32::try_from(star.map_or(0, |index| patterns.len().saturating_sub(index + 1)))
+                        .map_err(|_| "sequence pattern is too large")?;
+                let values = self.value();
+                let matched = self.value();
+                self.emit(
+                    pattern.span,
+                    mir::OperationKind::PatternSequence {
+                        values,
+                        matched,
+                        subject,
+                        before_count,
+                        after_count,
+                        starred: star.is_some(),
+                    },
+                );
+                let extracted = self.new_block();
+                self.terminate(mir::Terminator::Branch {
+                    condition: matched,
+                    then_target: extracted,
+                    then_arguments: vec![],
+                    else_target: failure,
+                    else_arguments: vec![],
+                })?;
+                self.current = extracted;
+                self.lower_extracted_patterns(values, patterns, tentative, success, failure)?;
+            }
+            hir::PatternKind::Star(name) => {
+                if let Some((name, _)) = name {
+                    self.record_pattern_capture(pattern.span, tentative, name, subject)?;
+                }
+                self.terminate(mir::Terminator::Jump {
+                    target: success,
+                    arguments: vec![],
+                })?;
+            }
+            hir::PatternKind::Mapping {
+                keys,
+                patterns,
+                rest,
+            } => {
+                let preflight = self.value();
+                self.emit(
+                    pattern.span,
+                    mir::OperationKind::PatternMappingCheck {
+                        matched: preflight,
+                        subject,
+                        minimum_count: u32::try_from(keys.len())
+                            .map_err(|_| "mapping pattern is too large")?,
+                    },
+                );
+                let keys_ready = self.new_block();
+                self.terminate(mir::Terminator::Branch {
+                    condition: preflight,
+                    then_target: keys_ready,
+                    then_arguments: vec![],
+                    else_target: failure,
+                    else_arguments: vec![],
+                })?;
+                self.current = keys_ready;
+                let keys = keys
+                    .iter()
+                    .map(|key| self.expression(key))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let values = self.value();
+                let matched = self.value();
+                self.emit(
+                    pattern.span,
+                    mir::OperationKind::PatternMapping {
+                        values,
+                        matched,
+                        subject,
+                        keys,
+                        rest: rest.is_some(),
+                    },
+                );
+                let extracted = self.new_block();
+                self.terminate(mir::Terminator::Branch {
+                    condition: matched,
+                    then_target: extracted,
+                    then_arguments: vec![],
+                    else_target: failure,
+                    else_arguments: vec![],
+                })?;
+                self.current = extracted;
+                let after_children = if rest.is_some() {
+                    self.new_block()
+                } else {
+                    success
+                };
+                self.lower_extracted_patterns(
+                    values,
+                    patterns,
+                    tentative,
+                    after_children,
+                    failure,
+                )?;
+                if let Some((name, _)) = rest {
+                    self.current = after_children;
+                    let rest_value = self.value();
+                    self.emit(
+                        pattern.span,
+                        mir::OperationKind::ValueArrayGet {
+                            dest: rest_value,
+                            array: values,
+                            index: u32::try_from(patterns.len())
+                                .map_err(|_| "mapping pattern is too large")?,
+                        },
+                    );
+                    self.record_pattern_capture(pattern.span, tentative, name, rest_value)?;
+                    self.terminate(mir::Terminator::Jump {
+                        target: success,
+                        arguments: vec![],
+                    })?;
+                }
+            }
+            hir::PatternKind::Class {
+                class,
+                positional,
+                keywords,
+            } => {
+                let class = self.expression(class)?;
+                let values = self.value();
+                let matched = self.value();
+                self.emit(
+                    pattern.span,
+                    mir::OperationKind::PatternClass {
+                        values,
+                        matched,
+                        subject,
+                        class,
+                        positional_count: u32::try_from(positional.len())
+                            .map_err(|_| "class pattern is too large")?,
+                        keyword_names: keywords.iter().map(|(name, _)| name.clone()).collect(),
+                    },
+                );
+                let extracted = self.new_block();
+                self.terminate(mir::Terminator::Branch {
+                    condition: matched,
+                    then_target: extracted,
+                    then_arguments: vec![],
+                    else_target: failure,
+                    else_arguments: vec![],
+                })?;
+                self.current = extracted;
+                let patterns = positional
+                    .iter()
+                    .chain(keywords.iter().map(|(_, pattern)| pattern))
+                    .collect::<Vec<_>>();
+                self.lower_extracted_pattern_refs(values, &patterns, tentative, success, failure)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_pattern_capture(
+        &mut self,
+        span: Span,
+        tentative: mir::ValueId,
+        name: &str,
+        value: mir::ValueId,
+    ) -> Result<(), String> {
+        let key = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::Constant {
+                dest: key,
+                value: mir::Constant::String(name.to_owned()),
+            },
+        );
+        self.emit(
+            span,
+            mir::OperationKind::DictionaryInsert {
+                dictionary: tentative,
+                key,
+                value,
+            },
+        );
+        Ok(())
+    }
+
+    fn lower_extracted_patterns(
+        &mut self,
+        values: mir::ValueId,
+        patterns: &[hir::Pattern],
+        tentative: mir::ValueId,
+        success: mir::BlockId,
+        failure: mir::BlockId,
+    ) -> Result<(), String> {
+        let patterns = patterns.iter().collect::<Vec<_>>();
+        self.lower_extracted_pattern_refs(values, &patterns, tentative, success, failure)
+    }
+
+    fn lower_extracted_pattern_refs(
+        &mut self,
+        values: mir::ValueId,
+        patterns: &[&hir::Pattern],
+        tentative: mir::ValueId,
+        success: mir::BlockId,
+        failure: mir::BlockId,
+    ) -> Result<(), String> {
+        if patterns.is_empty() {
+            self.terminate(mir::Terminator::Jump {
+                target: success,
+                arguments: vec![],
+            })?;
+            return Ok(());
+        }
+        for (index, pattern) in patterns.iter().enumerate() {
+            let value = self.value();
+            self.emit(
+                pattern.span,
+                mir::OperationKind::ValueArrayGet {
+                    dest: value,
+                    array: values,
+                    index: u32::try_from(index).map_err(|_| "pattern is too large")?,
+                },
+            );
+            let next = if index + 1 == patterns.len() {
+                success
+            } else {
+                self.new_block()
+            };
+            self.lower_pattern_test(value, pattern, tentative, next, failure)?;
+            if index + 1 != patterns.len() {
+                self.current = next;
+            }
+        }
+        Ok(())
+    }
+
     fn lower_for(
         &mut self,
         span: Span,
@@ -2131,6 +3016,146 @@ impl<'a> Lowerer<'a> {
             })?;
         }
         self.current = exit;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_comprehension_level(
+        &mut self,
+        kind: hir::ComprehensionKind,
+        element: &hir::Expression,
+        key: Option<&hir::Expression>,
+        clauses: &[hir::ComprehensionClause],
+        index: usize,
+        provided_iterator: Option<mir::ValueId>,
+        result: mir::ValueId,
+        exhausted_target: mir::BlockId,
+    ) -> Result<(), String> {
+        let clause = clauses
+            .get(index)
+            .ok_or_else(|| "comprehension clause index is out of range".to_owned())?;
+        let iterator = if let Some(iterator) = provided_iterator {
+            iterator
+        } else {
+            let iterable_expression = clause
+                .iterable
+                .as_ref()
+                .ok_or_else(|| "nested comprehension clause is missing its iterable".to_owned())?;
+            let iterable = self.expression(iterable_expression)?;
+            let iterator = self.value();
+            self.emit(
+                iterable_expression.span,
+                mir::OperationKind::IteratorNew {
+                    dest: iterator,
+                    value: iterable,
+                },
+            );
+            iterator
+        };
+        let header = self.new_block();
+        let body = self.new_block();
+        let exhausted = self.new_block();
+        self.terminate(mir::Terminator::Jump {
+            target: header,
+            arguments: Vec::new(),
+        })?;
+        self.current = header;
+        let item = self.value();
+        let has_value = self.value();
+        self.emit(
+            clause.target.span,
+            mir::OperationKind::IteratorNext {
+                item,
+                has_value,
+                iterator,
+            },
+        );
+        self.terminate(mir::Terminator::Branch {
+            condition: has_value,
+            then_target: body,
+            then_arguments: Vec::new(),
+            else_target: exhausted,
+            else_arguments: Vec::new(),
+        })?;
+        self.current = body;
+        self.write_clause_target(&clause.target, item)?;
+        for filter in &clause.filters {
+            let condition = self.expression(filter)?;
+            let passed = self.new_block();
+            self.terminate(mir::Terminator::Branch {
+                condition,
+                then_target: passed,
+                then_arguments: Vec::new(),
+                else_target: header,
+                else_arguments: Vec::new(),
+            })?;
+            self.current = passed;
+        }
+        if index + 1 < clauses.len() {
+            self.lower_comprehension_level(
+                kind,
+                element,
+                key,
+                clauses,
+                index + 1,
+                None,
+                result,
+                header,
+            )?;
+        } else {
+            match kind {
+                hir::ComprehensionKind::List => {
+                    let value = self.expression(element)?;
+                    self.emit(
+                        element.span,
+                        mir::OperationKind::ListAppend {
+                            list: result,
+                            value,
+                        },
+                    );
+                }
+                hir::ComprehensionKind::Set => {
+                    let value = self.expression(element)?;
+                    self.emit(
+                        element.span,
+                        mir::OperationKind::SetInsert { set: result, value },
+                    );
+                }
+                hir::ComprehensionKind::Dictionary => {
+                    let key = key.ok_or_else(|| {
+                        "dictionary comprehension is missing its key expression".to_owned()
+                    })?;
+                    let key_value = self.expression(key)?;
+                    let mapped_value = self.expression(element)?;
+                    self.emit(
+                        element.span,
+                        mir::OperationKind::DictionaryInsert {
+                            dictionary: result,
+                            key: key_value,
+                            value: mapped_value,
+                        },
+                    );
+                }
+                hir::ComprehensionKind::Generator => {
+                    let value = self.expression(element)?;
+                    self.terminate(mir::Terminator::Yield {
+                        value,
+                        resume_target: header,
+                    })?;
+                }
+            }
+            if kind != hir::ComprehensionKind::Generator {
+                self.terminate(mir::Terminator::Jump {
+                    target: header,
+                    arguments: Vec::new(),
+                })?;
+            }
+        }
+        self.current = exhausted;
+        self.terminate(mir::Terminator::Jump {
+            target: exhausted_target,
+            arguments: Vec::new(),
+        })?;
         Ok(())
     }
 
@@ -2900,37 +3925,144 @@ impl<'a> Lowerer<'a> {
                     right,
                 }
             }
-            hir::ExpressionKind::Compare { op, left, right } => {
-                let left = self.expression(left)?;
-                let right = self.expression(right)?;
-                if matches!(op, hir::CompareOperator::In | hir::CompareOperator::NotIn) {
-                    mir::OperationKind::Contains {
+            hir::ExpressionKind::Compare { left, comparisons } => {
+                self.lower_compare_expression(expression.span, left, comparisons)?
+            }
+            hir::ExpressionKind::Comprehension {
+                kind,
+                outer_iterable,
+                element,
+                key,
+                clauses,
+                locals,
+                cells: _,
+                free,
+            } => {
+                let outer_iterable = self.expression(outer_iterable)?;
+                let outer_iterator = self.value();
+                self.emit(
+                    expression.span,
+                    mir::OperationKind::IteratorNew {
+                        dest: outer_iterator,
+                        value: outer_iterable,
+                    },
+                );
+                let function = self.program.lower_comprehension(
+                    *kind,
+                    element,
+                    key.as_deref(),
+                    clauses,
+                    locals,
+                    free,
+                )?;
+                let closure =
+                    free.iter()
+                        .map(|name| {
+                            self.cells.get(name).copied().ok_or_else(|| {
+                                format!("free variable `{name}` has no closure cell")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                let callable = self.value();
+                self.emit(
+                    expression.span,
+                    mir::OperationKind::MakeFunction {
+                        dest: callable,
+                        function,
+                        defaults: Vec::new(),
+                        closure,
+                    },
+                );
+                mir::OperationKind::Call {
+                    dest: self.value(),
+                    callable,
+                    positional: vec![outer_iterator],
+                    keywords: Vec::new(),
+                }
+            }
+            hir::ExpressionKind::NamedExpression {
+                name,
+                binding,
+                value,
+            } => {
+                let stored = self.expression(value)?;
+                if *binding == hir::Binding::Global
+                    && let Some(namespace) = self.class_scopes.last().map(|scope| scope.namespace)
+                {
+                    self.emit(
+                        expression.span,
+                        mir::OperationKind::ClassNamespaceSet {
+                            namespace,
+                            name: name.clone(),
+                            value: stored,
+                        },
+                    );
+                    self.record_class_name(name);
+                } else {
+                    self.store_name(expression.span, name, *binding, stored)?;
+                }
+                mir::OperationKind::Copy {
+                    dest: self.value(),
+                    source: stored,
+                }
+            }
+            hir::ExpressionKind::JoinedString(values) => {
+                if values.is_empty() {
+                    mir::OperationKind::Constant {
                         dest: self.value(),
-                        collection: right,
-                        needle: left,
-                        negate: *op == hir::CompareOperator::NotIn,
+                        value: mir::Constant::String(String::new()),
                     }
                 } else {
-                    mir::OperationKind::Compare {
-                        dest: self.value(),
-                        op: match op {
-                            hir::CompareOperator::Equal => mir::CompareOperator::Equal,
-                            hir::CompareOperator::NotEqual => mir::CompareOperator::NotEqual,
-                            hir::CompareOperator::Less => mir::CompareOperator::Less,
-                            hir::CompareOperator::LessEqual => mir::CompareOperator::LessEqual,
-                            hir::CompareOperator::Greater => mir::CompareOperator::Greater,
-                            hir::CompareOperator::GreaterEqual => {
-                                mir::CompareOperator::GreaterEqual
-                            }
-                            hir::CompareOperator::In | hir::CompareOperator::NotIn => unreachable!(
-                                "membership comparisons are lowered before comparison selection"
-                            ),
-                            hir::CompareOperator::Is => mir::CompareOperator::Is,
-                            hir::CompareOperator::IsNot => mir::CompareOperator::IsNot,
-                        },
-                        left,
-                        right,
+                    let mut accumulated = self.expression(&values[0])?;
+                    for value in &values[1..] {
+                        let right = self.expression(value)?;
+                        let next = self.value();
+                        self.emit(
+                            value.span,
+                            mir::OperationKind::Binary {
+                                dest: next,
+                                op: mir::BinaryOperator::Add,
+                                left: accumulated,
+                                right,
+                            },
+                        );
+                        accumulated = next;
                     }
+                    mir::OperationKind::Copy {
+                        dest: self.value(),
+                        source: accumulated,
+                    }
+                }
+            }
+            hir::ExpressionKind::FormattedValue {
+                value,
+                conversion,
+                format_spec,
+            } => {
+                let value = self.expression(value)?;
+                let spec = if let Some(format_spec) = format_spec {
+                    self.expression(format_spec)?
+                } else {
+                    let spec = self.value();
+                    self.emit(
+                        expression.span,
+                        mir::OperationKind::Constant {
+                            dest: spec,
+                            value: mir::Constant::String(String::new()),
+                        },
+                    );
+                    spec
+                };
+                mir::OperationKind::FormatValue {
+                    dest: self.value(),
+                    value,
+                    conversion: match conversion {
+                        hir::FormatConversion::None => mir::FormatConversion::None,
+                        hir::FormatConversion::Str => mir::FormatConversion::Str,
+                        hir::FormatConversion::Repr => mir::FormatConversion::Repr,
+                        hir::FormatConversion::Ascii => mir::FormatConversion::Ascii,
+                    },
+                    spec,
                 }
             }
             hir::ExpressionKind::Call { callable, parts } => {
@@ -2958,11 +4090,9 @@ impl<'a> Lowerer<'a> {
                             hir::CallPart::Starred(value) => {
                                 (mir::CallArgumentKind::Starred, None, value)
                             }
-                            hir::CallPart::Keyword { name, value } => (
-                                mir::CallArgumentKind::Keyword,
-                                Some(name.clone()),
-                                value,
-                            ),
+                            hir::CallPart::Keyword { name, value } => {
+                                (mir::CallArgumentKind::Keyword, Some(name.clone()), value)
+                            }
                             hir::CallPart::KeywordUnpack(value) => {
                                 (mir::CallArgumentKind::KeywordUnpack, None, value)
                             }
@@ -3013,6 +4143,86 @@ impl<'a> Lowerer<'a> {
             .ok_or_else(|| "expression did not define a value".to_owned())?;
         self.emit(expression.span, kind);
         Ok(destination)
+    }
+
+    fn emit_comparison(
+        &mut self,
+        span: Span,
+        op: hir::CompareOperator,
+        left: mir::ValueId,
+        right: mir::ValueId,
+    ) -> mir::ValueId {
+        let dest = self.value();
+        let kind = if matches!(op, hir::CompareOperator::In | hir::CompareOperator::NotIn) {
+            mir::OperationKind::Contains {
+                dest,
+                collection: right,
+                needle: left,
+                negate: op == hir::CompareOperator::NotIn,
+            }
+        } else {
+            mir::OperationKind::Compare {
+                dest,
+                op: match op {
+                    hir::CompareOperator::Equal => mir::CompareOperator::Equal,
+                    hir::CompareOperator::NotEqual => mir::CompareOperator::NotEqual,
+                    hir::CompareOperator::Less => mir::CompareOperator::Less,
+                    hir::CompareOperator::LessEqual => mir::CompareOperator::LessEqual,
+                    hir::CompareOperator::Greater => mir::CompareOperator::Greater,
+                    hir::CompareOperator::GreaterEqual => mir::CompareOperator::GreaterEqual,
+                    hir::CompareOperator::In | hir::CompareOperator::NotIn => unreachable!(),
+                    hir::CompareOperator::Is => mir::CompareOperator::Is,
+                    hir::CompareOperator::IsNot => mir::CompareOperator::IsNot,
+                },
+                left,
+                right,
+            }
+        };
+        self.emit(span, kind);
+        dest
+    }
+
+    fn lower_compare_expression(
+        &mut self,
+        _span: Span,
+        left: &hir::Expression,
+        comparisons: &[(hir::CompareOperator, hir::Expression)],
+    ) -> Result<mir::OperationKind, String> {
+        if comparisons.is_empty() {
+            return Err("comparison expression has no operators".to_owned());
+        }
+        let mut left_value = self.expression(left)?;
+        let join = self.new_block();
+        let result = self.value();
+        self.blocks[join.0 as usize].parameters.push(result);
+        for (index, (op, right)) in comparisons.iter().enumerate() {
+            let right_value = self.expression(right)?;
+            let compared = self.emit_comparison(right.span, *op, left_value, right_value);
+            if index + 1 == comparisons.len() {
+                self.terminate(mir::Terminator::Jump {
+                    target: join,
+                    arguments: vec![compared],
+                })?;
+            } else {
+                let next = self.new_block();
+                let next_left = self.value();
+                self.blocks[next.0 as usize].parameters.push(next_left);
+                self.terminate(mir::Terminator::Branch {
+                    condition: compared,
+                    then_target: next,
+                    then_arguments: vec![right_value],
+                    else_target: join,
+                    else_arguments: vec![compared],
+                })?;
+                self.current = next;
+                left_value = next_left;
+            }
+        }
+        self.current = join;
+        Ok(mir::OperationKind::Copy {
+            dest: self.value(),
+            source: result,
+        })
     }
 
     fn lower_boolean_expression(
@@ -3144,6 +4354,63 @@ impl<'a> Lowerer<'a> {
     }
 }
 
+fn collect_pattern_bindings<'a>(
+    pattern: &'a hir::Pattern,
+    bindings: &mut Vec<(&'a str, hir::Binding, Span)>,
+) {
+    match &pattern.kind {
+        hir::PatternKind::Capture { name, binding } => {
+            bindings.push((name, *binding, pattern.span));
+        }
+        hir::PatternKind::As {
+            pattern: inner,
+            name,
+            binding,
+        } => {
+            collect_pattern_bindings(inner, bindings);
+            bindings.push((name, *binding, pattern.span));
+        }
+        hir::PatternKind::Or(patterns) => {
+            if let Some(first) = patterns.first() {
+                collect_pattern_bindings(first, bindings);
+            }
+        }
+        hir::PatternKind::Sequence(patterns) => {
+            for pattern in patterns {
+                collect_pattern_bindings(pattern, bindings);
+            }
+        }
+        hir::PatternKind::Star(Some((name, binding))) => {
+            bindings.push((name, *binding, pattern.span));
+        }
+        hir::PatternKind::Star(None) => {}
+        hir::PatternKind::Mapping { patterns, rest, .. } => {
+            for pattern in patterns {
+                collect_pattern_bindings(pattern, bindings);
+            }
+            if let Some((name, binding)) = rest {
+                bindings.push((name, *binding, pattern.span));
+            }
+        }
+        hir::PatternKind::Class {
+            positional,
+            keywords,
+            ..
+        } => {
+            for pattern in positional {
+                collect_pattern_bindings(pattern, bindings);
+            }
+            for (_, pattern) in keywords {
+                collect_pattern_bindings(pattern, bindings);
+            }
+        }
+        hir::PatternKind::Value(_)
+        | hir::PatternKind::SingletonNone
+        | hir::PatternKind::SingletonBool(_)
+        | hir::PatternKind::Wildcard => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -3229,5 +4496,1082 @@ except Exception:
                 .exception_edges
                 .contains_key(&(item_set.0 as u32, item_set.1 as u32))
         );
+    }
+
+    #[test]
+    fn gate4_loop_destructuring_roots_yielded_item_and_iterator_at_unpack_safepoint() {
+        let path = Path::new("gate4_loop_target_gc.py");
+        let source = r#"
+try:
+    for first, *rest in [[1, 2, 3], [4, 5]]:
+        print(first, rest)
+except Exception:
+    marker = 1
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let function = &program.functions[program.entry.0 as usize];
+        let plan = mir::safepoint_plan(function).unwrap();
+
+        let mut yielded = None;
+        let mut iterator = None;
+        let mut unpack = None;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                match &operation.kind {
+                    mir::OperationKind::IteratorNext {
+                        item,
+                        iterator: source_iterator,
+                        ..
+                    } => {
+                        yielded = Some(*item);
+                        iterator = Some(*source_iterator);
+                    }
+                    mir::OperationKind::Unpack { value, .. } => {
+                        unpack = Some((block_index, operation_index, *value));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let yielded = yielded.expect("for loop should produce an iterator item");
+        let iterator = iterator.expect("for loop should keep its iterator");
+        let (block, operation, unpack_value) = unpack.expect("starred loop target should unpack");
+        assert_eq!(unpack_value, yielded);
+        let roots = plan
+            .operation_roots(block, operation)
+            .expect("unpack must be a safepoint");
+        assert!(roots.contains(&yielded));
+        assert!(roots.contains(&iterator));
+        assert!(
+            function
+                .exception_edges
+                .contains_key(&(block as u32, operation as u32))
+        );
+    }
+
+    #[test]
+    fn gate4_boolean_short_circuit_cfg_roots_selected_values_at_truth_safepoints() {
+        let path = Path::new("gate4_boolean_cfg.py");
+        let source = r#"
+left = [1]
+middle = []
+right = [3]
+selected = left and middle and right
+print(selected)
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let function = &program.functions[program.entry.0 as usize];
+        let plan = mir::safepoint_plan(function).unwrap();
+
+        let mut branches = 0;
+        let mut parameterized_joins = 0;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            if !block.parameters.is_empty() {
+                parameterized_joins += 1;
+            }
+            if let mir::Terminator::Branch {
+                condition,
+                then_arguments,
+                else_arguments,
+                ..
+            } = &block.terminator
+            {
+                branches += 1;
+                let roots = plan
+                    .terminator_roots(block_index)
+                    .expect("boolean truth test must publish branch roots");
+                assert!(roots.contains(condition));
+                for value in then_arguments.iter().chain(else_arguments) {
+                    assert!(roots.contains(value));
+                }
+            }
+        }
+        assert_eq!(
+            branches, 2,
+            "three operands should lower to two truth branches"
+        );
+        assert!(
+            parameterized_joins >= 2,
+            "each short-circuit stage must merge the selected original value"
+        );
+    }
+
+    #[test]
+    fn gate4_comparison_chain_carries_middle_operand_and_exception_edges() {
+        let path = Path::new("gate4_compare_chain_mir.py");
+        let source = r#"
+def value(number):
+    return number
+
+try:
+    result = value(1) < value(2) < value(3)
+except Exception:
+    result = False
+print(result)
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let function = &program.functions[program.entry.0 as usize];
+        let plan = mir::safepoint_plan(function).unwrap();
+
+        let mut compare_locations = Vec::new();
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                if matches!(operation.kind, mir::OperationKind::Compare { .. }) {
+                    compare_locations.push((block_index, operation_index));
+                }
+            }
+        }
+        assert_eq!(compare_locations.len(), 2);
+        for (block, operation) in &compare_locations {
+            assert!(
+                function
+                    .exception_edges
+                    .contains_key(&(*block as u32, *operation as u32)),
+                "fallible comparison must retain its try-handler successor"
+            );
+        }
+
+        let (branch_block, carried, next_target, condition) = function
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| match &block.terminator {
+                mir::Terminator::Branch {
+                    condition,
+                    then_target,
+                    then_arguments,
+                    else_arguments,
+                    ..
+                } if then_arguments.len() == 1 && else_arguments.len() == 1 => {
+                    Some((block_index, then_arguments[0], *then_target, *condition))
+                }
+                _ => None,
+            })
+            .expect("comparison chain should branch while carrying the middle operand");
+        let next_left = function.blocks[next_target.0 as usize]
+            .parameters
+            .first()
+            .copied()
+            .expect("comparison continuation must receive the middle operand as a block parameter");
+        let roots = plan
+            .terminator_roots(branch_block)
+            .expect("comparison truth test must publish roots");
+        assert!(roots.contains(&condition));
+        assert!(roots.contains(&carried));
+        assert!(
+            function.blocks[next_target.0 as usize]
+                .operations
+                .iter()
+                .any(|operation| matches!(
+                    operation.kind,
+                    mir::OperationKind::Compare { left, .. } if left == next_left
+                ))
+        );
+    }
+
+    #[test]
+    fn gate4_extended_subscript_roots_receiver_tuple_components_and_rhs() {
+        let path = Path::new("gate4_extended_subscript_mir.py");
+        let source = r#"
+items = {}
+right = 7
+try:
+    items[1, 2:5:2] = right
+except Exception:
+    marker = 1
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let function = &program.functions[program.entry.0 as usize];
+        let plan = mir::safepoint_plan(function).unwrap();
+
+        let mut slice_dest = None;
+        let mut tuple = None;
+        let mut item_set = None;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                match &operation.kind {
+                    mir::OperationKind::SliceNew {
+                        dest,
+                        start,
+                        stop,
+                        step,
+                    } => {
+                        assert!(start.is_some() && stop.is_some() && step.is_some());
+                        slice_dest = Some(*dest);
+                    }
+                    mir::OperationKind::Tuple { dest, values } if values.len() == 2 => {
+                        tuple = Some((block_index, operation_index, *dest, values.clone()));
+                    }
+                    mir::OperationKind::ItemSet {
+                        collection,
+                        index,
+                        value,
+                    } => {
+                        item_set =
+                            Some((block_index, operation_index, *collection, *index, *value));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let slice_dest = slice_dest.expect("extended subscript should construct a native slice");
+        let (tuple_block, tuple_operation, tuple_dest, tuple_values) =
+            tuple.expect("extended subscript should materialize one tuple index");
+        assert!(tuple_values.contains(&slice_dest));
+        let tuple_roots = plan
+            .operation_roots(tuple_block, tuple_operation)
+            .expect("tuple construction is a safepoint");
+        for component in &tuple_values {
+            assert!(tuple_roots.contains(component));
+        }
+
+        let (set_block, set_operation, collection, index, value) =
+            item_set.expect("extended assignment should lower to ItemSet");
+        assert_eq!(index, tuple_dest);
+        let set_roots = plan
+            .operation_roots(set_block, set_operation)
+            .expect("item assignment is a safepoint");
+        assert!(set_roots.contains(&collection));
+        assert!(set_roots.contains(&index));
+        assert!(set_roots.contains(&value));
+        assert!(
+            function
+                .exception_edges
+                .contains_key(&(set_block as u32, set_operation as u32))
+        );
+    }
+
+    #[test]
+    fn gate4_slice11_mir_pins_inplace_store_delete_and_lazy_assert_failure() {
+        let path = Path::new("gate4_slice11_mir.py");
+        let source = r#"
+items = [1, 2]
+
+def message():
+    return "boom"
+
+try:
+    items[0] += 4
+    del items[1]
+    assert items, message()
+except Exception:
+    marker = 1
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let function = &program.functions[program.entry.0 as usize];
+
+        let mut inplace = None;
+        let mut item_set = None;
+        let mut item_delete = None;
+        let mut assertion_branch = None;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                match &operation.kind {
+                    mir::OperationKind::InPlace { dest, .. } => {
+                        inplace = Some((block_index, operation_index, *dest));
+                    }
+                    mir::OperationKind::ItemSet { value, .. } => {
+                        item_set = Some((block_index, operation_index, *value));
+                    }
+                    mir::OperationKind::ItemDelete { .. } => {
+                        item_delete = Some((block_index, operation_index));
+                    }
+                    _ => {}
+                }
+            }
+            if let mir::Terminator::Branch {
+                else_target,
+                condition,
+                ..
+            } = block.terminator
+                && function.blocks[else_target.0 as usize]
+                    .operations
+                    .iter()
+                    .any(|operation| {
+                        matches!(
+                            &operation.kind,
+                            mir::OperationKind::GlobalGet { name, .. } if name == "AssertionError"
+                        )
+                    })
+            {
+                assertion_branch = Some((block_index, condition, else_target));
+            }
+        }
+
+        let (inplace_block, inplace_operation, inplace_result) =
+            inplace.expect("augmented item assignment should emit InPlace");
+        let (set_block, set_operation, set_value) =
+            item_set.expect("augmented item assignment should store its inplace result");
+        assert_eq!(inplace_result, set_value);
+        for (block, operation) in [
+            (inplace_block, inplace_operation),
+            (set_block, set_operation),
+            item_delete.expect("delete should emit ItemDelete"),
+        ] {
+            assert!(
+                function
+                    .exception_edges
+                    .contains_key(&(block as u32, operation as u32)),
+                "Slice 11 fallible statement operation must keep its try successor"
+            );
+        }
+
+        let (branch_block, condition, failed) =
+            assertion_branch.expect("assert must branch to a dedicated lazy failure block");
+        let failed_block = &function.blocks[failed.0 as usize];
+        assert!(failed_block.operations.iter().any(|operation| matches!(
+            &operation.kind,
+            mir::OperationKind::GlobalGet { name, .. } if name == "message"
+        )));
+        assert!(failed_block.operations.iter().any(|operation| matches!(
+            &operation.kind,
+            mir::OperationKind::GlobalGet { name, .. } if name == "AssertionError"
+        )));
+        assert!(
+            failed_block
+                .operations
+                .iter()
+                .any(|operation| matches!(operation.kind, mir::OperationKind::Raise { .. }))
+        );
+        assert!(
+            mir::safepoint_plan(function)
+                .unwrap()
+                .terminator_roots(branch_block)
+                .expect("assert truth branch must publish roots")
+                .contains(&condition)
+        );
+    }
+
+    #[test]
+    fn gate4_named_expression_stores_once_and_returns_the_identical_mir_value() {
+        let path = Path::new("gate4_named_expression_mir.py");
+        let source = r#"
+def make():
+    return [1]
+
+try:
+    result = (named := make())
+except Exception:
+    result = None
+print(result is named)
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let function = &program.functions[program.entry.0 as usize];
+
+        let mut stored = None;
+        let mut returned_copy = None;
+        let mut make_call = None;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                match &operation.kind {
+                    mir::OperationKind::GlobalSet { name, value } if name == "named" => {
+                        stored = Some(*value);
+                    }
+                    mir::OperationKind::Copy { dest, source } if Some(*source) == stored => {
+                        returned_copy = Some((*dest, *source));
+                    }
+                    mir::OperationKind::Call { dest, .. } if make_call.is_none() => {
+                        make_call = Some((block_index, operation_index, *dest));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let stored = stored.expect("walrus target must use the normal global store");
+        let (copy_dest, copy_source) = returned_copy.expect("walrus must return the stored value");
+        assert_eq!(copy_source, stored);
+        assert_ne!(
+            copy_dest, stored,
+            "MIR may copy the slot but not recompute the object"
+        );
+        let (block, operation, call_result) =
+            make_call.expect("walrus RHS call should be emitted once");
+        assert_eq!(
+            call_result, stored,
+            "the call result itself must be stored by :="
+        );
+        assert!(
+            function
+                .exception_edges
+                .contains_key(&(block as u32, operation as u32))
+        );
+    }
+
+    #[test]
+    fn gate4_annotation_mir_initializes_namespaces_and_skips_local_annotation_evaluation() {
+        let path = Path::new("gate4_annotations_mir.py");
+        let source = r#"
+def mark(value):
+    return value
+
+x: mark(int) = 1
+
+def local():
+    hidden: mark(int)
+    return 1
+
+class C:
+    y: mark(int) = 2
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let module = &program.functions[program.entry.0 as usize];
+        assert!(module.blocks[0].operations.iter().any(|operation| matches!(
+            operation.kind,
+            mir::OperationKind::AnnotationsEnsure { namespace: None }
+        )));
+
+        let local = program
+            .functions
+            .iter()
+            .find(|function| function.name == "local")
+            .expect("local function should be lowered");
+        assert!(!local.blocks.iter().flat_map(|block| &block.operations).any(|operation| {
+            matches!(&operation.kind, mir::OperationKind::GlobalGet { name, .. } if name == "mark")
+        }), "function-local variable annotations must not evaluate");
+
+        let class_body = program
+            .functions
+            .iter()
+            .find(|function| {
+                function.kind == mir::FunctionKind::ClassBody && function.name == "<class body C>"
+            })
+            .expect("class body should be lowered");
+        let (block_index, operation_index, namespace) = class_body
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .find_map(|(operation_index, operation)| match operation.kind {
+                        mir::OperationKind::AnnotationsEnsure {
+                            namespace: Some(namespace),
+                        } => Some((block_index, operation_index, namespace)),
+                        _ => None,
+                    })
+            })
+            .expect("class body must ensure __annotations__ in its prepared namespace");
+        let plan = mir::safepoint_plan(class_body).unwrap();
+        let roots = plan
+            .operation_roots(block_index, operation_index)
+            .expect("annotation namespace setup is a safepoint");
+        assert!(roots.contains(&namespace));
+    }
+
+    #[test]
+    fn gate4_fstring_mir_roots_earlier_segments_across_later_format_callbacks() {
+        let path = Path::new("gate4_fstring_mir.py");
+        let source = r#"
+def left():
+    return "left"
+def right():
+    return 7
+def width():
+    return 4
+result = f"{left()}:{right():>{width()}}"
+print(result)
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let function = &program.functions[program.entry.0 as usize];
+        let plan = mir::safepoint_plan(function).unwrap();
+
+        let mut formatted = Vec::new();
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                if let mir::OperationKind::FormatValue {
+                    dest, value, spec, ..
+                } = operation.kind
+                {
+                    formatted.push((block_index, operation_index, dest, value, spec));
+                }
+            }
+        }
+        assert!(
+            formatted.len() >= 3,
+            "nested width and two outer fields must all use format_value"
+        );
+        let first_outer = formatted[0].2;
+        let &(block, operation, _dest, value, spec) = formatted.last().unwrap();
+        let prefix = function.blocks[block]
+            .operations
+            .iter()
+            .take(operation)
+            .find_map(|operation| match operation.kind {
+                mir::OperationKind::Binary {
+                    dest,
+                    op: mir::BinaryOperator::Add,
+                    left,
+                    ..
+                } if left == first_outer => Some(dest),
+                _ => None,
+            })
+            .expect("later field should format after the earlier field was accumulated");
+        let roots = plan
+            .operation_roots(block, operation)
+            .expect("format callback must be a safepoint");
+        assert!(roots.contains(&value));
+        assert!(roots.contains(&spec));
+        assert!(
+            roots.contains(&prefix),
+            "the accumulated earlier f-string prefix must stay rooted during later formatting"
+        );
+    }
+
+    #[test]
+    fn gate4_comprehension_cfg_uses_hidden_activation_and_roots_live_loop_state() {
+        let path = Path::new("gate4_comprehension_mir.py");
+        let source = r#"
+try:
+    result = [left + right for left in [1, 2] if left for right in [3, 4]]
+except Exception:
+    result = []
+print(result)
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let module = &program.functions[program.entry.0 as usize];
+        assert!(
+            module
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|operation| {
+                    matches!(operation.kind, mir::OperationKind::IteratorNew { .. })
+                })
+        );
+        let (call_block, call_operation) = module
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .find_map(|(operation_index, operation)| {
+                        matches!(operation.kind, mir::OperationKind::Call { .. })
+                            .then_some((block_index, operation_index))
+                    })
+            })
+            .expect("caller must invoke a hidden comprehension function");
+        assert!(
+            module
+                .exception_edges
+                .contains_key(&(call_block as u32, call_operation as u32))
+        );
+
+        let hidden = program
+            .functions
+            .iter()
+            .find(|function| function.name == "<listcomp>")
+            .expect("list comprehension must lower to a hidden function");
+        assert_eq!(hidden.parameters.len(), 1);
+        assert_eq!(hidden.parameters[0].name, ".0");
+        let plan = mir::safepoint_plan(hidden).unwrap();
+        let mut append = None;
+        let mut iterators = Vec::new();
+        for (block_index, block) in hidden.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                match operation.kind {
+                    mir::OperationKind::IteratorNext { iterator, .. } => iterators.push(iterator),
+                    mir::OperationKind::ListAppend { list, value } => {
+                        append = Some((block_index, operation_index, list, value));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            iterators.len(),
+            2,
+            "nested clauses need two iterator regions"
+        );
+        let (block, operation, list, value) =
+            append.expect("list sink must append in hidden scope");
+        let roots = plan
+            .operation_roots(block, operation)
+            .expect("list append is a runtime safepoint");
+        assert!(roots.contains(&list));
+        assert!(roots.contains(&value));
+        assert!(iterators.iter().any(|iterator| roots.contains(iterator)));
+    }
+
+    #[test]
+    fn gate4_generator_expression_mir_uses_yield_and_persists_only_live_state() {
+        let path = Path::new("gate4_generator_mir.py");
+        let source = r#"
+def make():
+    prefix = "p"
+    generator = (prefix + str(left + right) for left in [1, 2] for right in [10, 20])
+    prefix = "q"
+    return generator
+
+print(list(make()))
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        mir::verify(&program).unwrap();
+        let generator = program
+            .functions
+            .iter()
+            .find(|function| function.name == "<genexpr>")
+            .expect("generator expression must lower to a hidden generator function");
+        assert_eq!(generator.kind, mir::FunctionKind::Generator);
+        assert_eq!(generator.parameters.len(), 1);
+        assert_eq!(generator.parameters[0].name, ".0");
+
+        let persistent = mir::generator_persistent_values(generator).unwrap();
+        assert!(persistent.contains(&generator.parameters[0].value));
+        assert!(persistent.len() < generator.value_count as usize);
+
+        let inner_iterator = generator
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|operation| match operation.kind {
+                mir::OperationKind::IteratorNew { dest, .. } => Some(dest),
+                _ => None,
+            })
+            .expect("nested generator clause must create a lazy inner iterator");
+        assert!(
+            persistent.contains(&inner_iterator),
+            "inner iterator must survive suspension"
+        );
+
+        let plan = mir::safepoint_plan(generator).unwrap();
+        let mut yields = 0;
+        for (block_index, block) in generator.blocks.iter().enumerate() {
+            if let mir::Terminator::Yield { value, .. } = block.terminator {
+                yields += 1;
+                let roots = plan
+                    .terminator_roots(block_index)
+                    .expect("yield must publish a suspension root set");
+                assert!(roots.contains(&value));
+                assert!(roots.contains(&inner_iterator));
+                assert!(
+                    !persistent.contains(&value),
+                    "the yielded temporary is dead after suspension and must not consume a persistent slot"
+                );
+            }
+        }
+        assert_eq!(
+            yields, 1,
+            "one comprehension sink should lower to one yield site"
+        );
+    }
+
+    #[test]
+    fn gate4_match_cfg_commits_only_on_success_and_roots_subject_across_callbacks() {
+        let path = Path::new("gate4_match_mir.py");
+        let source = r#"
+class Values:
+    first = "one"
+    second = "two"
+
+def subject():
+    return "one"
+
+def guard(value):
+    return value
+
+match subject():
+    case Values.first as captured if guard(captured):
+        result = captured
+    case Values.second:
+        result = "second"
+    case _:
+        result = "fallback"
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        mir::verify(&program).unwrap();
+        let function = &program.functions[program.entry.0 as usize];
+        let plan = mir::safepoint_plan(function).unwrap();
+
+        let mut subject_get = None;
+        let mut subject_get_count = 0;
+        let mut captured_store = None;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                match &operation.kind {
+                    mir::OperationKind::GlobalGet { dest, name } if name == "subject" => {
+                        subject_get_count += 1;
+                        subject_get = Some(*dest);
+                    }
+                    mir::OperationKind::GlobalSet { name, value } if name == "captured" => {
+                        captured_store = Some((block_index, operation_index, *value));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            subject_get_count, 1,
+            "match subject callable must be resolved once"
+        );
+        let subject_callable = subject_get.expect("match subject callable must be loaded");
+        let subject = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|operation| match &operation.kind {
+                mir::OperationKind::Call { dest, callable, .. }
+                    if *callable == subject_callable =>
+                {
+                    Some(*dest)
+                }
+                _ => None,
+            })
+            .expect("match subject must be evaluated exactly once");
+        let (captured_block, captured_index, captured_value) =
+            captured_store.expect("successful capture must commit a binding");
+        let tentative = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|operation| match operation.kind {
+                mir::OperationKind::DictionaryInsert {
+                    dictionary, value, ..
+                } if value == subject => Some(dictionary),
+                _ => None,
+            })
+            .expect("successful AS capture must first publish into tentative storage");
+        assert!(
+            function.blocks[captured_block]
+                .operations
+                .iter()
+                .any(|operation| {
+                    matches!(
+                        operation.kind,
+                        mir::OperationKind::ItemGet {
+                            dest,
+                            collection,
+                            ..
+                        } if dest == captured_value && collection == tentative
+                    )
+                })
+        );
+
+        let mut first_compare = None;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                if let mir::OperationKind::Compare { dest, left, .. } = operation.kind
+                    && left == subject
+                {
+                    let roots = plan
+                        .operation_roots(block_index, operation_index)
+                        .expect("pattern equality is a runtime safepoint");
+                    assert!(roots.contains(&subject));
+                    if first_compare.is_none() {
+                        first_compare = Some((block_index, dest));
+                    }
+                }
+            }
+        }
+
+        let (compare_block, compare_result) =
+            first_compare.expect("value pattern must compare against the subject");
+        let mir::Terminator::Branch {
+            condition,
+            then_target,
+            else_target,
+            ..
+        } = function.blocks[compare_block].terminator
+        else {
+            panic!("value-pattern comparison must branch to success/failure CFG");
+        };
+        assert_eq!(condition, compare_result);
+        assert!(
+            function.blocks[then_target.0 as usize]
+                .operations
+                .iter()
+                .any(|operation| matches!(
+                    operation.kind,
+                    mir::OperationKind::DictionaryInsert { dictionary, value, .. }
+                        if dictionary == tentative && value == subject
+                ))
+        );
+        assert!(
+            !function.blocks[else_target.0 as usize]
+                .operations
+                .iter()
+                .any(|operation| matches!(
+                    &operation.kind,
+                    mir::OperationKind::GlobalSet { name, .. } if name == "captured"
+                )),
+            "pattern failure must not publish tentative captures"
+        );
+
+        let matched_operations = &function.blocks[captured_block].operations;
+        let guard_get = matched_operations
+            .iter()
+            .position(|operation| {
+                matches!(
+                    &operation.kind,
+                    mir::OperationKind::GlobalGet { name, .. } if name == "guard"
+                )
+            })
+            .expect("guard callable must be loaded after capture commit");
+        let guard_call = matched_operations
+            .iter()
+            .enumerate()
+            .skip(guard_get + 1)
+            .find_map(|(index, operation)| {
+                matches!(operation.kind, mir::OperationKind::Call { .. }).then_some(index)
+            })
+            .expect("guard must call through ordinary call MIR");
+        assert!(captured_index < guard_get);
+        assert!(guard_get < guard_call);
+        let guard_roots = plan
+            .operation_roots(captured_block, guard_call)
+            .expect("guard call must publish live roots");
+        assert!(
+            guard_roots.contains(&subject),
+            "subject must remain rooted when a false guard continues matching later cases"
+        );
+    }
+
+    #[test]
+    fn gate4_structural_pattern_extractors_publish_exact_safepoint_roots() {
+        let path = Path::new("gate4_structural_patterns_mir.py");
+        let source = r#"
+subject = {"items": [1, 2, 3], "keep": 4}
+try:
+    match subject:
+        case {"items": [first, *middle], "keep": kept, **rest}:
+            result = (first, middle, kept, rest)
+        case _:
+            result = None
+except Exception:
+    result = None
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let function = &program.functions[program.entry.0 as usize];
+        let plan = mir::safepoint_plan(function).unwrap();
+
+        let mut saw_sequence = false;
+        let mut saw_mapping_check = false;
+        let mut saw_mapping = false;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                match &operation.kind {
+                    mir::OperationKind::PatternSequence { subject, .. } => {
+                        saw_sequence = true;
+                        let roots = plan.operation_roots(block_index, operation_index).unwrap();
+                        assert!(roots.contains(subject));
+                        assert!(
+                            function
+                                .exception_edges
+                                .contains_key(&(block_index as u32, operation_index as u32))
+                        );
+                    }
+                    mir::OperationKind::PatternMappingCheck { subject, .. } => {
+                        saw_mapping_check = true;
+                        let roots = plan.operation_roots(block_index, operation_index).unwrap();
+                        assert!(roots.contains(subject));
+                        assert!(
+                            function
+                                .exception_edges
+                                .contains_key(&(block_index as u32, operation_index as u32))
+                        );
+                    }
+                    mir::OperationKind::PatternMapping { subject, keys, .. } => {
+                        saw_mapping = true;
+                        let roots = plan.operation_roots(block_index, operation_index).unwrap();
+                        assert!(roots.contains(subject));
+                        for key in keys {
+                            assert!(roots.contains(key));
+                        }
+                        assert!(
+                            function
+                                .exception_edges
+                                .contains_key(&(block_index as u32, operation_index as u32))
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_sequence && saw_mapping_check && saw_mapping);
+    }
+
+    #[test]
+    fn gate4_class_pattern_roots_subject_and_class_and_evaluates_class_expression_once() {
+        let path = Path::new("gate4_class_pattern_mir.py");
+        let source = r#"
+class Point:
+    __match_args__ = ("x", "y")
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+class Holder:
+    target = Point
+subject = Point(1, 2)
+try:
+    match subject:
+        case Holder.target(left, right):
+            result = left + right
+        case _:
+            result = 0
+except Exception:
+    result = -1
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let function = &program.functions[program.entry.0 as usize];
+        let plan = mir::safepoint_plan(function).unwrap();
+
+        let class_gets = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|operation| match &operation.kind {
+                mir::OperationKind::AttributeGet { dest, name, .. } if name == "target" => {
+                    Some(*dest)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            class_gets.len(),
+            1,
+            "class expression must be evaluated once"
+        );
+
+        let mut saw_class = false;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                if let mir::OperationKind::PatternClass {
+                    subject,
+                    class,
+                    positional_count,
+                    keyword_names,
+                    ..
+                } = &operation.kind
+                {
+                    saw_class = true;
+                    assert_eq!(*class, class_gets[0]);
+                    assert_eq!(*positional_count, 2);
+                    assert!(keyword_names.is_empty());
+                    let roots = plan.operation_roots(block_index, operation_index).unwrap();
+                    assert!(roots.contains(subject));
+                    assert!(roots.contains(class));
+                    assert!(
+                        function
+                            .exception_edges
+                            .contains_key(&(block_index as u32, operation_index as u32))
+                    );
+                }
+            }
+        }
+        assert!(saw_class);
+    }
+
+    #[test]
+    fn gate4_set_and_dict_comprehension_sinks_root_inputs_and_dict_evaluates_key_first() {
+        let path = Path::new("gate4_set_dict_comprehension_mir.py");
+        let source = r#"
+def key(value):
+    return value
+def mapped(value):
+    return value
+sets = {item for item in [1, 2]}
+dicts = {key(item): mapped(item) for item in [1, 2]}
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+
+        let set_comp = program
+            .functions
+            .iter()
+            .find(|function| function.name == "<setcomp>")
+            .expect("set comprehension function");
+        let set_plan = mir::safepoint_plan(set_comp).unwrap();
+        let (block, operation, set, value) = set_comp
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .find_map(|(operation_index, operation)| match operation.kind {
+                        mir::OperationKind::SetInsert { set, value } => {
+                            Some((block_index, operation_index, set, value))
+                        }
+                        _ => None,
+                    })
+            })
+            .expect("set sink");
+        let roots = set_plan.operation_roots(block, operation).unwrap();
+        assert!(roots.contains(&set));
+        assert!(roots.contains(&value));
+
+        let dict_comp = program
+            .functions
+            .iter()
+            .find(|function| function.name == "<dictcomp>")
+            .expect("dict comprehension function");
+        let dict_plan = mir::safepoint_plan(dict_comp).unwrap();
+        let mut key_get = None;
+        let mut value_get = None;
+        let mut insert = None;
+        for (block_index, block) in dict_comp.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                match &operation.kind {
+                    mir::OperationKind::GlobalGet { name, .. } if name == "key" => {
+                        key_get = Some((block_index, operation_index));
+                    }
+                    mir::OperationKind::GlobalGet { name, .. } if name == "mapped" => {
+                        value_get = Some((block_index, operation_index));
+                    }
+                    mir::OperationKind::DictionaryInsert {
+                        dictionary,
+                        key,
+                        value,
+                    } => insert = Some((block_index, operation_index, *dictionary, *key, *value)),
+                    _ => {}
+                }
+            }
+        }
+        let key_get = key_get.expect("dict key callback load");
+        let value_get = value_get.expect("dict value callback load");
+        assert_eq!(key_get.0, value_get.0);
+        assert!(
+            key_get.1 < value_get.1,
+            "dictionary keys must evaluate before values"
+        );
+        let (block, operation, dictionary, key, value) = insert.expect("dict sink");
+        let roots = dict_plan.operation_roots(block, operation).unwrap();
+        assert!(roots.contains(&dictionary));
+        assert!(roots.contains(&key));
+        assert!(roots.contains(&value));
     }
 }

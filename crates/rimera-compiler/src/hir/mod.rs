@@ -38,11 +38,22 @@ pub enum StatementKind {
     Delete {
         targets: Vec<Target>,
     },
+    AnnAssign {
+        target: Target,
+        annotation: Expression,
+        value: Option<Expression>,
+        simple: bool,
+    },
+    Assert {
+        test: Expression,
+        message: Option<Expression>,
+    },
     FunctionDef {
         name: String,
         binding: Binding,
         decorators: Vec<Expression>,
         parameters: Vec<Parameter>,
+        return_annotation: Option<Expression>,
         body: Vec<Statement>,
         locals: Vec<String>,
         cells: Vec<String>,
@@ -92,6 +103,53 @@ pub enum StatementKind {
         body: Vec<Statement>,
         else_body: Vec<Statement>,
     },
+    Match {
+        subject: Expression,
+        cases: Vec<MatchCase>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchCase {
+    pub pattern: Pattern,
+    pub guard: Option<Expression>,
+    pub body: Vec<Statement>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    pub span: Span,
+    pub kind: PatternKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum PatternKind {
+    Value(Expression),
+    SingletonNone,
+    SingletonBool(bool),
+    Capture {
+        name: String,
+        binding: Binding,
+    },
+    Wildcard,
+    As {
+        pattern: Box<Pattern>,
+        name: String,
+        binding: Binding,
+    },
+    Or(Vec<Pattern>),
+    Sequence(Vec<Pattern>),
+    Star(Option<(String, Binding)>),
+    Mapping {
+        keys: Vec<Expression>,
+        patterns: Vec<Pattern>,
+        rest: Option<(String, Binding)>,
+    },
+    Class {
+        class: Expression,
+        positional: Vec<Pattern>,
+        keywords: Vec<(String, Pattern)>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -130,30 +188,26 @@ pub enum TargetKind {
 #[derive(Debug, Clone)]
 pub enum ClassMember {
     Assign {
-        name: String,
+        targets: Vec<Target>,
         value: Expression,
     },
     AugAssign {
-        name: String,
+        target: Target,
         op: BinaryOperator,
         value: Expression,
     },
     Delete {
-        name: String,
+        targets: Vec<Target>,
     },
-    ItemAssign {
-        collection: Expression,
-        index: Expression,
-        value: Expression,
+    AnnAssign {
+        target: Target,
+        annotation: Expression,
+        value: Option<Expression>,
+        simple: bool,
     },
-    AttributeAssign {
-        receiver: Expression,
-        name: String,
-        value: Expression,
-    },
-    AttributeDelete {
-        receiver: Expression,
-        name: String,
+    Assert {
+        test: Expression,
+        message: Option<Expression>,
     },
     Raise {
         exception: Option<Expression>,
@@ -181,6 +235,7 @@ pub enum ClassMember {
         decorators: Vec<Expression>,
         uses_zero_argument_super: bool,
         parameters: Vec<Parameter>,
+        return_annotation: Option<Expression>,
         body: Vec<Statement>,
         locals: Vec<String>,
         cells: Vec<String>,
@@ -224,6 +279,7 @@ pub struct Parameter {
     pub name: String,
     pub kind: RParameterKind,
     pub default: Option<Expression>,
+    pub annotation: Option<Expression>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +308,31 @@ pub enum CallPart {
     Starred(Expression),
     Keyword { name: String, value: Expression },
     KeywordUnpack(Expression),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatConversion {
+    None,
+    Str,
+    Repr,
+    Ascii,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComprehensionKind {
+    List,
+    Set,
+    Dictionary,
+    Generator,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComprehensionClause {
+    pub target: Target,
+    /// `None` for the first clause because its iterator is created in the
+    /// containing scope and passed to the hidden comprehension function.
+    pub iterable: Option<Expression>,
+    pub filters: Vec<Expression>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,9 +397,29 @@ pub enum ExpressionKind {
         right: Box<Expression>,
     },
     Compare {
-        op: CompareOperator,
         left: Box<Expression>,
-        right: Box<Expression>,
+        comparisons: Vec<(CompareOperator, Expression)>,
+    },
+    NamedExpression {
+        name: String,
+        binding: Binding,
+        value: Box<Expression>,
+    },
+    Comprehension {
+        kind: ComprehensionKind,
+        outer_iterable: Box<Expression>,
+        element: Box<Expression>,
+        key: Option<Box<Expression>>,
+        clauses: Vec<ComprehensionClause>,
+        locals: Vec<String>,
+        cells: Vec<String>,
+        free: Vec<String>,
+    },
+    JoinedString(Vec<Expression>),
+    FormattedValue {
+        value: Box<Expression>,
+        conversion: FormatConversion,
+        format_spec: Option<Box<Expression>>,
     },
     Call {
         callable: Box<Expression>,

@@ -142,6 +142,30 @@ pub enum RCompareOperator {
     IsNot = 9,
 }
 
+/// F-string conversion applied before the ordinary `format(value, spec)` path.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RFormatConversion {
+    None = 0,
+    Str = 1,
+    Repr = 2,
+    Ascii = 3,
+}
+
+impl TryFrom<u8> for RFormatConversion {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Str),
+            2 => Ok(Self::Repr),
+            3 => Ok(Self::Ascii),
+            _ => Err(()),
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RParameterKind {
@@ -290,5 +314,7 @@ mod tests {
         assert_eq!(RCompareOperator::NotIn as u8, 7);
         assert_eq!(RCallArgumentKind::Positional as u8, 0);
         assert_eq!(RCallArgumentKind::KeywordUnpack as u8, 3);
+        assert_eq!(RFormatConversion::None as u8, 0);
+        assert_eq!(RFormatConversion::Ascii as u8, 3);
     }
 }
