@@ -164,8 +164,8 @@ fn define_generator_function(
         let parameters = builder.block_params(prologue).to_vec();
         let context_value = parameters[0];
         let generator = parameters[1];
-        let _operation = parameters[2];
-        let _input = parameters[3];
+        let operation = parameters[2];
+        let input = parameters[3];
         let output = parameters[4];
         let outcome = parameters[5];
 
@@ -225,6 +225,7 @@ fn define_generator_function(
         builder.ins().stack_store(root_count, frame_slot, 16);
         let frame_pointer = builder.ins().stack_addr(pointer, frame_slot, 0);
         let failure = builder.create_block();
+        let propagate = builder.create_block();
         let invalid_state = builder.create_block();
         let push_ref = module.declare_func_in_func(imports.roots_push, builder.func);
         emit_status_call(
@@ -285,12 +286,26 @@ fn define_generator_function(
             .iter()
             .enumerate()
             .filter_map(|(index, block)| match block.terminator {
-                Terminator::Yield { resume_target, .. } => Some((index, resume_target)),
+                Terminator::Yield {
+                    resume_value,
+                    resume_target,
+                    exception_target,
+                    delegate,
+                    ..
+                } => Some((
+                    index,
+                    resume_value,
+                    resume_target,
+                    exception_target,
+                    delegate,
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
         let mut check_state = invalid_state;
-        for (yield_block, resume_target) in yield_states.iter().copied() {
+        for (yield_block, resume_value, resume_target, exception_target, delegate) in
+            yield_states.iter().copied()
+        {
             builder.switch_to_block(check_state);
             let dispatch = builder.create_block();
             let next_check = builder.create_block();
@@ -321,7 +336,204 @@ fn define_generator_function(
                     );
                 }
             }
+            if delegate.is_some() {
+                let delegate_value = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    VALUE_SIZE,
+                    3,
+                ));
+                let delegate_outcome = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    1,
+                    0,
+                ));
+                let delegate_value_pointer = builder.ins().stack_addr(pointer, delegate_value, 0);
+                let delegate_outcome_pointer =
+                    builder.ins().stack_addr(pointer, delegate_outcome, 0);
+                let delegate_resume =
+                    module.declare_func_in_func(imports.generator_delegate_resume, builder.func);
+                emit_status_call(
+                    &mut builder,
+                    delegate_resume,
+                    &[
+                        context_value,
+                        generator,
+                        operation,
+                        input,
+                        delegate_value_pointer,
+                        delegate_outcome_pointer,
+                    ],
+                    failure,
+                );
+                let delegate_outcome_value =
+                    builder.ins().stack_load(types::I8, delegate_outcome, 0);
+                let delegated_yield = builder.create_block();
+                let delegated_not_yield = builder.create_block();
+                let is_yielded = builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, delegate_outcome_value, 0);
+                builder
+                    .ins()
+                    .brif(is_yielded, delegated_yield, &[], delegated_not_yield, &[]);
+
+                builder.switch_to_block(delegated_yield);
+                let first = builder.ins().stack_load(types::I64, delegate_value, 0);
+                let second = builder.ins().stack_load(types::I64, delegate_value, 8);
+                builder
+                    .ins()
+                    .store(cranelift_codegen::ir::MemFlags::trusted(), first, output, 0);
+                builder.ins().store(
+                    cranelift_codegen::ir::MemFlags::trusted(),
+                    second,
+                    output,
+                    8,
+                );
+                let yielded = builder.ins().iconst(types::I8, 0);
+                builder.ins().store(
+                    cranelift_codegen::ir::MemFlags::trusted(),
+                    yielded,
+                    outcome,
+                    0,
+                );
+                builder
+                    .ins()
+                    .call(refs.roots_pop, &[context_value, frame_pointer]);
+                let ok = builder.ins().iconst(types::I32, 0);
+                builder.ins().return_(&[ok]);
+
+                builder.switch_to_block(delegated_not_yield);
+                let delegated_complete = builder.create_block();
+                let delegated_propagate = builder.create_block();
+                let is_completed = builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, delegate_outcome_value, 1);
+                builder.ins().brif(
+                    is_completed,
+                    delegated_complete,
+                    &[],
+                    delegated_propagate,
+                    &[],
+                );
+
+                builder.switch_to_block(delegated_complete);
+                if let Some(resume_value) = resume_value {
+                    let destination = value_offset(resume_value);
+                    let first = builder.ins().stack_load(types::I64, delegate_value, 0);
+                    let second = builder.ins().stack_load(types::I64, delegate_value, 8);
+                    builder.ins().stack_store(first, values_slot, destination);
+                    builder
+                        .ins()
+                        .stack_store(second, values_slot, destination + 8);
+                }
+                builder.ins().jump(block_map[resume_target.0 as usize], &[]);
+
+                builder.switch_to_block(delegated_propagate);
+                let (filename, filename_len) = metadata_pointer(
+                    &mut builder,
+                    module,
+                    data,
+                    &module_program.filename,
+                    pointer,
+                )?;
+                let (function_name, function_name_len) =
+                    metadata_pointer(&mut builder, module, data, &program.name, pointer)?;
+                let source_offset = program.blocks[yield_block]
+                    .operations
+                    .last()
+                    .map_or(0, |operation| operation.span.start);
+                let line = source_line(&module_program.line_starts, source_offset);
+                let line = builder.ins().iconst(types::I32, i64::from(line));
+                let column = builder.ins().iconst(types::I32, 0);
+                builder.ins().call(
+                    refs.traceback_append,
+                    &[
+                        context_value,
+                        filename,
+                        filename_len,
+                        function_name,
+                        function_name_len,
+                        line,
+                        column,
+                    ],
+                );
+                if let Some(exception_target) = exception_target {
+                    builder
+                        .ins()
+                        .jump(block_map[exception_target.0 as usize], &[]);
+                } else {
+                    builder.ins().jump(propagate, &[]);
+                }
+                check_state = next_check;
+                continue;
+            }
+
+            let injected = builder
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, operation, 2);
+            let injected_block = builder.create_block();
+            let normal_block = builder.create_block();
+            builder
+                .ins()
+                .brif(injected, injected_block, &[], normal_block, &[]);
+
+            builder.switch_to_block(normal_block);
+            if let Some(resume_value) = resume_value {
+                let destination = value_offset(resume_value);
+                let first = builder.ins().load(
+                    types::I64,
+                    cranelift_codegen::ir::MemFlags::trusted(),
+                    input,
+                    0,
+                );
+                let second = builder.ins().load(
+                    types::I64,
+                    cranelift_codegen::ir::MemFlags::trusted(),
+                    input,
+                    8,
+                );
+                builder.ins().stack_store(first, values_slot, destination);
+                builder
+                    .ins()
+                    .stack_store(second, values_slot, destination + 8);
+            }
             builder.ins().jump(block_map[resume_target.0 as usize], &[]);
+
+            builder.switch_to_block(injected_block);
+            let (filename, filename_len) = metadata_pointer(
+                &mut builder,
+                module,
+                data,
+                &module_program.filename,
+                pointer,
+            )?;
+            let (function_name, function_name_len) =
+                metadata_pointer(&mut builder, module, data, &program.name, pointer)?;
+            let source_offset = program.blocks[yield_block]
+                .operations
+                .last()
+                .map_or(0, |operation| operation.span.start);
+            let line = source_line(&module_program.line_starts, source_offset);
+            let line = builder.ins().iconst(types::I32, i64::from(line));
+            let column = builder.ins().iconst(types::I32, 0);
+            builder.ins().call(
+                refs.traceback_append,
+                &[
+                    context_value,
+                    filename,
+                    filename_len,
+                    function_name,
+                    function_name_len,
+                    line,
+                    column,
+                ],
+            );
+            if let Some(exception_target) = exception_target {
+                builder
+                    .ins()
+                    .jump(block_map[exception_target.0 as usize], &[]);
+            } else {
+                builder.ins().jump(propagate, &[]);
+            }
             check_state = next_check;
         }
         builder.switch_to_block(check_state);
@@ -331,16 +543,37 @@ fn define_generator_function(
             .call(refs.roots_pop, &[context_value, frame_pointer]);
         builder.ins().return_(&[invalid]);
 
+        let mut traced_exception_edges = Vec::new();
         for (block_index, block) in program.blocks.iter().enumerate() {
             builder.switch_to_block(block_map[block_index]);
             for (operation_index, operation) in block.operations.iter().enumerate() {
-                let line = source_line(&module_program.line_starts, operation.span.start);
-                let line = builder.ins().iconst(types::I32, i64::from(line));
-                builder.ins().stack_store(line, failure_line_slot, 0);
-                let operation_failure = program
+                let source_line = source_line(&module_program.line_starts, operation.span.start);
+                let line_value = builder.ins().iconst(types::I32, i64::from(source_line));
+                builder.ins().stack_store(line_value, failure_line_slot, 0);
+                let preserves_traceback = matches!(
+                    operation.kind,
+                    OperationKind::Reraise | OperationKind::Propagate
+                );
+                let operation_failure = if let Some(target) = program
                     .exception_edges
                     .get(&(block_index as u32, operation_index as u32))
-                    .map_or(failure, |target| block_map[target.0 as usize]);
+                {
+                    if preserves_traceback {
+                        block_map[target.0 as usize]
+                    } else {
+                        let traced = builder.create_block();
+                        traced_exception_edges.push((
+                            traced,
+                            block_map[target.0 as usize],
+                            source_line,
+                        ));
+                        traced
+                    }
+                } else if preserves_traceback {
+                    propagate
+                } else {
+                    failure
+                };
                 emit_operation(
                     &mut builder,
                     module,
@@ -370,6 +603,7 @@ fn define_generator_function(
                 program,
                 &block_map,
                 block_index,
+                &module_program.line_starts,
                 &block.terminator,
                 pointer,
                 values_slot,
@@ -385,6 +619,40 @@ fn define_generator_function(
                 failure,
             )?;
         }
+        for (traced, target, line) in traced_exception_edges {
+            builder.switch_to_block(traced);
+            let (filename, filename_len) = metadata_pointer(
+                &mut builder,
+                module,
+                data,
+                &module_program.filename,
+                pointer,
+            )?;
+            let (function_name, function_name_len) =
+                metadata_pointer(&mut builder, module, data, &program.name, pointer)?;
+            let line = builder.ins().iconst(types::I32, i64::from(line));
+            let column = builder.ins().iconst(types::I32, 0);
+            builder.ins().call(
+                refs.traceback_append,
+                &[
+                    context_value,
+                    filename,
+                    filename_len,
+                    function_name,
+                    function_name_len,
+                    line,
+                    column,
+                ],
+            );
+            builder.ins().jump(target, &[]);
+        }
+
+        builder.switch_to_block(propagate);
+        builder
+            .ins()
+            .call(refs.roots_pop, &[context_value, frame_pointer]);
+        let exception = builder.ins().iconst(types::I32, 1);
+        builder.ins().return_(&[exception]);
 
         builder.switch_to_block(failure);
         let (filename, filename_len) = metadata_pointer(
@@ -557,6 +825,7 @@ fn define_native_function(
         builder.ins().stack_store(root_count, frame_slot, 16);
         let frame_pointer = builder.ins().stack_addr(pointer, frame_slot, 0);
         let failure = builder.create_block();
+        let propagated_failure = builder.create_block();
         let push_ref = module.declare_func_in_func(imports.roots_push, builder.func);
         emit_status_call(
             &mut builder,
@@ -571,16 +840,37 @@ fn define_native_function(
             .map(|_| builder.create_block())
             .collect::<Vec<_>>();
         builder.ins().jump(block_map[program.entry.0 as usize], &[]);
+        let mut traced_exception_edges = Vec::new();
         for (block_index, block) in program.blocks.iter().enumerate() {
             builder.switch_to_block(block_map[block_index]);
             for (operation_index, operation) in block.operations.iter().enumerate() {
-                let line = source_line(&module_program.line_starts, operation.span.start);
-                let line = builder.ins().iconst(types::I32, i64::from(line));
-                builder.ins().stack_store(line, failure_line_slot, 0);
-                let operation_failure = program
+                let source_line = source_line(&module_program.line_starts, operation.span.start);
+                let line_value = builder.ins().iconst(types::I32, i64::from(source_line));
+                builder.ins().stack_store(line_value, failure_line_slot, 0);
+                let preserves_traceback = matches!(
+                    operation.kind,
+                    OperationKind::Reraise | OperationKind::Propagate
+                );
+                let operation_failure = if let Some(target) = program
                     .exception_edges
                     .get(&(block_index as u32, operation_index as u32))
-                    .map_or(failure, |target| block_map[target.0 as usize]);
+                {
+                    if preserves_traceback {
+                        block_map[target.0 as usize]
+                    } else {
+                        let traced = builder.create_block();
+                        traced_exception_edges.push((
+                            traced,
+                            block_map[target.0 as usize],
+                            source_line,
+                        ));
+                        traced
+                    }
+                } else if preserves_traceback {
+                    propagated_failure
+                } else {
+                    failure
+                };
                 emit_operation(
                     &mut builder,
                     module,
@@ -619,6 +909,38 @@ fn define_native_function(
                 failure,
             )?;
         }
+        if !matches!(
+            program.name.as_str(),
+            "<listcomp>" | "<setcomp>" | "<dictcomp>"
+        ) {
+            for (traced, target, line) in traced_exception_edges {
+                builder.switch_to_block(traced);
+                let (filename, filename_len) = metadata_pointer(
+                    &mut builder,
+                    module,
+                    data,
+                    &module_program.filename,
+                    pointer,
+                )?;
+                let (function_name, function_name_len) =
+                    metadata_pointer(&mut builder, module, data, &program.name, pointer)?;
+                let line = builder.ins().iconst(types::I32, i64::from(line));
+                let column = builder.ins().iconst(types::I32, 0);
+                builder.ins().call(
+                    refs.traceback_append,
+                    &[
+                        context_value,
+                        filename,
+                        filename_len,
+                        function_name,
+                        function_name_len,
+                        line,
+                        column,
+                    ],
+                );
+                builder.ins().jump(target, &[]);
+            }
+        }
         builder.switch_to_block(failure);
         let traceback_transparent_comprehension = matches!(
             program.name.as_str(),
@@ -654,6 +976,12 @@ fn define_native_function(
             .call(refs.roots_pop, &[context_value, frame_pointer]);
         let exception = builder.ins().iconst(types::I32, 1);
         builder.ins().return_(&[exception]);
+        builder.switch_to_block(propagated_failure);
+        builder
+            .ins()
+            .call(refs.roots_pop, &[context_value, frame_pointer]);
+        let exception = builder.ins().iconst(types::I32, 1);
+        builder.ins().return_(&[exception]);
         builder.seal_all_blocks();
         builder.finalize();
     }
@@ -671,9 +999,12 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
         "rimera_context_free",
         "rimera_roots_push",
         "rimera_roots_pop",
-        "rimera_traceback_append",
+        "rimera_traceback_append_module",
         "rimera_render_error",
     ]);
+    if program.functions.len() > 1 {
+        required.insert("rimera_traceback_append");
+    }
     for function in &program.functions {
         if function.kind == mir::FunctionKind::Generator {
             required.extend([
@@ -681,6 +1012,7 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                 "rimera_generator_function_get",
                 "rimera_generator_state_get",
                 "rimera_generator_state_set",
+                "rimera_generator_frame_line_set",
                 "rimera_generator_slot_get",
                 "rimera_generator_slot_set",
             ]);
@@ -688,6 +1020,16 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
         for block in &function.blocks {
             if matches!(block.terminator, Terminator::Branch { .. }) {
                 required.insert("rimera_truthy");
+            }
+            if matches!(
+                block.terminator,
+                Terminator::Yield {
+                    delegate: Some(_),
+                    ..
+                }
+            ) {
+                required.insert("rimera_generator_delegate_set");
+                required.insert("rimera_generator_delegate_resume");
             }
             for operation in &block.operations {
                 let name = match &operation.kind {
@@ -721,6 +1063,7 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                     OperationKind::Length { .. } => Some("rimera_length"),
                     OperationKind::IteratorNew { .. } => Some("rimera_iterator_new"),
                     OperationKind::IteratorNext { .. } => Some("rimera_iterator_next"),
+                    OperationKind::YieldFromNext { .. } => Some("rimera_generator_delegate_start"),
                     OperationKind::Range { .. } => Some("rimera_range_new"),
                     OperationKind::ItemSet { .. } => Some("rimera_item_set"),
                     OperationKind::ItemDelete { .. } => Some("rimera_item_delete"),
@@ -732,11 +1075,14 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                     OperationKind::PatternMapping { .. } => Some("rimera_pattern_mapping"),
                     OperationKind::PatternClass { .. } => Some("rimera_pattern_class"),
                     OperationKind::MakeFunction { .. } => Some("rimera_function_new"),
+                    OperationKind::TypeParameterNew { .. } => Some("rimera_type_parameter_new"),
+                    OperationKind::TypeAliasNew { .. } => Some("rimera_type_alias_new"),
                     OperationKind::ClassNamespaceNew { .. } => Some("rimera_namespace_new"),
                     OperationKind::AnnotationsEnsure { .. } => Some("rimera_annotations_ensure"),
                     OperationKind::ClassNamespaceSet { .. } => Some("rimera_namespace_set"),
                     OperationKind::ClassNamespaceGet { .. } => Some("rimera_namespace_get"),
                     OperationKind::ClassNameGet { .. } => Some("rimera_class_name_get"),
+                    OperationKind::ClassFreeGet { .. } => Some("rimera_class_free_get"),
                     OperationKind::ClassNamespaceDelete { .. } => Some("rimera_namespace_delete"),
                     OperationKind::ClassNew { .. } => Some("rimera_class_new"),
                     OperationKind::AttributeGet { .. } => Some("rimera_attr_get"),
@@ -747,6 +1093,12 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                     OperationKind::CallArgumentAdd { .. } => Some("rimera_call_argument_add"),
                     OperationKind::CallPrepared { .. } => Some("rimera_call_prepared"),
                     OperationKind::CellNew { .. } => Some("rimera_cell_new"),
+                    OperationKind::ReflectionScopeConfigure { .. } => {
+                        Some("rimera_reflection_scope_configure")
+                    }
+                    OperationKind::ReflectionLocalRegister { .. } => {
+                        Some("rimera_reflection_local_register")
+                    }
                     OperationKind::CellGet { name, .. } => Some(if name.is_some() {
                         "rimera_cell_get_named"
                     } else {
@@ -755,6 +1107,7 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                     OperationKind::ClosureGet { .. } => Some("rimera_function_closure_get"),
                     OperationKind::CellSet { .. } => Some("rimera_cell_set"),
                     OperationKind::CellClear { .. } => Some("rimera_cell_clear"),
+                    OperationKind::ImportName { .. } => Some("rimera_import_name"),
                     OperationKind::GlobalGet { .. } => Some("rimera_global_get"),
                     OperationKind::GlobalSet { .. } => Some("rimera_global_set"),
                     OperationKind::GlobalDelete { .. } => Some("rimera_global_delete"),
@@ -820,16 +1173,23 @@ struct Imports {
     pattern_mapping: cranelift_module::FuncId,
     pattern_class: cranelift_module::FuncId,
     function_new: cranelift_module::FuncId,
+    type_parameter_new: cranelift_module::FuncId,
+    type_alias_new: cranelift_module::FuncId,
     generator_function_new: cranelift_module::FuncId,
     generator_function_get: cranelift_module::FuncId,
     generator_state_get: cranelift_module::FuncId,
     generator_state_set: cranelift_module::FuncId,
+    generator_frame_line_set: cranelift_module::FuncId,
     generator_slot_get: cranelift_module::FuncId,
     generator_slot_set: cranelift_module::FuncId,
+    generator_delegate_start: cranelift_module::FuncId,
+    generator_delegate_set: cranelift_module::FuncId,
+    generator_delegate_resume: cranelift_module::FuncId,
     namespace_new: cranelift_module::FuncId,
     namespace_set: cranelift_module::FuncId,
     namespace_get: cranelift_module::FuncId,
     class_name_get: cranelift_module::FuncId,
+    class_free_get: cranelift_module::FuncId,
     namespace_delete: cranelift_module::FuncId,
     class_new: cranelift_module::FuncId,
     attr_get: cranelift_module::FuncId,
@@ -840,11 +1200,14 @@ struct Imports {
     call_argument_add: cranelift_module::FuncId,
     call_prepared: cranelift_module::FuncId,
     cell_new: cranelift_module::FuncId,
+    reflection_scope_configure: cranelift_module::FuncId,
+    reflection_local_register: cranelift_module::FuncId,
     cell_get: cranelift_module::FuncId,
     cell_get_named: cranelift_module::FuncId,
     cell_set: cranelift_module::FuncId,
     cell_clear: cranelift_module::FuncId,
     closure_get: cranelift_module::FuncId,
+    import_name: cranelift_module::FuncId,
     global_get: cranelift_module::FuncId,
     global_set: cranelift_module::FuncId,
     global_delete: cranelift_module::FuncId,
@@ -861,6 +1224,7 @@ struct Imports {
     reraise: cranelift_module::FuncId,
     propagate: cranelift_module::FuncId,
     traceback_append: cranelift_module::FuncId,
+    traceback_append_module: cranelift_module::FuncId,
     unary: cranelift_module::FuncId,
     binary: cranelift_module::FuncId,
     inplace: cranelift_module::FuncId,
@@ -1062,6 +1426,24 @@ impl Imports {
                 &[pointer, pointer, pointer, pointer],
                 true,
             )?,
+            generator_delegate_start: declaration(
+                module,
+                "rimera_generator_delegate_start",
+                &[pointer, pointer, pointer, pointer],
+                true,
+            )?,
+            generator_delegate_set: declaration(
+                module,
+                "rimera_generator_delegate_set",
+                &[pointer, pointer, pointer],
+                true,
+            )?,
+            generator_delegate_resume: declaration(
+                module,
+                "rimera_generator_delegate_resume",
+                &[pointer, pointer, types::I8, pointer, pointer, pointer],
+                true,
+            )?,
             value_array_get: declaration(
                 module,
                 "rimera_value_array_get",
@@ -1115,8 +1497,20 @@ impl Imports {
                 "rimera_function_new",
                 &[
                     pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
-                    pointer, pointer, pointer,
+                    pointer, pointer, pointer, pointer,
                 ],
+                true,
+            )?,
+            type_parameter_new: declaration(
+                module,
+                "rimera_type_parameter_new",
+                &[pointer, types::I8, pointer, pointer, pointer],
+                true,
+            )?,
+            type_alias_new: declaration(
+                module,
+                "rimera_type_alias_new",
+                &[pointer, pointer, pointer, pointer, pointer, pointer],
                 true,
             )?,
             generator_function_new: declaration(
@@ -1124,7 +1518,7 @@ impl Imports {
                 "rimera_generator_function_new",
                 &[
                     pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
-                    pointer, pointer, pointer, pointer,
+                    pointer, pointer, pointer, pointer, pointer,
                 ],
                 true,
             )?,
@@ -1143,6 +1537,12 @@ impl Imports {
             generator_state_set: declaration(
                 module,
                 "rimera_generator_state_set",
+                &[pointer, pointer, types::I32],
+                true,
+            )?,
+            generator_frame_line_set: declaration(
+                module,
+                "rimera_generator_frame_line_set",
                 &[pointer, pointer, types::I32],
                 true,
             )?,
@@ -1181,6 +1581,12 @@ impl Imports {
                 module,
                 "rimera_class_name_get",
                 &[pointer, pointer, pointer, pointer, pointer],
+                true,
+            )?,
+            class_free_get: declaration(
+                module,
+                "rimera_class_free_get",
+                &[pointer, pointer, pointer, pointer, pointer, pointer],
                 true,
             )?,
             namespace_delete: declaration(
@@ -1245,6 +1651,18 @@ impl Imports {
                 &[pointer, pointer, pointer],
                 true,
             )?,
+            reflection_scope_configure: declaration(
+                module,
+                "rimera_reflection_scope_configure",
+                &[pointer, pointer, types::I8],
+                true,
+            )?,
+            reflection_local_register: declaration(
+                module,
+                "rimera_reflection_local_register",
+                &[pointer, pointer, pointer, pointer],
+                true,
+            )?,
             cell_get: declaration(
                 module,
                 "rimera_cell_get",
@@ -1267,6 +1685,12 @@ impl Imports {
             closure_get: declaration(
                 module,
                 "rimera_function_closure_get",
+                &[pointer, pointer, pointer, pointer],
+                true,
+            )?,
+            import_name: declaration(
+                module,
+                "rimera_import_name",
                 &[pointer, pointer, pointer, pointer],
                 true,
             )?,
@@ -1343,6 +1767,20 @@ impl Imports {
             traceback_append: declaration(
                 module,
                 "rimera_traceback_append",
+                &[
+                    pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                    types::I32,
+                    types::I32,
+                ],
+                true,
+            )?,
+            traceback_append_module: declaration(
+                module,
+                "rimera_traceback_append_module",
                 &[
                     pointer,
                     pointer,
@@ -1461,7 +1899,21 @@ fn define_constants(
                     } => {
                         define_string(module, &mut data, name)?;
                     }
-                    OperationKind::GlobalGet { name, .. }
+                    OperationKind::MakeFunction {
+                        local_names,
+                        cell_names,
+                        free_names,
+                        ..
+                    } => {
+                        for name in local_names.iter().chain(cell_names).chain(free_names) {
+                            define_string(module, &mut data, name)?;
+                        }
+                    }
+                    OperationKind::TypeParameterNew { name, .. }
+                    | OperationKind::TypeAliasNew { name, .. }
+                    | OperationKind::ReflectionLocalRegister { name, .. }
+                    | OperationKind::ImportName { name, .. }
+                    | OperationKind::GlobalGet { name, .. }
                     | OperationKind::GlobalSet { name, .. }
                     | OperationKind::GlobalDelete { name }
                     | OperationKind::ClassNamespaceSet { name, .. }
@@ -1640,26 +2092,40 @@ fn define_main(
             .map(|_| builder.create_block())
             .collect::<Vec<_>>();
         builder.ins().jump(block_map[program.entry.0 as usize], &[]);
-        let refs = FunctionRefs::new(module, builder.func, imports);
+        let refs = FunctionRefs::new_module(module, builder.func, imports);
+        let mut traced_exception_edges = Vec::new();
         for (block_index, block) in program.blocks.iter().enumerate() {
             builder.switch_to_block(block_map[block_index]);
             for (operation_index, operation) in block.operations.iter().enumerate() {
-                let line = source_line(&module_program.line_starts, operation.span.start);
-                let line = builder.ins().iconst(types::I32, i64::from(line));
-                builder.ins().stack_store(line, failure_line_slot, 0);
-                let operation_failure = program
+                let source_line = source_line(&module_program.line_starts, operation.span.start);
+                let line_value = builder.ins().iconst(types::I32, i64::from(source_line));
+                builder.ins().stack_store(line_value, failure_line_slot, 0);
+                let preserves_traceback = matches!(
+                    operation.kind,
+                    OperationKind::Reraise | OperationKind::Propagate
+                );
+                let operation_failure = if let Some(target) = program
                     .exception_edges
                     .get(&(block_index as u32, operation_index as u32))
-                    .map_or_else(
-                        || {
-                            if matches!(operation.kind, OperationKind::CallModuleChunk { .. }) {
-                                propagated_failure
-                            } else {
-                                failure
-                            }
-                        },
-                        |target| block_map[target.0 as usize],
-                    );
+                {
+                    if preserves_traceback {
+                        block_map[target.0 as usize]
+                    } else {
+                        let traced = builder.create_block();
+                        traced_exception_edges.push((
+                            traced,
+                            block_map[target.0 as usize],
+                            source_line,
+                        ));
+                        traced
+                    }
+                } else if preserves_traceback
+                    || matches!(operation.kind, OperationKind::CallModuleChunk { .. })
+                {
+                    propagated_failure
+                } else {
+                    failure
+                };
                 emit_operation(
                     &mut builder,
                     module,
@@ -1697,6 +2163,33 @@ fn define_main(
                 ReturnMode::Main,
                 failure,
             )?;
+        }
+        for (traced, target, line) in traced_exception_edges {
+            builder.switch_to_block(traced);
+            let (filename, filename_len) = metadata_pointer(
+                &mut builder,
+                module,
+                data,
+                &module_program.filename,
+                pointer,
+            )?;
+            let (function_name, function_name_len) =
+                metadata_pointer(&mut builder, module, data, &program.name, pointer)?;
+            let line = builder.ins().iconst(types::I32, i64::from(line));
+            let column = builder.ins().iconst(types::I32, 0);
+            builder.ins().call(
+                refs.traceback_append,
+                &[
+                    context_value,
+                    filename,
+                    filename_len,
+                    function_name,
+                    function_name_len,
+                    line,
+                    column,
+                ],
+            );
+            builder.ins().jump(target, &[]);
         }
 
         builder.switch_to_block(failure);
@@ -1763,6 +2256,17 @@ impl FunctionRefs {
             truthy: module.declare_func_in_func(imports.truthy, function),
             render_error: module.declare_func_in_func(imports.render_error, function),
         }
+    }
+
+    fn new_module(
+        module: &mut ObjectModule,
+        function: &mut cranelift_codegen::ir::Function,
+        imports: &Imports,
+    ) -> Self {
+        let mut refs = Self::new(module, function, imports);
+        refs.traceback_append =
+            module.declare_func_in_func(imports.traceback_append_module, function);
+        refs
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -2449,6 +2953,51 @@ fn emit_operation(
                 .ins()
                 .stack_store(payload, values_slot, value_offset(*has_value) + 8);
         }
+        OperationKind::YieldFromNext {
+            yielded,
+            result,
+            complete,
+            iterator,
+        } => {
+            let outcome_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                1,
+                0,
+            ));
+            let temporary = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                VALUE_SIZE,
+                3,
+            ));
+            let iterator = value_pointer(builder, pointer, values_slot, *iterator);
+            let temporary_pointer = builder.ins().stack_addr(pointer, temporary, 0);
+            let outcome_pointer = builder.ins().stack_addr(pointer, outcome_slot, 0);
+            let runtime_call =
+                module.declare_func_in_func(imports.generator_delegate_start, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, iterator, temporary_pointer, outcome_pointer],
+                failure,
+            );
+            let first = builder.ins().stack_load(types::I64, temporary, 0);
+            let second = builder.ins().stack_load(types::I64, temporary, 8);
+            for destination in [*yielded, *result] {
+                let offset = value_offset(destination);
+                builder.ins().stack_store(first, values_slot, offset);
+                builder.ins().stack_store(second, values_slot, offset + 8);
+            }
+            let outcome = builder.ins().stack_load(types::I8, outcome_slot, 0);
+            let completed = builder.ins().icmp_imm(IntCC::Equal, outcome, 1);
+            let tag = builder.ins().iconst(types::I64, 1);
+            let payload = builder.ins().uextend(types::I64, completed);
+            builder
+                .ins()
+                .stack_store(tag, values_slot, value_offset(*complete));
+            builder
+                .ins()
+                .stack_store(payload, values_slot, value_offset(*complete) + 8);
+        }
         OperationKind::ItemSet {
             collection,
             index,
@@ -2483,6 +3032,9 @@ fn emit_operation(
             function,
             defaults,
             closure,
+            local_names,
+            cell_names,
+            free_names,
         } => {
             let target = module_program
                 .functions
@@ -2567,6 +3119,51 @@ fn emit_operation(
                 pointer,
                 i64::try_from(closure.len()).map_err(|_| "too many closure cells")?,
             );
+
+            let (filename, filename_len) =
+                metadata_pointer(builder, module, data, &module_program.filename, pointer)?;
+            let (local_names, local_name_len) =
+                name_specs_pointer(builder, module, data, local_names, pointer)?;
+            let (cell_names, cell_name_len) =
+                name_specs_pointer(builder, module, data, cell_names, pointer)?;
+            let (free_names, free_name_len) =
+                name_specs_pointer(builder, module, data, free_names, pointer)?;
+            let code_metadata_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                72,
+                3,
+            ));
+            builder.ins().stack_store(filename, code_metadata_slot, 0);
+            builder
+                .ins()
+                .stack_store(filename_len, code_metadata_slot, 8);
+            let first_line = source_line(&module_program.line_starts, operation.span.start);
+            let first_line = builder.ins().iconst(types::I32, i64::from(first_line));
+            builder
+                .ins()
+                .stack_store(first_line, code_metadata_slot, 16);
+            let reserved = builder.ins().iconst(types::I32, 0);
+            builder.ins().stack_store(reserved, code_metadata_slot, 20);
+            builder
+                .ins()
+                .stack_store(local_names, code_metadata_slot, 24);
+            builder
+                .ins()
+                .stack_store(local_name_len, code_metadata_slot, 32);
+            builder
+                .ins()
+                .stack_store(cell_names, code_metadata_slot, 40);
+            builder
+                .ins()
+                .stack_store(cell_name_len, code_metadata_slot, 48);
+            builder
+                .ins()
+                .stack_store(free_names, code_metadata_slot, 56);
+            builder
+                .ins()
+                .stack_store(free_name_len, code_metadata_slot, 64);
+            let code_metadata = builder.ins().stack_addr(pointer, code_metadata_slot, 0);
+
             let output = value_pointer(builder, pointer, values_slot, *dest);
             if target.kind == mir::FunctionKind::Generator {
                 let persistent = mir::generator_persistent_values(target)?;
@@ -2601,6 +3198,7 @@ fn emit_operation(
                         parameter_count,
                         closure_pointer,
                         closure_count,
+                        code_metadata,
                         persistent_slot_count,
                         output,
                     ],
@@ -2622,11 +3220,43 @@ fn emit_operation(
                         parameter_count,
                         closure_pointer,
                         closure_count,
+                        code_metadata,
                         output,
                     ],
                     failure,
                 );
             }
+        }
+        OperationKind::TypeParameterNew { dest, name, kind } => {
+            let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
+            let kind = builder.ins().iconst(types::I8, i64::from(*kind as u8));
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call =
+                module.declare_func_in_func(imports.type_parameter_new, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, kind, name, name_len, output],
+                failure,
+            );
+        }
+        OperationKind::TypeAliasNew {
+            dest,
+            name,
+            type_params,
+            value,
+        } => {
+            let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
+            let type_params = value_pointer(builder, pointer, values_slot, *type_params);
+            let value = value_pointer(builder, pointer, values_slot, *value);
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call = module.declare_func_in_func(imports.type_alias_new, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, name, name_len, type_params, value, output],
+                failure,
+            );
         }
         OperationKind::ClassNamespaceNew { dest } => {
             let output = value_pointer(builder, pointer, values_slot, *dest);
@@ -2690,6 +3320,25 @@ fn emit_operation(
                 builder,
                 runtime_call,
                 &[context, namespace, name, name_len, output],
+                failure,
+            );
+        }
+        OperationKind::ClassFreeGet {
+            dest,
+            namespace,
+            cell,
+            name,
+        } => {
+            let namespace = value_pointer(builder, pointer, values_slot, *namespace);
+            let cell = value_pointer(builder, pointer, values_slot, *cell);
+            let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call = module.declare_func_in_func(imports.class_free_get, builder.func);
+
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, namespace, cell, name, name_len, output],
                 failure,
             );
         }
@@ -2957,6 +3606,35 @@ fn emit_operation(
 
             emit_status_call(builder, runtime_call, &[context, initial, output], failure);
         }
+        OperationKind::ReflectionScopeConfigure {
+            namespace,
+            comprehension,
+        } => {
+            let namespace = namespace
+                .map(|value| value_pointer(builder, pointer, values_slot, value))
+                .unwrap_or_else(|| builder.ins().iconst(pointer, 0));
+            let comprehension = builder.ins().iconst(types::I8, i64::from(*comprehension));
+            let runtime_call =
+                module.declare_func_in_func(imports.reflection_scope_configure, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, namespace, comprehension],
+                failure,
+            );
+        }
+        OperationKind::ReflectionLocalRegister { name, cell } => {
+            let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
+            let cell = value_pointer(builder, pointer, values_slot, *cell);
+            let runtime_call =
+                module.declare_func_in_func(imports.reflection_local_register, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, name, name_len, cell],
+                failure,
+            );
+        }
         OperationKind::CellGet {
             dest,
             cell,
@@ -3009,6 +3687,18 @@ fn emit_operation(
             let runtime_call = module.declare_func_in_func(imports.cell_clear, builder.func);
 
             emit_status_call(builder, runtime_call, &[context, cell], failure);
+        }
+        OperationKind::ImportName { dest, name } => {
+            let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call = module.declare_func_in_func(imports.import_name, builder.func);
+
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, name, name_len, output],
+                failure,
+            );
         }
         OperationKind::GlobalGet { dest, name } => {
             let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
@@ -3138,7 +3828,6 @@ fn emit_operation(
                 .ins()
                 .iconst(types::I8, i64::from(*suppress_context));
             let runtime_call = module.declare_func_in_func(imports.raise, builder.func);
-
             emit_status_call(
                 builder,
                 runtime_call,
@@ -3219,6 +3908,7 @@ fn emit_generator_terminator(
     program: &mir::Function,
     blocks: &[cranelift_codegen::ir::Block],
     block_index: usize,
+    line_starts: &[u32],
     terminator: &Terminator,
     pointer: cranelift_codegen::ir::Type,
     values_slot: StackSlot,
@@ -3291,7 +3981,9 @@ fn emit_generator_terminator(
             )?;
             builder.ins().jump(blocks[else_target.0 as usize], &[]);
         }
-        Terminator::Yield { value, .. } => {
+        Terminator::Yield {
+            value, delegate, ..
+        } => {
             let roots = roots.ok_or_else(|| {
                 "internal error: yield is missing its persistent root set".to_owned()
             })?;
@@ -3314,6 +4006,31 @@ fn emit_generator_terminator(
                     failure,
                 );
             }
+            if let Some(delegate) = delegate {
+                let delegate = value_pointer(builder, pointer, values_slot, *delegate);
+                let delegate_set =
+                    module.declare_func_in_func(imports.generator_delegate_set, builder.func);
+                emit_status_call(
+                    builder,
+                    delegate_set,
+                    &[context, generator, delegate],
+                    failure,
+                );
+            }
+            let source_offset = program.blocks[block_index]
+                .operations
+                .last()
+                .map_or(0, |operation| operation.span.start);
+            let line = source_line(line_starts, source_offset);
+            let line = builder.ins().iconst(types::I32, i64::from(line));
+            let frame_line_set =
+                module.declare_func_in_func(imports.generator_frame_line_set, builder.func);
+            emit_status_call(
+                builder,
+                frame_line_set,
+                &[context, generator, line],
+                failure,
+            );
             let state_id =
                 u32::try_from(block_index + 1).map_err(|_| "too many generator states")?;
             let state = builder.ins().iconst(types::I32, i64::from(state_id));
@@ -3577,6 +4294,32 @@ fn metadata_pointer(
     let len = builder.ins().iconst(
         pointer,
         i64::try_from(len).map_err(|_| "metadata string is too large")?,
+    );
+    Ok((address, len))
+}
+
+fn name_specs_pointer(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut ObjectModule,
+    data: &ConstantData,
+    names: &[String],
+    pointer: cranelift_codegen::ir::Type,
+) -> Result<(Value, Value), String> {
+    let bytes = u32::try_from(names.len().max(1) * 16)
+        .map_err(|_| "code metadata name array is too large")?;
+    let slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, bytes, 3));
+    for (index, name) in names.iter().enumerate() {
+        let offset =
+            i32::try_from(index * 16).map_err(|_| "code metadata name offset is too large")?;
+        let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
+        builder.ins().stack_store(name, slot, offset);
+        builder.ins().stack_store(name_len, slot, offset + 8);
+    }
+    let address = builder.ins().stack_addr(pointer, slot, 0);
+    let len = builder.ins().iconst(
+        pointer,
+        i64::try_from(names.len()).map_err(|_| "too many code metadata names")?,
     );
     Ok((address, len))
 }

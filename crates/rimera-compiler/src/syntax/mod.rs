@@ -53,6 +53,7 @@ pub enum StatementKind {
     },
     FunctionDef {
         name: String,
+        type_params: Vec<TypeParameter>,
         decorators: Vec<Expression>,
         parameters: Vec<Parameter>,
         return_annotation: Option<Expression>,
@@ -60,14 +61,23 @@ pub enum StatementKind {
     },
     ClassDef {
         name: String,
+        type_params: Vec<TypeParameter>,
         decorators: Vec<Expression>,
         bases: Vec<Expression>,
         metaclass: Option<Expression>,
         keywords: Vec<(String, Expression)>,
         body: Vec<Statement>,
     },
+    TypeAlias {
+        name: String,
+        type_params: Vec<TypeParameter>,
+        value: Expression,
+    },
     Return {
         value: Option<Expression>,
+    },
+    Import {
+        aliases: Vec<ImportAlias>,
     },
     Break,
     Continue,
@@ -107,6 +117,26 @@ pub enum StatementKind {
         subject: Expression,
         cases: Vec<MatchCase>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportAlias {
+    pub module: String,
+    pub bind_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeParameterKind {
+    TypeVar,
+    TypeVarTuple,
+    ParamSpec,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeParameter {
+    pub span: Span,
+    pub name: String,
+    pub kind: TypeParameterKind,
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +330,12 @@ pub enum ExpressionKind {
         name: String,
         value: Box<Expression>,
     },
+    Yield {
+        value: Option<Box<Expression>>,
+    },
+    YieldFrom {
+        value: Box<Expression>,
+    },
     Comprehension {
         kind: ComprehensionKind,
         element: Box<Expression>,
@@ -350,40 +386,24 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
     use ast::Ranged;
     let span = span_of(statement.range());
     let kind = match statement {
-        ast::Stmt::FunctionDef(node) => {
-            if !node.type_params.is_empty() {
-                return capability(
-                    path,
-                    span,
-                    "RIM-CAP-G7-01",
-                    "PEP 695 function type parameters require Gate 7 Python-visible type-parameter metadata",
-                );
-            }
-            StatementKind::FunctionDef {
-                name: node.name.to_string(),
-                decorators: node
-                    .decorator_list
-                    .iter()
-                    .map(|decorator| convert_expression(path, decorator))
-                    .collect::<Result<Vec<_>, _>>()?,
-                parameters: convert_parameters(path, &node.args)?,
-                return_annotation: node
-                    .returns
-                    .as_deref()
-                    .map(|annotation| convert_expression(path, annotation))
-                    .transpose()?,
-                body: convert_statements(path, &node.body)?,
-            }
-        }
+        ast::Stmt::FunctionDef(node) => StatementKind::FunctionDef {
+            name: node.name.to_string(),
+            type_params: convert_type_parameters(path, &node.type_params)?,
+            decorators: node
+                .decorator_list
+                .iter()
+                .map(|decorator| convert_expression(path, decorator))
+                .collect::<Result<Vec<_>, _>>()?,
+            parameters: convert_parameters(path, &node.args)?,
+            return_annotation: node
+                .returns
+                .as_deref()
+                .map(|annotation| convert_expression(path, annotation))
+                .transpose()?,
+            body: convert_statements(path, &node.body)?,
+        },
         ast::Stmt::ClassDef(node) => {
-            if !node.type_params.is_empty() {
-                return capability(
-                    path,
-                    span,
-                    "RIM-CAP-G7-01",
-                    "PEP 695 class type parameters require Gate 7 Python-visible type-parameter metadata",
-                );
-            }
+            let type_params = convert_type_parameters(path, &node.type_params)?;
             let mut metaclass = None;
             let mut keywords = Vec::new();
             for keyword in &node.keywords {
@@ -427,6 +447,7 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
             }
             StatementKind::ClassDef {
                 name: node.name.to_string(),
+                type_params,
                 decorators: node
                     .decorator_list
                     .iter()
@@ -436,6 +457,21 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
                 metaclass,
                 keywords,
                 body: convert_class_body(path, &node.body)?,
+            }
+        }
+        ast::Stmt::TypeAlias(node) => {
+            let ast::Expr::Name(name) = node.name.as_ref() else {
+                return capability(
+                    path,
+                    span,
+                    "RIM-CAP-G7-04",
+                    "PEP 695 type aliases require a simple name target",
+                );
+            };
+            StatementKind::TypeAlias {
+                name: name.id.to_string(),
+                type_params: convert_type_parameters(path, &node.type_params)?,
+                value: convert_expression(path, &node.value)?,
             }
         }
         ast::Stmt::AugAssign(node) => {
@@ -467,6 +503,25 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
                 .map(|value| convert_expression(path, value))
                 .transpose()?,
         },
+        ast::Stmt::Import(node) => {
+            let mut aliases = Vec::with_capacity(node.names.len());
+            for alias in &node.names {
+                let module = alias.name.to_string();
+                if module.contains('.') {
+                    return unsupported(
+                        path,
+                        span,
+                        "dotted imports are outside the pulled-forward native import foundation",
+                    );
+                }
+                let bind_name = alias
+                    .asname
+                    .as_ref()
+                    .map_or_else(|| module.clone(), ToString::to_string);
+                aliases.push(ImportAlias { module, bind_name });
+            }
+            StatementKind::Import { aliases }
+        }
         ast::Stmt::Break(_) => StatementKind::Break,
         ast::Stmt::Continue(_) => StatementKind::Continue,
         ast::Stmt::Global(node) => {
@@ -582,6 +637,46 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
         }
     };
     Ok(Statement { span, kind })
+}
+
+fn convert_type_parameters(
+    path: &Path,
+    parameters: &[ast::TypeParam],
+) -> Result<Vec<TypeParameter>, DiagnosticSet> {
+    parameters
+        .iter()
+        .map(|parameter| {
+            let (span, name, kind, bound) = match parameter {
+                ast::TypeParam::TypeVar(parameter) => (
+                    span_of(parameter.range),
+                    parameter.name.to_string(),
+                    TypeParameterKind::TypeVar,
+                    parameter.bound.as_deref(),
+                ),
+                ast::TypeParam::TypeVarTuple(parameter) => (
+                    span_of(parameter.range),
+                    parameter.name.to_string(),
+                    TypeParameterKind::TypeVarTuple,
+                    None,
+                ),
+                ast::TypeParam::ParamSpec(parameter) => (
+                    span_of(parameter.range),
+                    parameter.name.to_string(),
+                    TypeParameterKind::ParamSpec,
+                    None,
+                ),
+            };
+            if bound.is_some() {
+                return capability(
+                    path,
+                    span,
+                    "RIM-CAP-G7-03",
+                    "lazy PEP 695 type-parameter bounds and constraints are deferred to the later generic-bound evaluator",
+                );
+            }
+            Ok(TypeParameter { span, name, kind })
+        })
+        .collect()
 }
 
 fn convert_target(path: &Path, target: &ast::Expr) -> Result<Target, DiagnosticSet> {
@@ -747,6 +842,10 @@ fn convert_class_body(
                 | StatementKind::Raise { .. }
                 | StatementKind::Try { .. }
                 | StatementKind::ClassDef { .. }
+                | StatementKind::Import { .. }
+                | StatementKind::Global(_)
+                | StatementKind::Nonlocal(_)
+                | StatementKind::Match { .. }
         ) {
             return unsupported(
                 path,
@@ -953,6 +1052,17 @@ fn convert_expression(path: &Path, expression: &ast::Expr) -> Result<Expression,
                 value: Box::new(convert_expression(path, &node.value)?),
             }
         }
+        ast::Expr::Yield(node) => ExpressionKind::Yield {
+            value: node
+                .value
+                .as_deref()
+                .map(|value| convert_expression(path, value))
+                .transpose()?
+                .map(Box::new),
+        },
+        ast::Expr::YieldFrom(node) => ExpressionKind::YieldFrom {
+            value: Box::new(convert_expression(path, &node.value)?),
+        },
         ast::Expr::ListComp(node) => ExpressionKind::Comprehension {
             kind: ComprehensionKind::List,
             element: Box::new(convert_expression(path, &node.elt)?),
@@ -1253,5 +1363,35 @@ mod tests {
     fn malformed_source_has_a_parse_diagnostic() {
         let diagnostics = parse(path(), "if True\n    print(1)\n").unwrap_err();
         assert_eq!(diagnostics.as_slice()[0].code, "RIM-PARSE-001");
+    }
+
+    #[test]
+    fn gate5_function_surface_preserves_decorators_annotations_and_parameter_kinds() {
+        let module = parse(
+            path(),
+            "@outer\n@inner(1)\ndef function(a: int, /, b=2, *args, c: str=3, **kwargs) -> bool:\n    return a\n",
+        )
+        .unwrap();
+        let StatementKind::FunctionDef {
+            decorators,
+            parameters,
+            return_annotation,
+            ..
+        } = &module.statements[0].kind
+        else {
+            panic!("expected function definition");
+        };
+        assert_eq!(decorators.len(), 2);
+        assert_eq!(parameters.len(), 5);
+        assert_eq!(parameters[0].kind, ParameterKind::PositionalOnly);
+        assert_eq!(parameters[1].kind, ParameterKind::PositionalOrKeyword);
+        assert_eq!(parameters[2].kind, ParameterKind::VarArgs);
+        assert_eq!(parameters[3].kind, ParameterKind::KeywordOnly);
+        assert_eq!(parameters[4].kind, ParameterKind::VarKeywords);
+        assert!(parameters[0].annotation.is_some());
+        assert!(parameters[1].default.is_some());
+        assert!(parameters[3].annotation.is_some());
+        assert!(parameters[3].default.is_some());
+        assert!(return_annotation.is_some());
     }
 }

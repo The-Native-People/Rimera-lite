@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(panic = "unwind")]
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr;
@@ -10,9 +10,9 @@ use rimera_abi::{
 
 use crate::heap::{Heap, HeapObject, HeapStats, MIN_COLLECTION_THRESHOLD};
 use crate::object::{
-    BoundMethodObject, BuiltinFunctionKind, BuiltinFunctionObject, ClassMethodObject,
-    DictionaryObject, ExceptionObject, FunctionKind, GeneratorObject, InstanceObject,
-    MemberDescriptorObject, PropertyMethodKind, PropertyMethodObject, PropertyObject,
+    BoundMethodObject, BuiltinFunctionKind, BuiltinFunctionObject, ClassMethodObject, CodeObject,
+    DictionaryObject, ExceptionObject, FrameObject, FunctionKind, GeneratorObject, InstanceObject,
+    MemberDescriptorObject, ModuleObject, PropertyMethodKind, PropertyMethodObject, PropertyObject,
     StaticMethodObject, SuperObject, TYPE_FLAG_BUILTIN, TYPE_FLAG_EXCEPTION,
     TYPE_FLAG_INSTANTIABLE, TracebackObject, TypeLayout, TypeObject,
 };
@@ -59,14 +59,21 @@ const LAZY_BUILTIN_TYPES: &[(&str, &str)] = &[
     ("dict_items", "object"),
     ("mappingproxy", "object"),
     ("memoryview", "object"),
+    ("module", "object"),
     ("range", "object"),
     ("function", "object"),
+    ("code", "object"),
     ("builtin_function_or_method", "object"),
     ("iterator", "object"),
     ("cell", "object"),
     ("traceback", "object"),
+    ("frame", "object"),
     ("generator", "object"),
     ("super", "object"),
+    ("TypeVar", "object"),
+    ("TypeVarTuple", "object"),
+    ("ParamSpec", "object"),
+    ("TypeAliasType", "object"),
 ];
 
 /// Gate-specific exception classes that do not need to inflate the permanent
@@ -79,6 +86,8 @@ const LAZY_BUILTIN_EXCEPTIONS: &[(&str, &str)] = &[
     ("AssertionError", "Exception"),
     ("GeneratorExit", "BaseException"),
     ("StopIteration", "Exception"),
+    ("ImportError", "Exception"),
+    ("ModuleNotFoundError", "ImportError"),
 ];
 
 fn is_public_builtin_type_name(name: &str) -> bool {
@@ -121,6 +130,8 @@ fn is_public_builtin_type_name(name: &str) -> bool {
             | "AssertionError"
             | "GeneratorExit"
             | "StopIteration"
+            | "ImportError"
+            | "ModuleNotFoundError"
     )
 }
 
@@ -132,10 +143,19 @@ struct KernelRoots {
     emergency_memory_error: RValue,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ActiveCall {
     function: RValue,
     receiver: Option<RValue>,
+    generator: Option<RValue>,
+    frame: Option<RValue>,
+    local_cells: Vec<(String, RValue)>,
+    locals_snapshot: Option<RValue>,
+    namespace: Option<RValue>,
+    comprehension: bool,
+    transient_names: BTreeSet<String>,
+    overlay_base: Option<RValue>,
+    overlay_restore: Vec<(String, Option<RValue>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +163,8 @@ pub(crate) struct GeneratorResume {
     pub value: RValue,
     pub outcome: RGeneratorOutcome,
 }
+
+type BufferLeaseFinalizer = fn(&mut RimeraContext, RValue) -> Result<(), String>;
 
 #[derive(Debug)]
 pub struct RimeraContext {
@@ -154,9 +176,12 @@ pub struct RimeraContext {
     pub(crate) raised: Option<RValue>,
     pub(crate) handled: Vec<RValue>,
     active_calls: Vec<ActiveCall>,
+    modules: BTreeMap<String, RValue>,
+    module_frame: Option<RValue>,
     kernel: Option<KernelRoots>,
     next_collection_bytes: usize,
     heap_limit_bytes: Option<usize>,
+    buffer_lease_finalizer: Option<BufferLeaseFinalizer>,
 }
 
 impl Default for RimeraContext {
@@ -170,9 +195,12 @@ impl Default for RimeraContext {
             raised: None,
             handled: Vec::new(),
             active_calls: Vec::new(),
+            modules: BTreeMap::new(),
+            module_frame: None,
             kernel: None,
             next_collection_bytes: MIN_COLLECTION_THRESHOLD,
             heap_limit_bytes: None,
+            buffer_lease_finalizer: None,
         }
     }
 }
@@ -196,10 +224,85 @@ impl RimeraContext {
     }
 
     pub fn collect(&mut self) {
-        let roots = self.discover_roots();
-        self.heap.collect(roots);
+        loop {
+            let roots = self.discover_roots();
+            let finalizers = self.heap.collect(roots);
+            if finalizers.is_empty() {
+                break;
+            }
+            let finalizer = self
+                .buffer_lease_finalizer
+                .expect("buffer lease finalizer must be installed before lease allocation");
+            for lease in finalizers {
+                let saved_raised = self.raised.take();
+                let saved_exception = self.exception.take();
+                let _ = self.with_temporary_roots(&[lease], |context| finalizer(context, lease));
+                // GC-triggered release callback failures are unraisable here;
+                // they must not replace the exception state of the allocation
+                // or safepoint that caused collection.
+                self.raised = saved_raised;
+                self.exception = saved_exception;
+            }
+        }
         self.next_collection_bytes =
             MIN_COLLECTION_THRESHOLD.max(self.heap.live_bytes().saturating_mul(2));
+    }
+
+    pub(crate) fn enable_buffer_lease_finalizer(&mut self) {
+        if self.buffer_lease_finalizer.is_none() {
+            self.buffer_lease_finalizer = Some(Self::finalize_buffer_lease);
+        }
+    }
+
+    pub(crate) fn release_buffer_lease_view(&mut self, lease: RValue) -> Result<(), String> {
+        let should_finalize = match self.heap.get_mut(lease) {
+            Some(HeapObject::BufferLease(lease)) => {
+                if lease.released {
+                    false
+                } else {
+                    lease.active_views = lease.active_views.saturating_sub(1);
+                    lease.active_views == 0
+                }
+            }
+            _ => return Err("memoryview has an invalid provider lease".to_owned()),
+        };
+        if should_finalize {
+            self.finalize_buffer_lease(lease)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn finalize_buffer_lease(&mut self, lease: RValue) -> Result<(), String> {
+        let (provider, exported_view) = match self.heap.get(lease) {
+            Some(HeapObject::BufferLease(lease)) if !lease.released => {
+                (lease.provider, lease.exported_view)
+            }
+            Some(HeapObject::BufferLease(_)) => return Ok(()),
+            _ => return Err("memoryview has an invalid provider lease".to_owned()),
+        };
+        let Some(HeapObject::BufferLease(lease_object)) = self.heap.get_mut(lease) else {
+            unreachable!("provider lease was checked above");
+        };
+        lease_object.released = true;
+        lease_object.active_views = 0;
+
+        let saved_raised = self.raised.take();
+        let saved_exception = self.exception.take();
+        let _callback_result = match self.special_method(provider, "__release_buffer__") {
+            Ok(Some(callback)) => self
+                .with_temporary_roots(&[lease, provider, exported_view, callback], |context| {
+                    crate::call::invoke(context, callback, &[exported_view], &[]).map(|_| ())
+                }),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        // CPython reports release-callback failures as unraisable and still
+        // makes memoryview.release() succeed. Preserve the caller's exception
+        // state while dropping the native export obligation unconditionally.
+        self.raised = saved_raised;
+        self.exception = saved_exception;
+        crate::operations::memoryview_release(self, exported_view)
     }
 
     fn discover_roots(&self) -> Vec<RValue> {
@@ -220,6 +323,42 @@ impl RimeraContext {
         roots.extend_from_slice(&self.context_roots);
         roots.extend(self.raised);
         roots.extend(self.handled.iter().copied());
+        roots.extend(self.modules.values().copied());
+        roots.extend(self.module_frame);
+        for active in &self.active_calls {
+            roots.push(active.function);
+            active
+                .receiver
+                .into_iter()
+                .for_each(|value| roots.push(value));
+            active
+                .generator
+                .into_iter()
+                .for_each(|value| roots.push(value));
+            active.frame.into_iter().for_each(|value| roots.push(value));
+            active
+                .local_cells
+                .iter()
+                .map(|(_, cell)| *cell)
+                .for_each(|value| roots.push(value));
+            active
+                .locals_snapshot
+                .into_iter()
+                .for_each(|value| roots.push(value));
+            active
+                .namespace
+                .into_iter()
+                .for_each(|value| roots.push(value));
+            active
+                .overlay_base
+                .into_iter()
+                .for_each(|value| roots.push(value));
+            active
+                .overlay_restore
+                .iter()
+                .filter_map(|(_, value)| *value)
+                .for_each(|value| roots.push(value));
+        }
         roots
     }
 
@@ -285,24 +424,428 @@ impl RimeraContext {
     }
 
     pub(crate) fn push_active_call(&mut self, function: RValue, receiver: Option<RValue>) {
-        self.active_calls.push(ActiveCall { function, receiver });
+        self.active_calls.push(ActiveCall {
+            function,
+            receiver,
+            generator: None,
+            frame: None,
+            local_cells: Vec::new(),
+            locals_snapshot: None,
+            namespace: None,
+            comprehension: false,
+            transient_names: BTreeSet::new(),
+            overlay_base: None,
+            overlay_restore: Vec::new(),
+        });
+    }
+
+    pub(crate) fn push_active_generator_call(
+        &mut self,
+        function: RValue,
+        generator: RValue,
+    ) -> Result<(), String> {
+        let (local_cells, locals_snapshot) = match self.heap.get(generator) {
+            Some(HeapObject::Generator(generator)) => {
+                (generator.local_cells.clone(), generator.locals_snapshot)
+            }
+            _ => return Err("generator activation is invalid".to_owned()),
+        };
+        self.active_calls.push(ActiveCall {
+            function,
+            receiver: None,
+            generator: Some(generator),
+            frame: match self.heap.get(generator) {
+                Some(HeapObject::Generator(generator)) => generator.frame,
+                _ => None,
+            },
+            local_cells,
+            locals_snapshot,
+            namespace: None,
+            comprehension: false,
+            transient_names: BTreeSet::new(),
+            overlay_base: None,
+            overlay_restore: Vec::new(),
+        });
+        Ok(())
     }
 
     pub(crate) fn pop_active_call(&mut self) {
-        let _ = self.active_calls.pop();
+        let Some(active) = self.active_calls.pop() else {
+            return;
+        };
+        if let Some(base) = active.overlay_base {
+            for (name, previous) in active.overlay_restore.iter().rev() {
+                match previous {
+                    Some(value) => self.direct_namespace_set(base, name, *value),
+                    None => self.direct_namespace_delete(base, name),
+                }
+            }
+        }
+        if let Some(generator) = active.generator
+            && let Some(HeapObject::Generator(object)) = self.heap.get_mut(generator)
+        {
+            object.local_cells = active.local_cells;
+            object.locals_snapshot = active.locals_snapshot;
+        }
+    }
+
+    pub(crate) fn configure_active_scope(
+        &mut self,
+        namespace: Option<RValue>,
+        comprehension: bool,
+    ) -> Result<(), String> {
+        let active = self
+            .active_calls
+            .last_mut()
+            .ok_or_else(|| "reflection scope has no active native activation".to_owned())?;
+        active.namespace = namespace;
+        active.comprehension = comprehension;
+        Ok(())
+    }
+
+    pub(crate) fn register_active_local(&mut self, name: &str, cell: RValue) -> Result<(), String> {
+        if !matches!(self.heap.get(cell), Some(HeapObject::Cell(_))) {
+            return Err("reflection local registration requires a cell".to_owned());
+        }
+        let active = self
+            .active_calls
+            .last_mut()
+            .ok_or_else(|| "reflection local has no active native activation".to_owned())?;
+        if let Some((_, current)) = active
+            .local_cells
+            .iter_mut()
+            .find(|(current, _)| current == name)
+        {
+            *current = cell;
+        } else {
+            active.local_cells.push((name.to_owned(), cell));
+        }
+        Ok(())
+    }
+
+    fn direct_namespace_set(&mut self, namespace: RValue, name: &str, value: RValue) {
+        match self.heap.get_mut(namespace) {
+            Some(HeapObject::Dictionary(dictionary)) => {
+                dictionary.insert(name.to_owned(), value);
+            }
+            Some(HeapObject::ValueDictionary(_)) => {
+                let _ = self.namespace_set(namespace, name, value);
+            }
+            _ => {}
+        }
+    }
+
+    fn direct_namespace_delete(&mut self, namespace: RValue, name: &str) {
+        match self.heap.get_mut(namespace) {
+            Some(HeapObject::Dictionary(dictionary)) => {
+                dictionary.remove(name);
+            }
+            Some(HeapObject::ValueDictionary(_)) => {
+                let _ = self.namespace_delete(namespace, name);
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_locals_at(&mut self, index: usize) -> Result<RValue, String> {
+        let (namespace, comprehension) = {
+            let active = self
+                .active_calls
+                .get(index)
+                .ok_or_else(|| "active locals index is invalid".to_owned())?;
+            (active.namespace, active.comprehension)
+        };
+        if let Some(namespace) = namespace {
+            return Ok(namespace);
+        }
+        if comprehension {
+            return self.refresh_comprehension_locals(index);
+        }
+        let snapshot = if let Some(existing) = self.active_calls[index].locals_snapshot {
+            existing
+        } else {
+            let dictionary = self.allocate(HeapObject::Dictionary(DictionaryObject {
+                entries: Vec::new(),
+            }))?;
+            self.active_calls[index].locals_snapshot = Some(dictionary);
+            if let Some(generator) = self.active_calls[index].generator
+                && let Some(HeapObject::Generator(object)) = self.heap.get_mut(generator)
+            {
+                object.locals_snapshot = Some(dictionary);
+            }
+            dictionary
+        };
+        let transient = std::mem::take(&mut self.active_calls[index].transient_names);
+        for name in transient {
+            self.direct_namespace_delete(snapshot, &name);
+        }
+        let local_cells = self.active_calls[index].local_cells.clone();
+        for (name, cell) in local_cells {
+            let value = match self.heap.get(cell) {
+                Some(HeapObject::Cell(cell)) => cell.value,
+                _ => None,
+            };
+            match value {
+                Some(value) => self.direct_namespace_set(snapshot, &name, value),
+                None => self.direct_namespace_delete(snapshot, &name),
+            }
+        }
+        Ok(snapshot)
+    }
+
+    fn refresh_comprehension_locals(&mut self, index: usize) -> Result<RValue, String> {
+        let base_index = (0..index)
+            .rev()
+            .find(|candidate| !self.active_calls[*candidate].comprehension);
+        let (base, live_mapping, parent_index) = if let Some(parent) = base_index {
+            if let Some(namespace) = self.active_calls[parent].namespace {
+                (namespace, true, Some(parent))
+            } else {
+                (self.refresh_locals_at(parent)?, false, Some(parent))
+            }
+        } else {
+            (
+                self.globals()
+                    .ok_or_else(|| "module globals are unavailable".to_owned())?,
+                true,
+                None,
+            )
+        };
+        let overlay_start = base_index.map_or(0, |parent| parent + 1);
+        let locals = self.active_calls[overlay_start..=index]
+            .iter()
+            .filter(|active| active.comprehension)
+            .flat_map(|active| active.local_cells.iter().cloned())
+            .collect::<Vec<_>>();
+        for (name, cell) in locals {
+            let value = match self.heap.get(cell) {
+                Some(HeapObject::Cell(cell)) => cell.value,
+                _ => None,
+            };
+            if live_mapping {
+                let recorded = self.active_calls[index]
+                    .overlay_restore
+                    .iter()
+                    .any(|(current, _)| current == &name);
+                if !recorded {
+                    let previous = self.namespace_value(base, &name);
+                    self.active_calls[index]
+                        .overlay_restore
+                        .push((name.clone(), previous));
+                    self.active_calls[index].overlay_base = Some(base);
+                }
+            } else if let Some(parent) = parent_index {
+                self.active_calls[parent]
+                    .transient_names
+                    .insert(name.clone());
+            }
+            match value {
+                Some(value) => self.direct_namespace_set(base, &name, value),
+                None => self.direct_namespace_delete(base, &name),
+            }
+        }
+        Ok(base)
+    }
+
+    pub(crate) fn current_locals(&mut self) -> Result<RValue, String> {
+        if self.active_calls.is_empty() {
+            self.initialize_kernel()?;
+            return self
+                .globals()
+                .ok_or_else(|| "module globals are unavailable".to_owned());
+        }
+        self.refresh_locals_at(self.active_calls.len() - 1)
+    }
+
+    fn active_frame_default_line(&self, index: usize) -> u32 {
+        self.active_calls
+            .get(index)
+            .and_then(|active| match self.heap.get(active.function) {
+                Some(HeapObject::Function(function)) => Some(function.code),
+                _ => None,
+            })
+            .and_then(|code| match self.heap.get(code) {
+                Some(HeapObject::Code(code)) => Some(code.first_line),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    fn ensure_active_frame(&mut self, index: usize, line: u32) -> Result<RValue, String> {
+        if let Some(frame) = self.active_calls.get(index).and_then(|active| active.frame) {
+            if let Some(HeapObject::Frame(frame_object)) = self.heap.get_mut(frame) {
+                frame_object.line = line;
+            }
+            return Ok(frame);
+        }
+        let function = self
+            .active_calls
+            .get(index)
+            .map(|active| active.function)
+            .ok_or_else(|| "active frame index is invalid".to_owned())?;
+        let code = match self.heap.get(function) {
+            Some(HeapObject::Function(function)) => function.code,
+            _ => return Err("active frame function is invalid".to_owned()),
+        };
+        let globals = self
+            .globals()
+            .ok_or_else(|| "module globals are unavailable".to_owned())?;
+        let back = if index == 0 {
+            None
+        } else {
+            let caller_line = self.active_frame_default_line(index - 1);
+            Some(self.ensure_active_frame(index - 1, caller_line)?)
+        };
+        let locals = self.refresh_locals_at(index)?;
+        let generator = self.active_calls[index].generator;
+        let roots = back
+            .into_iter()
+            .chain(generator)
+            .chain([function, code, globals, locals])
+            .collect::<Vec<_>>();
+        let frame = self.with_temporary_roots(&roots, |context| {
+            context.allocate(HeapObject::Frame(Box::new(FrameObject {
+                code,
+                globals,
+                locals,
+                back,
+                line,
+                generator,
+            })))
+        })?;
+        self.active_calls[index].frame = Some(frame);
+        if let Some(generator) = generator
+            && let Some(HeapObject::Generator(generator)) = self.heap.get_mut(generator)
+        {
+            generator.frame = Some(frame);
+        }
+        Ok(frame)
+    }
+
+    fn ensure_module_frame(&mut self, filename: &str, line: u32) -> Result<RValue, String> {
+        if let Some(frame) = self.module_frame {
+            if let Some(HeapObject::Frame(frame_object)) = self.heap.get_mut(frame) {
+                frame_object.line = line;
+            }
+            return Ok(frame);
+        }
+        let globals = self
+            .globals()
+            .ok_or_else(|| "module globals are unavailable".to_owned())?;
+        let code = self.with_temporary_roots(&[globals], |context| {
+            context.allocate(HeapObject::Code(CodeObject {
+                code_address: 0,
+                kind: FunctionKind::Normal,
+                name: "<module>".to_owned(),
+                qualified_name: "<module>".to_owned(),
+                parameters: Box::new([]),
+                filename: filename.to_owned(),
+                first_line: 1,
+                local_names: Box::new([]),
+                cell_names: Box::new([]),
+                free_names: Box::new([]),
+            }))
+        })?;
+        let frame = self.with_temporary_roots(&[globals, code], |context| {
+            context.allocate(HeapObject::Frame(Box::new(FrameObject {
+                code,
+                globals,
+                locals: globals,
+                back: None,
+                line,
+                generator: None,
+            })))
+        })?;
+        self.module_frame = Some(frame);
+        Ok(frame)
+    }
+
+    pub(crate) fn namespace_names(&self, namespace: RValue) -> Vec<String> {
+        match self.heap.get(namespace) {
+            Some(HeapObject::Dictionary(dictionary)) => dictionary
+                .entries
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+            Some(HeapObject::ValueDictionary(dictionary)) => dictionary
+                .table
+                .values()
+                .filter_map(|(key, _)| match self.heap.get(*key) {
+                    Some(HeapObject::String(name)) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect(),
+            Some(HeapObject::MappingProxy(proxy)) => self.namespace_names(proxy.dictionary),
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn default_dir_names(&mut self, value: RValue) -> Result<Vec<String>, String> {
+        let mut names = BTreeSet::new();
+        match self.heap.get(value) {
+            Some(HeapObject::Module(module)) => {
+                names.extend(self.namespace_names(module.namespace));
+            }
+            Some(HeapObject::Instance(instance)) => {
+                if let Some(dictionary) = instance.dictionary {
+                    names.extend(self.namespace_names(dictionary));
+                }
+                let class = instance.class;
+                if let Some(HeapObject::Type(class)) = self.heap.get(class) {
+                    for candidate in class.mro.iter().copied() {
+                        if let Some(HeapObject::Type(candidate)) = self.heap.get(candidate) {
+                            names.extend(self.namespace_names(candidate.namespace));
+                        }
+                    }
+                }
+            }
+            Some(HeapObject::Type(class)) => {
+                let class_mro = class.mro.to_vec();
+                let metaclass = class.metaclass;
+                for candidate in class_mro {
+                    if let Some(HeapObject::Type(candidate)) = self.heap.get(candidate) {
+                        names.extend(self.namespace_names(candidate.namespace));
+                    }
+                }
+                if let Some(HeapObject::Type(meta)) = self.heap.get(metaclass) {
+                    for candidate in meta.mro.iter().copied() {
+                        if let Some(HeapObject::Type(candidate)) = self.heap.get(candidate) {
+                            names.extend(self.namespace_names(candidate.namespace));
+                        }
+                    }
+                }
+            }
+            _ => {
+                let class = self.type_of(value)?;
+                if let Some(HeapObject::Type(class)) = self.heap.get(class) {
+                    for candidate in class.mro.iter().copied() {
+                        if let Some(HeapObject::Type(candidate)) = self.heap.get(candidate) {
+                            names.extend(self.namespace_names(candidate.namespace));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
     }
 
     pub(crate) fn zero_argument_super(&mut self) -> Result<RValue, String> {
         let active = self
             .active_calls
             .last()
-            .copied()
+            .cloned()
             .ok_or_else(|| "super(): no arguments".to_owned())?;
         let receiver = active
             .receiver
             .ok_or_else(|| "super(): no arguments".to_owned())?;
         let class_cell = match self.heap.get(active.function) {
-            Some(HeapObject::Function(function)) => function.closure.last().copied(),
+            Some(HeapObject::Function(function)) => function.closure.and_then(|closure| match self
+                .heap
+                .get(closure)
+            {
+                Some(HeapObject::Tuple(cells)) => cells.last().copied(),
+                _ => None,
+            }),
             _ => None,
         }
         .ok_or_else(|| "super(): __class__ cell not found".to_owned())?;
@@ -574,6 +1117,10 @@ impl RimeraContext {
             "sorted" => BuiltinFunctionKind::Sorted,
             "id" => BuiltinFunctionKind::Id,
             "ascii" => BuiltinFunctionKind::Ascii,
+            "dir" => BuiltinFunctionKind::Dir,
+            "vars" => BuiltinFunctionKind::Vars,
+            "globals" => BuiltinFunctionKind::Globals,
+            "locals" => BuiltinFunctionKind::Locals,
             _ => return Ok(None),
         };
         let value =
@@ -634,12 +1181,20 @@ impl RimeraContext {
                 },
                 Some(HeapObject::MappingProxy(_)) => "mappingproxy",
                 Some(HeapObject::MemoryView(_)) => "memoryview",
+                Some(HeapObject::Module(_)) => "module",
+                Some(HeapObject::TypeParameter(parameter)) => match parameter.kind {
+                    rimera_abi::RTypeParameterKind::TypeVar => "TypeVar",
+                    rimera_abi::RTypeParameterKind::TypeVarTuple => "TypeVarTuple",
+                    rimera_abi::RTypeParameterKind::ParamSpec => "ParamSpec",
+                },
+                Some(HeapObject::TypeAlias(_)) => "TypeAliasType",
                 Some(HeapObject::Range(_)) => "range",
                 Some(HeapObject::Iterator(_)) => "iterator",
                 Some(HeapObject::Function(_)) => "function",
+                Some(HeapObject::Code(_)) => "code",
                 Some(HeapObject::Generator(_)) => "generator",
                 Some(HeapObject::BoundMethod(_)) => "function",
-                Some(HeapObject::CallArguments(_)) => "object",
+                Some(HeapObject::CallArguments(_) | HeapObject::BufferLease(_)) => "object",
                 Some(HeapObject::Property(_))
                 | Some(HeapObject::StaticMethod(_))
                 | Some(HeapObject::ClassMethod(_)) => "object",
@@ -652,6 +1207,7 @@ impl RimeraContext {
                 Some(HeapObject::Exception(exception)) => return Ok(exception.exception_type),
                 Some(HeapObject::Cell(_)) => "cell",
                 Some(HeapObject::Traceback(_)) => "traceback",
+                Some(HeapObject::Frame(_)) => "frame",
                 Some(HeapObject::ValueArray(_)) => "object",
                 None => return Err("value contains a stale heap handle".to_owned()),
             },
@@ -668,6 +1224,80 @@ impl RimeraContext {
     ) -> Result<bool, String> {
         let actual_type = self.type_of(value)?;
         self.is_subclass_of_class_info(actual_type, class_info, "isinstance")
+    }
+
+    /// Python-visible `isinstance` semantics. Internal runtime subtype checks
+    /// deliberately keep using the structural helpers so user metaclass hooks
+    /// cannot perturb exception matching, numeric dispatch, or class creation.
+    pub(crate) fn is_instance_reflective(
+        &mut self,
+        value: RValue,
+        class_info: RValue,
+    ) -> Result<bool, String> {
+        if let Some(HeapObject::Tuple(items)) = self.heap.get(class_info) {
+            let items = items.to_vec();
+            for item in items {
+                if self.is_instance_reflective(value, item)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        let Some(HeapObject::Type(_)) = self.heap.get(class_info) else {
+            return Err(
+                "isinstance() arg 2 must be a type, a tuple of types, or a union".to_owned(),
+            );
+        };
+        let actual_type = self.type_of(value)?;
+        // CPython bypasses a custom __instancecheck__ for exact instances.
+        if actual_type == class_info {
+            return Ok(true);
+        }
+        if let Some(method) = self.special_method(class_info, "__instancecheck__")? {
+            let result = self.with_temporary_roots(&[value, class_info, method], |context| {
+                crate::call::invoke(context, method, &[value], &[])
+            })?;
+            return self.with_temporary_roots(&[value, class_info, result], |context| {
+                crate::operations::truthy(context, result)
+            });
+        }
+        self.is_subclass(actual_type, class_info)
+    }
+
+    /// Python-visible `issubclass` semantics including custom metaclass
+    /// `__subclasscheck__`, kept separate from structural runtime subtyping.
+    pub(crate) fn is_subclass_reflective(
+        &mut self,
+        candidate: RValue,
+        class_info: RValue,
+    ) -> Result<bool, String> {
+        if !matches!(self.heap.get(candidate), Some(HeapObject::Type(_))) {
+            return Err("issubclass() arg 1 must be a class".to_owned());
+        }
+        if let Some(HeapObject::Tuple(items)) = self.heap.get(class_info) {
+            let items = items.to_vec();
+            for item in items {
+                if self.is_subclass_reflective(candidate, item)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        let Some(HeapObject::Type(_)) = self.heap.get(class_info) else {
+            return Err(
+                "issubclass() arg 2 must be a class, a tuple of classes, or a union".to_owned(),
+            );
+        };
+        if let Some(method) = self.special_method(class_info, "__subclasscheck__")? {
+            let result = self
+                .with_temporary_roots(&[candidate, class_info, method], |context| {
+                    crate::call::invoke(context, method, &[candidate], &[])
+                })?;
+            return self.with_temporary_roots(&[candidate, class_info, result], |context| {
+                crate::operations::truthy(context, result)
+            });
+        }
+        self.is_subclass(candidate, class_info)
     }
 
     pub(crate) fn is_subclass(
@@ -824,6 +1454,7 @@ impl RimeraContext {
             if base != object
                 && base != type_metaclass
                 && base_type.flags & TYPE_FLAG_BUILTIN != 0
+                && base_type.flags & TYPE_FLAG_EXCEPTION == 0
                 && !matches!(
                     base_type.name.as_str(),
                     "list"
@@ -856,6 +1487,10 @@ impl RimeraContext {
             return Err("metaclass conflict: the metaclass of a derived class must be a (non-strict) subclass of the metaclasses of all its bases".to_owned());
         }
         let base_mro = self.compute_c3_mro(&effective_bases)?;
+        if self.namespace_value(namespace, "__module__").is_none() {
+            let module_name = crate::operations::string(self, "__main__")?;
+            self.namespace_set(namespace, "__module__", module_name)?;
+        }
         let (own_slots, declares_dictionary, declares_weakref) = self.class_slot_spec(namespace)?;
         let mut inherited_slots = Vec::new();
         let mut has_dictionary = false;
@@ -891,6 +1526,13 @@ impl RimeraContext {
             // equality without opting into a compatible hash implementation.
             self.namespace_set(namespace, "__hash__", RValue::NONE)?;
         }
+        let qualified_name = self
+            .namespace_value(namespace, "__qualname__")
+            .and_then(|value| match self.heap.get(value) {
+                Some(HeapObject::String(value)) => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| name.to_owned());
         let mut roots = effective_bases.clone();
         roots.extend([object, namespace, metaclass]);
         self.with_temporary_roots(&roots, |context| {
@@ -899,7 +1541,7 @@ impl RimeraContext {
             mro.extend(base_mro);
             let value = context.allocate(HeapObject::Type(TypeObject {
                 name: name.to_owned(),
-                qualified_name: format!("__main__.{name}"),
+                qualified_name: qualified_name.clone(),
                 metaclass,
                 bases: effective_bases.into_boxed_slice(),
                 mro: mro.into_boxed_slice(),
@@ -1315,36 +1957,126 @@ impl RimeraContext {
         function: RValue,
         bound: &[RValue],
     ) -> Result<RValue, String> {
-        let (resume_address, persistent_slot_count) = match self.heap.get(function) {
-            Some(HeapObject::Function(function)) => match function.kind {
-                FunctionKind::Generator {
-                    persistent_slot_count,
-                } => (function.code_address, persistent_slot_count),
-                FunctionKind::Normal => return Err("function is not a generator".to_owned()),
-            },
+        let (code, name, qualified_name) = match self.heap.get(function) {
+            Some(HeapObject::Function(function)) => (
+                function.code,
+                function.name.clone(),
+                function.qualified_name.clone(),
+            ),
             _ => return Err("function is not a generator".to_owned()),
         };
+        let (resume_address, persistent_slot_count, first_line, parameter_names) =
+            match self.heap.get(code) {
+                Some(HeapObject::Code(code)) => match code.kind {
+                    FunctionKind::Generator {
+                        persistent_slot_count,
+                    } => (
+                        code.code_address,
+                        persistent_slot_count,
+                        code.first_line,
+                        code.parameters
+                            .iter()
+                            .map(|parameter| parameter.name.clone())
+                            .collect::<Vec<_>>(),
+                    ),
+                    FunctionKind::Normal => return Err("function is not a generator".to_owned()),
+                },
+                _ => return Err("function has an invalid code object".to_owned()),
+            };
+        let globals = self
+            .globals()
+            .ok_or_else(|| "module globals are unavailable".to_owned())?;
         let mut slots = vec![None; persistent_slot_count.max(bound.len())];
         for (slot, value) in slots.iter_mut().zip(bound.iter().copied()) {
             *slot = Some(value);
         }
         let mut roots = bound.to_vec();
-        roots.push(function);
+        roots.extend([function, code, globals]);
         self.with_temporary_roots(&roots, |context| {
-            context.allocate(HeapObject::Generator(GeneratorObject {
-                function,
-                resume_address,
-                state: 0,
-                slots: slots.into_boxed_slice(),
-                delegate: None,
-                handled: Box::new([]),
-                started: false,
-                running: false,
-                closed: false,
-                completed: false,
-                return_value: None,
-            }))
+            let locals = context.allocate(HeapObject::Dictionary(DictionaryObject {
+                entries: Vec::new(),
+            }))?;
+            context.with_temporary_roots(&[locals], |context| {
+                for (name, value) in parameter_names.iter().zip(bound.iter().copied()) {
+                    context.direct_namespace_set(locals, name, value);
+                }
+                context.enforce_heap_limit()?;
+                let generator =
+                    context.allocate(HeapObject::Generator(Box::new(GeneratorObject {
+                        function,
+                        name,
+                        qualified_name,
+                        resume_address,
+                        state: 0,
+                        slots: slots.into_boxed_slice(),
+                        local_cells: Vec::new(),
+                        locals_snapshot: Some(locals),
+                        frame: None,
+                        delegate: None,
+                        handled: Box::new([]),
+                        raised: None,
+                        started: false,
+                        running: false,
+                        closed: false,
+                        completed: false,
+                        return_value: None,
+                    })))?;
+                context.with_temporary_roots(&[generator, locals], |context| {
+                    let frame = context.allocate(HeapObject::Frame(Box::new(FrameObject {
+                        code,
+                        globals,
+                        locals,
+                        back: None,
+                        line: first_line,
+                        generator: Some(generator),
+                    })))?;
+                    let Some(HeapObject::Generator(object)) = context.heap.get_mut(generator)
+                    else {
+                        return Err(
+                            "new generator disappeared while publishing its frame".to_owned()
+                        );
+                    };
+                    object.frame = Some(frame);
+                    Ok(generator)
+                })
+            })
         })
+    }
+
+    pub(crate) fn set_generator_frame_line(
+        &mut self,
+        generator: RValue,
+        line: u32,
+    ) -> Result<(), String> {
+        let frame = match self.heap.get(generator) {
+            Some(HeapObject::Generator(generator)) => generator.frame,
+            _ => return Err("object is not a generator".to_owned()),
+        };
+        if let Some(frame) = frame {
+            let Some(HeapObject::Frame(frame)) = self.heap.get_mut(frame) else {
+                return Err("generator frame is invalid".to_owned());
+            };
+            frame.line = line;
+        }
+        Ok(())
+    }
+
+    fn detach_generator_frame(&mut self, generator: RValue) -> Result<(), String> {
+        let frame = match self.heap.get(generator) {
+            Some(HeapObject::Generator(generator)) => generator.frame,
+            _ => return Err("object is not a generator".to_owned()),
+        };
+        if let Some(frame) = frame {
+            let Some(HeapObject::Frame(frame_object)) = self.heap.get_mut(frame) else {
+                return Err("generator frame is invalid".to_owned());
+            };
+            frame_object.generator = None;
+        }
+        let Some(HeapObject::Generator(generator_object)) = self.heap.get_mut(generator) else {
+            return Err("object is not a generator".to_owned());
+        };
+        generator_object.frame = None;
+        Ok(())
     }
 
     pub(crate) fn resume_generator(
@@ -1353,33 +2085,99 @@ impl RimeraContext {
         operation: RGeneratorOperation,
         input: RValue,
     ) -> Result<GeneratorResume, String> {
-        let (resume_address, started, running, closed, completed, saved_handled) =
-            match self.heap.get(generator) {
-                Some(HeapObject::Generator(generator)) => (
-                    generator.resume_address,
-                    generator.started,
-                    generator.running,
-                    generator.closed,
-                    generator.completed,
-                    generator.handled.to_vec(),
-                ),
-                _ => return Err("object is not a generator".to_owned()),
-            };
+        let (
+            function,
+            resume_address,
+            started,
+            running,
+            closed,
+            completed,
+            saved_handled,
+            saved_raised,
+        ) = match self.heap.get(generator) {
+            Some(HeapObject::Generator(generator)) => (
+                generator.function,
+                generator.resume_address,
+                generator.started,
+                generator.running,
+                generator.closed,
+                generator.completed,
+                generator.handled.to_vec(),
+                generator.raised,
+            ),
+            _ => return Err("object is not a generator".to_owned()),
+        };
         if running {
-            return Err("generator already executing".to_owned());
+            return self.raise_error("ValueError", "generator already executing");
         }
         if completed || closed {
+            if matches!(operation, RGeneratorOperation::Throw) {
+                self.raise_value(input, None, false)?;
+                return Err("generator raised an exception".to_owned());
+            }
             return Ok(GeneratorResume {
                 value: RValue::NONE,
                 outcome: RGeneratorOutcome::Returned,
             });
         }
         if !started && matches!(operation, RGeneratorOperation::Send) && input != RValue::NONE {
-            return Err("can't send non-None value to a just-started generator".to_owned());
+            return self.raise_error(
+                "TypeError",
+                "can't send non-None value to a just-started generator",
+            );
         }
+        if !started && matches!(operation, RGeneratorOperation::Close) {
+            self.detach_generator_frame(generator)?;
+            if let Some(HeapObject::Generator(object)) = self.heap.get_mut(generator) {
+                object.closed = true;
+                object.completed = true;
+                object.slots.fill(None);
+                object.local_cells.clear();
+                object.locals_snapshot = None;
+            }
+            return Ok(GeneratorResume {
+                value: RValue::NONE,
+                outcome: RGeneratorOutcome::Returned,
+            });
+        }
+        if !started && matches!(operation, RGeneratorOperation::Throw) {
+            self.detach_generator_frame(generator)?;
+            if let Some(HeapObject::Generator(object)) = self.heap.get_mut(generator) {
+                object.completed = true;
+                object.slots.fill(None);
+                object.local_cells.clear();
+                object.locals_snapshot = None;
+            }
+            self.raise_value(input, None, false)?;
+            return Err("generator raised an exception".to_owned());
+        }
+
+        let previous_raised = std::mem::replace(&mut self.raised, saved_raised);
+        let previous_exception = self.exception.take();
+        self.exception = self
+            .raised
+            .and_then(|exception| self.exception_message(exception));
+
+        let injected = match operation {
+            RGeneratorOperation::Throw => Some(input),
+            RGeneratorOperation::Close => {
+                Some(self.with_temporary_roots(&[generator], |context| {
+                    context.new_builtin_exception("GeneratorExit", &[])
+                })?)
+            }
+            RGeneratorOperation::Next | RGeneratorOperation::Send => None,
+        };
+        if let Some(injected) = injected {
+            self.with_temporary_roots(&[generator, injected], |context| {
+                context.raise_value(injected, None, false)
+            })?;
+        }
+
         let previous_handled = std::mem::replace(&mut self.handled, saved_handled);
         let Some(HeapObject::Generator(object)) = self.heap.get_mut(generator) else {
             self.handled = previous_handled;
+            self.raised = previous_raised;
+            self.exception = previous_exception;
             return Err("object is not a generator".to_owned());
         };
         object.running = true;
@@ -1389,6 +2187,7 @@ impl RimeraContext {
         // SAFETY: generator functions enter the heap only through the ABI
         // constructor, which validates the stable generator-resume signature.
         let resume: RNativeGeneratorResume = unsafe { std::mem::transmute(resume_address) };
+        self.push_active_generator_call(function, generator)?;
         let status = unsafe {
             resume(
                 std::ptr::from_mut(self).cast(),
@@ -1399,23 +2198,76 @@ impl RimeraContext {
                 &raw mut outcome,
             )
         };
+        let active_index = self.active_calls.len().saturating_sub(1);
+        self.refresh_locals_at(active_index)?;
+        self.pop_active_call();
         let saved_after = std::mem::replace(&mut self.handled, previous_handled);
+
+        let mut effective_status = status;
+        if status == RStatus::Exception
+            && matches!(operation, RGeneratorOperation::Close)
+            && self.exception_type_name(self.raised.unwrap_or(RValue::NONE))
+                == Some("GeneratorExit")
+        {
+            self.consume_exception_type("GeneratorExit");
+            effective_status = RStatus::Ok;
+            outcome = RGeneratorOutcome::Returned;
+            output = RValue::NONE;
+        } else if status == RStatus::Exception
+            && self.exception_type_name(self.raised.unwrap_or(RValue::NONE))
+                == Some("StopIteration")
+        {
+            let original = self.raised.expect("StopIteration was just observed");
+            self.with_temporary_roots(&[generator, original], |context| {
+                let message = crate::operations::string(context, "generator raised StopIteration")?;
+                let replacement = context.new_builtin_exception("RuntimeError", &[message])?;
+                let Some(HeapObject::Exception(object)) = context.heap.get_mut(replacement) else {
+                    return Err("replacement generator exception is invalid".to_owned());
+                };
+                object.cause = Some(original);
+                object.context = Some(original);
+                object.suppress_context = true;
+                context.raised = Some(replacement);
+                context.exception = Some("generator raised StopIteration".to_owned());
+                Ok(())
+            })?;
+        }
+
+        let suspended_raised = self.raised;
+        let terminal = effective_status == RStatus::Exception
+            || (effective_status == RStatus::Ok && outcome == RGeneratorOutcome::Returned);
         if let Some(HeapObject::Generator(object)) = self.heap.get_mut(generator) {
             object.running = false;
             object.handled = saved_after.into_boxed_slice();
-            if status == RStatus::Ok && outcome == RGeneratorOutcome::Returned {
+            object.raised = (effective_status == RStatus::Ok
+                && outcome == RGeneratorOutcome::Yielded)
+                .then_some(suspended_raised)
+                .flatten();
+            if effective_status == RStatus::Ok && outcome == RGeneratorOutcome::Returned {
                 object.completed = true;
+                object.closed |= matches!(operation, RGeneratorOperation::Close);
                 object.return_value = Some(output);
                 object.delegate = None;
                 object.slots.fill(None);
-            } else if status == RStatus::Exception {
+                object.local_cells.clear();
+                object.locals_snapshot = None;
+            } else if effective_status == RStatus::Exception {
                 object.completed = true;
                 object.return_value = None;
                 object.delegate = None;
                 object.slots.fill(None);
+                object.local_cells.clear();
+                object.locals_snapshot = None;
             }
         }
-        match status {
+        if terminal {
+            self.detach_generator_frame(generator)?;
+        }
+        if effective_status == RStatus::Ok {
+            self.raised = previous_raised;
+            self.exception = previous_exception;
+        }
+        match effective_status {
             RStatus::Ok => Ok(GeneratorResume {
                 value: output,
                 outcome,
@@ -1588,24 +2440,368 @@ impl RimeraContext {
             .ok_or_else(|| format!("name '{name}' is not defined"))
     }
 
+    /// Resolves a class-body free name. Python still consults the prepared
+    /// class namespace first, but a miss falls back to the enclosing cell
+    /// rather than globals/builtins.
+    pub(crate) fn class_free_get(
+        &mut self,
+        namespace: RValue,
+        cell: RValue,
+        name: &str,
+    ) -> Result<RValue, String> {
+        if let Some(value) = self.namespace_value(namespace, name) {
+            return Ok(value);
+        }
+        if !matches!(
+            self.heap.get(namespace),
+            Some(HeapObject::Dictionary(_) | HeapObject::ValueDictionary(_))
+        ) {
+            match self.namespace_get(namespace, name) {
+                Ok(value) => return Ok(value),
+                Err(error) if self.consume_exception_type("KeyError") => {}
+                Err(error) => return Err(error),
+            }
+        }
+        match self.heap.get(cell) {
+            Some(HeapObject::Cell(cell)) => cell.value.ok_or_else(|| {
+                format!(
+                    "cannot access free variable '{name}' where it is not associated with a value in enclosing scope"
+                )
+            }),
+            _ => Err("class free-name lookup received an invalid closure cell".to_owned()),
+        }
+    }
+
+    fn code_var_names(code: &CodeObject) -> Vec<String> {
+        let mut names = Vec::new();
+        for kind in [
+            rimera_abi::RParameterKind::PositionalOnly,
+            rimera_abi::RParameterKind::PositionalOrKeyword,
+            rimera_abi::RParameterKind::KeywordOnly,
+            rimera_abi::RParameterKind::VarArgs,
+            rimera_abi::RParameterKind::VarKeywords,
+        ] {
+            names.extend(
+                code.parameters
+                    .iter()
+                    .filter(|parameter| parameter.kind == kind)
+                    .map(|parameter| parameter.name.clone()),
+            );
+        }
+        for local in code.local_names.iter() {
+            if !names.contains(local) && !code.cell_names.contains(local) {
+                names.push(local.clone());
+            }
+        }
+        names
+    }
+
+    fn code_flags(code: &CodeObject) -> u32 {
+        if code.code_address == 0 {
+            return 0;
+        }
+        let mut flags = 0x01 | 0x02; // CO_OPTIMIZED | CO_NEWLOCALS
+        if code
+            .parameters
+            .iter()
+            .any(|parameter| parameter.kind == rimera_abi::RParameterKind::VarArgs)
+        {
+            flags |= 0x04;
+        }
+        if code
+            .parameters
+            .iter()
+            .any(|parameter| parameter.kind == rimera_abi::RParameterKind::VarKeywords)
+        {
+            flags |= 0x08;
+        }
+        if code.qualified_name.contains(".<locals>.") {
+            flags |= 0x10;
+        }
+        if matches!(code.kind, FunctionKind::Generator { .. }) {
+            flags |= 0x20;
+        }
+        flags
+    }
+
+    fn reflection_string_tuple(&mut self, names: &[String]) -> Result<RValue, String> {
+        let mut values = Vec::with_capacity(names.len());
+        for name in names {
+            let value = self.with_temporary_roots(&values, |context| {
+                crate::operations::string(context, name)
+            })?;
+            values.push(value);
+        }
+        self.with_temporary_roots(&values, |context| {
+            crate::operations::tuple(context, &values)
+        })
+    }
+
     pub(crate) fn attribute_get(&mut self, receiver: RValue, name: &str) -> Result<RValue, String> {
-        if matches!(self.heap.get(receiver), Some(HeapObject::Function(_))) {
-            if name != "__annotations__" {
-                return Err(format!("'function' object has no attribute '{name}'"));
+        if let Some(HeapObject::Module(module)) = self.heap.get(receiver) {
+            let namespace = module.namespace;
+            if name == "__dict__" {
+                return Ok(namespace);
             }
-            let existing = match self.heap.get(receiver) {
-                Some(HeapObject::Function(function)) => function.annotations,
-                _ => unreachable!("function receiver was checked"),
+            return self
+                .namespace_value(namespace, name)
+                .ok_or_else(|| format!("module '{}' has no attribute '{name}'", module.name));
+        }
+        if let Some(HeapObject::Function(function)) = self.heap.get(receiver) {
+            let function_name = function.name.clone();
+            let qualified_name = function.qualified_name.clone();
+            let code = function.code;
+            let closure = function.closure;
+            let defaults = function.defaults;
+            let keyword_defaults = function.keyword_defaults;
+            let annotations = function.annotations;
+            let type_params = function.type_params;
+            return match name {
+                "__name__" => crate::operations::string(self, &function_name),
+                "__qualname__" => crate::operations::string(self, &qualified_name),
+                "__code__" => Ok(code),
+                "__closure__" => Ok(closure.unwrap_or(RValue::NONE)),
+                "__defaults__" => Ok(defaults.unwrap_or(RValue::NONE)),
+                "__kwdefaults__" => Ok(keyword_defaults.unwrap_or(RValue::NONE)),
+                "__type_params__" => match type_params {
+                    Some(type_params) => Ok(type_params),
+                    None => self.allocate(HeapObject::Tuple(Box::new([]))),
+                },
+                "__annotations__" => {
+                    if let Some(annotations) = annotations {
+                        return Ok(annotations);
+                    }
+                    let annotations = crate::operations::dictionary(self, &[], &[])?;
+                    let Some(HeapObject::Function(function)) = self.heap.get_mut(receiver) else {
+                        return Err("function disappeared while creating annotations".to_owned());
+                    };
+                    function.annotations = Some(annotations);
+                    Ok(annotations)
+                }
+                _ => Err(format!("'function' object has no attribute '{name}'")),
             };
-            if let Some(annotations) = existing {
-                return Ok(annotations);
+        }
+        if let Some(HeapObject::TypeParameter(parameter)) = self.heap.get(receiver) {
+            let name_value = parameter.name.clone();
+            return match name {
+                "__name__" => crate::operations::string(self, &name_value),
+                "__bound__" => Ok(RValue::NONE),
+                "__constraints__" => self.allocate(HeapObject::Tuple(Box::new([]))),
+                _ => Err(format!(
+                    "'{}' object has no attribute '{name}'",
+                    match parameter.kind {
+                        rimera_abi::RTypeParameterKind::TypeVar => "TypeVar",
+                        rimera_abi::RTypeParameterKind::TypeVarTuple => "TypeVarTuple",
+                        rimera_abi::RTypeParameterKind::ParamSpec => "ParamSpec",
+                    }
+                )),
+            };
+        }
+        if let Some(HeapObject::TypeAlias(alias)) = self.heap.get(receiver) {
+            let alias = alias.clone();
+            return match name {
+                "__name__" => crate::operations::string(self, &alias.name),
+                "__type_params__" => Ok(alias.type_params),
+                "__value__" => Ok(alias.value),
+                _ => Err(format!("'TypeAliasType' object has no attribute '{name}'")),
+            };
+        }
+        if let Some(HeapObject::Code(code)) = self.heap.get(receiver) {
+            let code = code.clone();
+            return match name {
+                "co_name" => crate::operations::string(self, &code.name),
+                "co_qualname" => crate::operations::string(self, &code.qualified_name),
+                "co_filename" => crate::operations::string(self, &code.filename),
+                "co_firstlineno" => Ok(RValue::small_int(i64::from(code.first_line))),
+                "co_argcount" => Ok(RValue::small_int(
+                    code.parameters
+                        .iter()
+                        .filter(|parameter| {
+                            matches!(
+                                parameter.kind,
+                                rimera_abi::RParameterKind::PositionalOnly
+                                    | rimera_abi::RParameterKind::PositionalOrKeyword
+                            )
+                        })
+                        .count() as i64,
+                )),
+                "co_posonlyargcount" => Ok(RValue::small_int(
+                    code.parameters
+                        .iter()
+                        .filter(|parameter| {
+                            parameter.kind == rimera_abi::RParameterKind::PositionalOnly
+                        })
+                        .count() as i64,
+                )),
+                "co_kwonlyargcount" => Ok(RValue::small_int(
+                    code.parameters
+                        .iter()
+                        .filter(|parameter| {
+                            parameter.kind == rimera_abi::RParameterKind::KeywordOnly
+                        })
+                        .count() as i64,
+                )),
+                "co_nlocals" => Ok(RValue::small_int(Self::code_var_names(&code).len() as i64)),
+                "co_varnames" => self.reflection_string_tuple(&Self::code_var_names(&code)),
+                "co_cellvars" => self.reflection_string_tuple(&code.cell_names),
+                "co_freevars" => self.reflection_string_tuple(&code.free_names),
+                "co_flags" => Ok(RValue::small_int(i64::from(Self::code_flags(&code)))),
+                _ => Err(format!("'code' object has no attribute '{name}'")),
+            };
+        }
+        if let Some(HeapObject::Cell(cell)) = self.heap.get(receiver) {
+            return match name {
+                "cell_contents" => cell
+                    .value
+                    .ok_or_else(|| "Cell is empty".to_owned())
+                    .or_else(|message| self.raise_error("ValueError", message)),
+                _ => Err(format!("'cell' object has no attribute '{name}'")),
+            };
+        }
+        if let Some(HeapObject::Exception(exception)) = self.heap.get(receiver) {
+            let exception_type = exception.exception_type;
+            let arguments = exception.arguments;
+            let dictionary = exception.dictionary;
+            let traceback = exception.traceback;
+            let cause = exception.cause;
+            let context_value = exception.context;
+            let suppress_context = exception.suppress_context;
+            match name {
+                "args" => return Ok(arguments),
+                "value" if self.type_name(exception_type) == "StopIteration" => {
+                    let value = match self.heap.get(arguments) {
+                        Some(HeapObject::Tuple(arguments)) => {
+                            arguments.first().copied().unwrap_or(RValue::NONE)
+                        }
+                        _ => RValue::NONE,
+                    };
+                    return Ok(value);
+                }
+                "__traceback__" => return Ok(traceback.unwrap_or(RValue::NONE)),
+                "__cause__" => return Ok(cause.unwrap_or(RValue::NONE)),
+                "__context__" => return Ok(context_value.unwrap_or(RValue::NONE)),
+                "__suppress_context__" => return Ok(RValue::boolean(suppress_context)),
+                "with_traceback" => {
+                    return self.bound_builtin_method(
+                        receiver,
+                        "BaseException.with_traceback",
+                        BuiltinFunctionKind::ExceptionWithTraceback,
+                    );
+                }
+                "__dict__" => return self.exception_dictionary(receiver),
+                _ => {}
             }
-            let annotations = crate::operations::dictionary(self, &[], &[])?;
-            let Some(HeapObject::Function(function)) = self.heap.get_mut(receiver) else {
-                return Err("function disappeared while creating annotations".to_owned());
+            if let Some((_, descriptor)) = self.class_attribute_with_owner(exception_type, name)
+                && self.descriptor_is_data(descriptor)?
+            {
+                return self.descriptor_get(descriptor, Some(receiver), exception_type);
+            }
+            if let Some(dictionary) = dictionary
+                && let Some(value) = self.namespace_value(dictionary, name)
+            {
+                return Ok(value);
+            }
+            if let Some(value) = self.class_attribute(exception_type, name) {
+                return self.descriptor_get(value, Some(receiver), exception_type);
+            }
+            return Err(format!(
+                "'{}' object has no attribute '{name}'",
+                self.type_name(exception_type)
+            ));
+        }
+        if let Some(HeapObject::Generator(generator)) = self.heap.get(receiver) {
+            let function = generator.function;
+            let generator_name = generator.name.clone();
+            let qualified_name = generator.qualified_name.clone();
+            let frame = generator.frame;
+            let running = generator.running;
+            let suspended = generator.started
+                && !generator.running
+                && !generator.completed
+                && !generator.closed;
+            let delegate = generator.delegate;
+            let code = match self.heap.get(function) {
+                Some(HeapObject::Function(function)) => Some(function.code),
+                _ => None,
             };
-            function.annotations = Some(annotations);
-            return Ok(annotations);
+            return match name {
+                "__name__" => crate::operations::string(self, &generator_name),
+                "__qualname__" => crate::operations::string(self, &qualified_name),
+                "gi_code" => code.ok_or_else(|| "generator function has no code object".to_owned()),
+                "gi_frame" => Ok(frame.unwrap_or(RValue::NONE)),
+                "gi_running" => Ok(RValue::boolean(running)),
+                "gi_suspended" => Ok(RValue::boolean(suspended)),
+                "gi_yieldfrom" => Ok(delegate.unwrap_or(RValue::NONE)),
+                "__iter__" => self.bound_builtin_method(
+                    receiver,
+                    "generator.__iter__",
+                    BuiltinFunctionKind::GeneratorIter,
+                ),
+                "__next__" => self.bound_builtin_method(
+                    receiver,
+                    "generator.__next__",
+                    BuiltinFunctionKind::GeneratorNext,
+                ),
+                "send" => self.bound_builtin_method(
+                    receiver,
+                    "generator.send",
+                    BuiltinFunctionKind::GeneratorSend,
+                ),
+                "throw" => self.bound_builtin_method(
+                    receiver,
+                    "generator.throw",
+                    BuiltinFunctionKind::GeneratorThrow,
+                ),
+                "close" => self.bound_builtin_method(
+                    receiver,
+                    "generator.close",
+                    BuiltinFunctionKind::GeneratorClose,
+                ),
+                _ => Err(format!("'generator' object has no attribute '{name}'")),
+            };
+        }
+        if let Some(HeapObject::Traceback(traceback)) = self.heap.get(receiver) {
+            let line = traceback.line;
+            let frame = traceback.frame;
+            let next = traceback.next;
+            return match name {
+                "tb_frame" => Ok(frame.unwrap_or(RValue::NONE)),
+                "tb_lineno" => crate::operations::store_integer(self, line.into()),
+                "tb_next" => Ok(next.unwrap_or(RValue::NONE)),
+                _ => Err(format!("'traceback' object has no attribute '{name}'")),
+            };
+        }
+        if let Some(HeapObject::Frame(frame)) = self.heap.get(receiver) {
+            let code = frame.code;
+            let globals = frame.globals;
+            let locals = frame.locals;
+            let back = frame.back;
+            let line = frame.line;
+            let generator = frame.generator;
+            if name == "f_locals"
+                && let Some(generator) = generator
+                && let Some(index) = self
+                    .active_calls
+                    .iter()
+                    .position(|active| active.generator == Some(generator))
+            {
+                let refreshed = self.refresh_locals_at(index)?;
+                if refreshed != locals {
+                    let Some(HeapObject::Frame(frame)) = self.heap.get_mut(receiver) else {
+                        return Err("frame disappeared while refreshing locals".to_owned());
+                    };
+                    frame.locals = refreshed;
+                    return Ok(refreshed);
+                }
+            }
+            return match name {
+                "f_code" => Ok(code),
+                "f_globals" => Ok(globals),
+                "f_locals" => Ok(locals),
+                "f_back" => Ok(back.unwrap_or(RValue::NONE)),
+                "f_lineno" => crate::operations::store_integer(self, line.into()),
+                _ => Err(format!("'frame' object has no attribute '{name}'")),
+            };
         }
         match self.heap.get(receiver) {
             Some(HeapObject::Float(_)) => match name {
@@ -1989,15 +3185,46 @@ impl RimeraContext {
                 if let Some(hook) = self.class_attribute(class, "__getattribute__") {
                     let callable = self.descriptor_get(hook, Some(receiver), class)?;
                     let name_value = crate::operations::string(self, name)?;
-                    return self
+                    let result = self
                         .with_temporary_roots(&[receiver, callable, name_value], |context| {
                             crate::call::invoke(context, callable, &[name_value], &[])
                         });
+                    match result {
+                        Ok(value) => return Ok(value),
+                        Err(error)
+                            if self.raised.is_some_and(|raised| {
+                                self.exception_type_name(raised) == Some("AttributeError")
+                            }) =>
+                        {
+                            let original_raised = self.raised.take();
+                            let original_message = self.exception.take();
+                            if let Some(fallback) = self.class_attribute(class, "__getattr__") {
+                                let callable =
+                                    self.descriptor_get(fallback, Some(receiver), class)?;
+                                let name_value = crate::operations::string(self, name)?;
+                                return self.with_temporary_roots(
+                                    &[receiver, callable, name_value],
+                                    |context| {
+                                        crate::call::invoke(context, callable, &[name_value], &[])
+                                    },
+                                );
+                            }
+                            self.raised = original_raised;
+                            self.exception = original_message;
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 if let Some((_, descriptor)) = self.class_attribute_with_owner(class, name)
                     && self.descriptor_is_data(descriptor)?
                 {
                     return self.descriptor_get(descriptor, Some(receiver), class);
+                }
+                if name == "__dict__"
+                    && let Some(dictionary) = dictionary
+                {
+                    return Ok(dictionary);
                 }
                 if let Some(dictionary) = dictionary
                     && let Some(value) = self.namespace_value(dictionary, name)
@@ -2032,6 +3259,40 @@ impl RimeraContext {
                 let qualified_name = class.qualified_name.clone();
                 let bases = class.bases.to_vec();
                 let metaclass = class.metaclass;
+                if let Some(hook) = self.class_attribute(metaclass, "__getattribute__") {
+                    let callable = self.descriptor_get(hook, Some(receiver), metaclass)?;
+                    let name_value = crate::operations::string(self, name)?;
+                    let result = self
+                        .with_temporary_roots(&[receiver, callable, name_value], |context| {
+                            crate::call::invoke(context, callable, &[name_value], &[])
+                        });
+                    match result {
+                        Ok(value) => return Ok(value),
+                        Err(error)
+                            if self.raised.is_some_and(|raised| {
+                                self.exception_type_name(raised) == Some("AttributeError")
+                            }) =>
+                        {
+                            let original_raised = self.raised.take();
+                            let original_message = self.exception.take();
+                            if let Some(fallback) = self.class_attribute(metaclass, "__getattr__") {
+                                let callable =
+                                    self.descriptor_get(fallback, Some(receiver), metaclass)?;
+                                let name_value = crate::operations::string(self, name)?;
+                                return self.with_temporary_roots(
+                                    &[receiver, callable, name_value],
+                                    |context| {
+                                        crate::call::invoke(context, callable, &[name_value], &[])
+                                    },
+                                );
+                            }
+                            self.raised = original_raised;
+                            self.exception = original_message;
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
                 if let Some((_, descriptor)) = self.class_attribute_with_owner(metaclass, name)
                     && self.descriptor_is_data(descriptor)?
                 {
@@ -2048,8 +3309,41 @@ impl RimeraContext {
                         context.allocate(HeapObject::Tuple(bases.clone().into_boxed_slice()))
                     });
                 }
+                if name == "__mro__" {
+                    let mro = match self.heap.get(receiver) {
+                        Some(HeapObject::Type(class)) => class.mro.to_vec(),
+                        _ => unreachable!("type receiver was checked"),
+                    };
+                    return self.with_temporary_roots(&mro, |context| {
+                        context.allocate(HeapObject::Tuple(mro.clone().into_boxed_slice()))
+                    });
+                }
+                if name == "__dict__" {
+                    let namespace = match self.heap.get(receiver) {
+                        Some(HeapObject::Type(class)) => class.namespace,
+                        _ => unreachable!("type receiver was checked"),
+                    };
+                    return self.with_temporary_roots(&[namespace], |context| {
+                        context.allocate(HeapObject::MappingProxy(
+                            crate::object::MappingProxyObject {
+                                dictionary: namespace,
+                            },
+                        ))
+                    });
+                }
                 let value = if let Some(value) = self.class_attribute(receiver, name) {
                     value
+                } else if name == "fromhex"
+                    && self.builtin_type("float").is_some_and(|float_type| {
+                        self.is_subclass(receiver, float_type).unwrap_or(false)
+                    })
+                {
+                    let function =
+                        self.allocate(HeapObject::BuiltinFunction(BuiltinFunctionObject {
+                            name: "float.fromhex".to_owned(),
+                            kind: BuiltinFunctionKind::FloatFromHex,
+                        }))?;
+                    return self.bind_method(function, receiver);
                 } else if name == "__prepare__" {
                     let function =
                         self.allocate(HeapObject::BuiltinFunction(BuiltinFunctionObject {
@@ -2060,6 +3354,14 @@ impl RimeraContext {
                 } else if let Some(value) = self.class_attribute(metaclass, name) {
                     return self.descriptor_get(value, Some(receiver), metaclass);
                 } else {
+                    if let Some(fallback) = self.class_attribute(metaclass, "__getattr__") {
+                        let callable = self.descriptor_get(fallback, Some(receiver), metaclass)?;
+                        let name_value = crate::operations::string(self, name)?;
+                        return self
+                            .with_temporary_roots(&[receiver, callable, name_value], |context| {
+                                crate::call::invoke(context, callable, &[name_value], &[])
+                            });
+                    }
                     return Err(format!(
                         "type object '{class_name}' has no attribute '{name}'"
                     ));
@@ -2074,6 +3376,22 @@ impl RimeraContext {
                 Err(format!("'{type_name}' object has no attribute '{name}'"))
             }
         }
+    }
+
+    fn exception_dictionary(&mut self, receiver: RValue) -> Result<RValue, String> {
+        if let Some(HeapObject::Exception(exception)) = self.heap.get(receiver)
+            && let Some(dictionary) = exception.dictionary
+        {
+            return Ok(dictionary);
+        }
+        let dictionary = self.with_temporary_roots(&[receiver], |context| {
+            crate::operations::dictionary(context, &[], &[])
+        })?;
+        let Some(HeapObject::Exception(exception)) = self.heap.get_mut(receiver) else {
+            return Err("exception disappeared while creating __dict__".to_owned());
+        };
+        exception.dictionary = Some(dictionary);
+        Ok(dictionary)
     }
 
     fn bound_builtin_method(
@@ -2180,23 +3498,326 @@ impl RimeraContext {
         name: &str,
         value: RValue,
     ) -> Result<(), String> {
-        if matches!(self.heap.get(receiver), Some(HeapObject::Function(_))) {
-            if name != "__annotations__" {
-                return Err(format!("'function' object has no attribute '{name}'"));
+        if let Some(HeapObject::Module(module)) = self.heap.get(receiver) {
+            let namespace = module.namespace;
+            if name == "__dict__" {
+                return self.raise_error("AttributeError", "readonly attribute");
             }
-            let annotations = if value == RValue::NONE {
-                None
-            } else if matches!(self.heap.get(value), Some(HeapObject::ValueDictionary(_))) {
-                Some(value)
-            } else {
-                return self
-                    .raise_error("TypeError", "__annotations__ must be set to a dict object");
+            return self.namespace_set(namespace, name, value);
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Function(_))) {
+            enum FunctionAttributeUpdate {
+                Name(String),
+                QualifiedName(String),
+                Code(RValue),
+                Defaults(Option<RValue>),
+                KeywordDefaults(Option<RValue>),
+                Annotations(Option<RValue>),
+                TypeParameters(RValue),
+            }
+            let (function_name, closure_count) = match self.heap.get(receiver) {
+                Some(HeapObject::Function(function)) => {
+                    let count = function
+                        .closure
+                        .and_then(|closure| match self.heap.get(closure) {
+                            Some(HeapObject::Tuple(values)) => Some(values.len()),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    (function.name.clone(), count)
+                }
+                _ => unreachable!("function receiver was checked"),
+            };
+            let update = match name {
+                "__name__" => match self.heap.get(value) {
+                    Some(HeapObject::String(value)) => FunctionAttributeUpdate::Name(value.clone()),
+                    _ => {
+                        return self
+                            .raise_error("TypeError", "__name__ must be set to a string object");
+                    }
+                },
+                "__qualname__" => match self.heap.get(value) {
+                    Some(HeapObject::String(value)) => {
+                        FunctionAttributeUpdate::QualifiedName(value.clone())
+                    }
+                    _ => {
+                        return self.raise_error(
+                            "TypeError",
+                            "__qualname__ must be set to a string object",
+                        );
+                    }
+                },
+                "__code__" => {
+                    let free_count = match self.heap.get(value) {
+                        Some(HeapObject::Code(code)) if code.code_address != 0 => {
+                            code.free_names.len()
+                        }
+                        _ => {
+                            return self
+                                .raise_error("TypeError", "__code__ must be set to a code object");
+                        }
+                    };
+                    if closure_count != free_count {
+                        return self.raise_error(
+                            "ValueError",
+                            format!(
+                                "{}() requires a code object with {} free vars, not {}",
+                                function_name, closure_count, free_count
+                            ),
+                        );
+                    }
+                    FunctionAttributeUpdate::Code(value)
+                }
+                "__closure__" => {
+                    return self.raise_error("AttributeError", "readonly attribute");
+                }
+                "__defaults__" => {
+                    let defaults = if value == RValue::NONE {
+                        None
+                    } else if matches!(self.heap.get(value), Some(HeapObject::Tuple(_))) {
+                        Some(value)
+                    } else {
+                        return self.raise_error(
+                            "TypeError",
+                            "__defaults__ must be set to a tuple object",
+                        );
+                    };
+                    FunctionAttributeUpdate::Defaults(defaults)
+                }
+                "__kwdefaults__" => {
+                    let defaults = if value == RValue::NONE {
+                        None
+                    } else if matches!(self.heap.get(value), Some(HeapObject::ValueDictionary(_))) {
+                        Some(value)
+                    } else {
+                        return self.raise_error(
+                            "TypeError",
+                            "__kwdefaults__ must be set to a dict object",
+                        );
+                    };
+                    FunctionAttributeUpdate::KeywordDefaults(defaults)
+                }
+                "__type_params__" => {
+                    if !matches!(self.heap.get(value), Some(HeapObject::Tuple(_))) {
+                        return self
+                            .raise_error("TypeError", "__type_params__ must be set to a tuple");
+                    }
+                    FunctionAttributeUpdate::TypeParameters(value)
+                }
+                "__annotations__" => {
+                    let annotations = if value == RValue::NONE {
+                        None
+                    } else if matches!(self.heap.get(value), Some(HeapObject::ValueDictionary(_))) {
+                        Some(value)
+                    } else {
+                        return self.raise_error(
+                            "TypeError",
+                            "__annotations__ must be set to a dict object",
+                        );
+                    };
+                    FunctionAttributeUpdate::Annotations(annotations)
+                }
+                _ => return Err(format!("'function' object has no attribute '{name}'")),
             };
             let Some(HeapObject::Function(function)) = self.heap.get_mut(receiver) else {
-                return Err("function disappeared while setting annotations".to_owned());
+                return Err("function disappeared while setting metadata".to_owned());
             };
-            function.annotations = annotations;
+            match update {
+                FunctionAttributeUpdate::Name(value) => function.name = value,
+                FunctionAttributeUpdate::QualifiedName(value) => function.qualified_name = value,
+                FunctionAttributeUpdate::Code(value) => function.code = value,
+                FunctionAttributeUpdate::Defaults(value) => function.defaults = value,
+                FunctionAttributeUpdate::KeywordDefaults(value) => {
+                    function.keyword_defaults = value
+                }
+                FunctionAttributeUpdate::Annotations(value) => function.annotations = value,
+                FunctionAttributeUpdate::TypeParameters(value) => {
+                    function.type_params = Some(value)
+                }
+            }
             return Ok(());
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Code(_))) {
+            return self.raise_error("AttributeError", "readonly attribute");
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Frame(_))) {
+            return self.raise_error("AttributeError", "readonly attribute");
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Generator(_))) {
+            match name {
+                "__name__" | "__qualname__" => {
+                    let text = match self.heap.get(value) {
+                        Some(HeapObject::String(value)) => value.clone(),
+                        _ => {
+                            return self.raise_error(
+                                "TypeError",
+                                if name == "__name__" {
+                                    "__name__ must be set to a string object"
+                                } else {
+                                    "__qualname__ must be set to a string object"
+                                },
+                            );
+                        }
+                    };
+                    let Some(HeapObject::Generator(generator)) = self.heap.get_mut(receiver) else {
+                        unreachable!("generator receiver was checked");
+                    };
+                    if name == "__name__" {
+                        generator.name = text;
+                    } else {
+                        generator.qualified_name = text;
+                    }
+                    return Ok(());
+                }
+                "gi_code" | "gi_frame" | "gi_running" | "gi_suspended" | "gi_yieldfrom" => {
+                    return self.raise_error(
+                        "AttributeError",
+                        format!("attribute '{name}' of 'generator' objects is not writable"),
+                    );
+                }
+                _ => return Err(format!("'generator' object has no attribute '{name}'")),
+            }
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Cell(_))) {
+            if name != "cell_contents" {
+                return Err(format!("'cell' object has no attribute '{name}'"));
+            }
+            let Some(HeapObject::Cell(cell)) = self.heap.get_mut(receiver) else {
+                unreachable!("cell receiver was checked");
+            };
+            cell.value = Some(value);
+            return Ok(());
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Traceback(_))) {
+            match name {
+                "tb_frame" => {
+                    return self.raise_error(
+                        "AttributeError",
+                        "attribute 'tb_frame' of 'traceback' objects is not writable",
+                    );
+                }
+                "tb_lineno" => {
+                    return self.raise_error(
+                        "AttributeError",
+                        "attribute 'tb_lineno' of 'traceback' objects is not writable",
+                    );
+                }
+                "tb_next" => {
+                    if value != RValue::NONE
+                        && !matches!(self.heap.get(value), Some(HeapObject::Traceback(_)))
+                    {
+                        return self
+                            .raise_error("TypeError", "tb_next must be a traceback or None");
+                    }
+                    let Some(HeapObject::Traceback(traceback)) = self.heap.get_mut(receiver) else {
+                        unreachable!("traceback receiver was checked");
+                    };
+                    traceback.next = (value != RValue::NONE).then_some(value);
+                    return Ok(());
+                }
+                _ => {
+                    return Err(format!("'traceback' object has no attribute '{name}'"));
+                }
+            }
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Exception(_))) {
+            match name {
+                "args" => {
+                    let values = match crate::operations::collect_iterable(self, value) {
+                        Ok(values) => values,
+                        Err(error) if self.raised.is_some() => return Err(error),
+                        Err(error) => return self.raise_error("TypeError", error),
+                    };
+                    let arguments = self.with_temporary_roots(
+                        &values
+                            .iter()
+                            .copied()
+                            .chain([receiver, value])
+                            .collect::<Vec<_>>(),
+                        |context| crate::operations::tuple(context, &values),
+                    )?;
+                    let Some(HeapObject::Exception(exception)) = self.heap.get_mut(receiver) else {
+                        unreachable!("exception receiver was checked");
+                    };
+                    exception.arguments = arguments;
+                    return Ok(());
+                }
+                "__traceback__" => {
+                    if value != RValue::NONE
+                        && !matches!(self.heap.get(value), Some(HeapObject::Traceback(_)))
+                    {
+                        return self
+                            .raise_error("TypeError", "__traceback__ must be a traceback or None");
+                    }
+                    let Some(HeapObject::Exception(exception)) = self.heap.get_mut(receiver) else {
+                        unreachable!("exception receiver was checked");
+                    };
+                    exception.traceback = (value != RValue::NONE).then_some(value);
+                    return Ok(());
+                }
+                "__cause__" | "__context__" => {
+                    if value != RValue::NONE
+                        && !matches!(self.heap.get(value), Some(HeapObject::Exception(_)))
+                    {
+                        return self.raise_error(
+                            "TypeError",
+                            if name == "__cause__" {
+                                "exception cause must be None or derive from BaseException"
+                            } else {
+                                "exception context must be None or derive from BaseException"
+                            },
+                        );
+                    }
+                    let Some(HeapObject::Exception(exception)) = self.heap.get_mut(receiver) else {
+                        unreachable!("exception receiver was checked");
+                    };
+                    let metadata = (value != RValue::NONE).then_some(value);
+                    if name == "__cause__" {
+                        exception.cause = metadata;
+                        exception.suppress_context = true;
+                    } else {
+                        exception.context = metadata;
+                    }
+                    return Ok(());
+                }
+                "__suppress_context__" => {
+                    let suppress = if value == RValue::boolean(true) {
+                        true
+                    } else if value == RValue::boolean(false) {
+                        false
+                    } else {
+                        return self.raise_error("TypeError", "attribute value type must be bool");
+                    };
+                    let Some(HeapObject::Exception(exception)) = self.heap.get_mut(receiver) else {
+                        unreachable!("exception receiver was checked");
+                    };
+                    exception.suppress_context = suppress;
+                    return Ok(());
+                }
+                "__dict__" => {
+                    if !matches!(self.heap.get(value), Some(HeapObject::ValueDictionary(_))) {
+                        return self
+                            .raise_error("TypeError", "__dict__ must be set to a dictionary");
+                    }
+                    let Some(HeapObject::Exception(exception)) = self.heap.get_mut(receiver) else {
+                        unreachable!("exception receiver was checked");
+                    };
+                    exception.dictionary = Some(value);
+                    return Ok(());
+                }
+                _ => {}
+            }
+            let class = match self.heap.get(receiver) {
+                Some(HeapObject::Exception(exception)) => exception.exception_type,
+                _ => unreachable!("exception receiver was checked"),
+            };
+            if let Some((_, descriptor)) = self.class_attribute_with_owner(class, name)
+                && self.descriptor_is_data(descriptor)?
+            {
+                return self.descriptor_set(descriptor, receiver, value);
+            }
+            let dictionary = self.exception_dictionary(receiver)?;
+            return self.namespace_set(dictionary, name, value);
         }
         let (namespace, class_receiver, class) = match self.heap.get(receiver) {
             Some(HeapObject::Instance(instance)) => (instance.dictionary, false, instance.class),
@@ -2209,6 +3830,23 @@ impl RimeraContext {
                 return Err(format!("'{type_name}' object has no attribute '{name}'"));
             }
         };
+        if class_receiver {
+            let metaclass = match self.heap.get(receiver) {
+                Some(HeapObject::Type(class)) => class.metaclass,
+                _ => unreachable!("class receiver was checked"),
+            };
+            if let Some(hook) = self.class_attribute(metaclass, "__setattr__") {
+                let callable = self.descriptor_get(hook, Some(receiver), metaclass)?;
+                let name_value = crate::operations::string(self, name)?;
+                return self.with_temporary_roots(
+                    &[receiver, callable, name_value, value],
+                    |context| {
+                        crate::call::invoke(context, callable, &[name_value, value], &[])
+                            .map(|_| ())
+                    },
+                );
+            }
+        }
         if !class_receiver && let Some(hook) = self.class_attribute(class, "__setattr__") {
             let callable = self.descriptor_get(hook, Some(receiver), class)?;
             let name_value = crate::operations::string(self, name)?;
@@ -2217,6 +3855,41 @@ impl RimeraContext {
                 |context| {
                     crate::call::invoke(context, callable, &[name_value, value], &[]).map(|_| ())
                 },
+            );
+        }
+        if class_receiver && matches!(name, "__name__" | "__qualname__") {
+            let class_name = match self.heap.get(receiver) {
+                Some(HeapObject::Type(class)) => class.name.clone(),
+                _ => unreachable!("class receiver was checked"),
+            };
+            let text = match self.heap.get(value) {
+                Some(HeapObject::String(text)) => text.clone(),
+                _ => {
+                    let value_type = self.type_of(value)?;
+                    let value_type_name = self.type_name(value_type);
+                    return self.raise_error(
+                        "TypeError",
+                        format!(
+                            "can only assign string to {class_name}.{name}, not '{value_type_name}'"
+                        ),
+                    );
+                }
+            };
+            let Some(HeapObject::Type(class)) = self.heap.get_mut(receiver) else {
+                unreachable!("class receiver was checked");
+            };
+            if name == "__name__" {
+                class.name = text;
+            } else {
+                class.qualified_name = text;
+            }
+            self.bump_type_version(receiver);
+            return Ok(());
+        }
+        if class_receiver && name == "__mro__" {
+            return self.raise_error(
+                "AttributeError",
+                "attribute '__mro__' of 'type' objects is not writable",
             );
         }
         if class_receiver && name == "__bases__" {
@@ -2242,15 +3915,113 @@ impl RimeraContext {
     }
 
     pub(crate) fn attribute_delete(&mut self, receiver: RValue, name: &str) -> Result<(), String> {
+        if let Some(HeapObject::Module(module)) = self.heap.get(receiver) {
+            let namespace = module.namespace;
+            if name == "__dict__" {
+                return self.raise_error("AttributeError", "readonly attribute");
+            }
+            return self.namespace_delete(namespace, name);
+        }
         if matches!(self.heap.get(receiver), Some(HeapObject::Function(_))) {
-            if name != "__annotations__" {
-                return Err(format!("'function' object has no attribute '{name}'"));
+            if name == "__closure__" {
+                return self.raise_error("AttributeError", "readonly attribute");
+            }
+            if name == "__code__" {
+                return self.raise_error("TypeError", "__code__ must be set to a code object");
+            }
+            if matches!(name, "__name__" | "__qualname__") {
+                return self.raise_error(
+                    "TypeError",
+                    if name == "__name__" {
+                        "__name__ must be set to a string object"
+                    } else {
+                        "__qualname__ must be set to a string object"
+                    },
+                );
             }
             let Some(HeapObject::Function(function)) = self.heap.get_mut(receiver) else {
-                return Err("function disappeared while deleting annotations".to_owned());
+                return Err("function disappeared while deleting metadata".to_owned());
             };
-            function.annotations = None;
+            match name {
+                "__defaults__" => function.defaults = None,
+                "__kwdefaults__" => function.keyword_defaults = None,
+                "__annotations__" => function.annotations = None,
+                "__type_params__" => {
+                    return self.raise_error("TypeError", "__type_params__ must be set to a tuple");
+                }
+                _ => return Err(format!("'function' object has no attribute '{name}'")),
+            }
             return Ok(());
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Code(_))) {
+            return self.raise_error("AttributeError", "readonly attribute");
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Frame(_))) {
+            return self.raise_error("AttributeError", "readonly attribute");
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Generator(_))) {
+            if matches!(name, "__name__" | "__qualname__") {
+                return self.raise_error(
+                    "TypeError",
+                    if name == "__name__" {
+                        "__name__ must be set to a string object"
+                    } else {
+                        "__qualname__ must be set to a string object"
+                    },
+                );
+            }
+            if matches!(
+                name,
+                "gi_code" | "gi_frame" | "gi_running" | "gi_suspended" | "gi_yieldfrom"
+            ) {
+                return self.raise_error(
+                    "AttributeError",
+                    format!("attribute '{name}' of 'generator' objects is not writable"),
+                );
+            }
+            return Err(format!("'generator' object has no attribute '{name}'"));
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Cell(_))) {
+            if name != "cell_contents" {
+                return Err(format!("'cell' object has no attribute '{name}'"));
+            }
+            let Some(HeapObject::Cell(cell)) = self.heap.get_mut(receiver) else {
+                unreachable!("cell receiver was checked");
+            };
+            cell.value = None;
+            return Ok(());
+        }
+        if matches!(self.heap.get(receiver), Some(HeapObject::Exception(_))) {
+            let protected = match name {
+                "args" => Some("args may not be deleted"),
+                "__traceback__" => Some("__traceback__ may not be deleted"),
+                "__cause__" => Some("__cause__ may not be deleted"),
+                "__context__" => Some("__context__ may not be deleted"),
+                "__suppress_context__" => Some("can't delete numeric/char attribute"),
+                "__dict__" => Some("cannot delete __dict__"),
+                _ => None,
+            };
+            if let Some(message) = protected {
+                return self.raise_error("TypeError", message);
+            }
+            let (class, dictionary) = match self.heap.get(receiver) {
+                Some(HeapObject::Exception(exception)) => {
+                    (exception.exception_type, exception.dictionary)
+                }
+                _ => unreachable!("exception receiver was checked"),
+            };
+            if let Some((_, descriptor)) = self.class_attribute_with_owner(class, name)
+                && self.descriptor_is_data(descriptor)?
+            {
+                return self.descriptor_delete(descriptor, receiver);
+            }
+            if let Some(dictionary) = dictionary {
+                return self.namespace_delete(dictionary, name);
+            }
+            return Err(format!(
+                "'{}' object has no attribute '{name}'",
+                self.type_name(class)
+            ));
         }
         let (namespace, label, class_receiver, class) = match self.heap.get(receiver) {
             Some(HeapObject::Instance(instance)) => (
@@ -2273,12 +4044,41 @@ impl RimeraContext {
                 return Err(format!("'{type_name}' object has no attribute '{name}'"));
             }
         };
+        if class_receiver {
+            let metaclass = match self.heap.get(receiver) {
+                Some(HeapObject::Type(class)) => class.metaclass,
+                _ => unreachable!("class receiver was checked"),
+            };
+            if let Some(hook) = self.class_attribute(metaclass, "__delattr__") {
+                let callable = self.descriptor_get(hook, Some(receiver), metaclass)?;
+                let name_value = crate::operations::string(self, name)?;
+                return self.with_temporary_roots(&[receiver, callable, name_value], |context| {
+                    crate::call::invoke(context, callable, &[name_value], &[]).map(|_| ())
+                });
+            }
+        }
         if !class_receiver && let Some(hook) = self.class_attribute(class, "__delattr__") {
             let callable = self.descriptor_get(hook, Some(receiver), class)?;
             let name_value = crate::operations::string(self, name)?;
             return self.with_temporary_roots(&[receiver, callable, name_value], |context| {
                 crate::call::invoke(context, callable, &[name_value], &[]).map(|_| ())
             });
+        }
+        if class_receiver && name == "__mro__" {
+            return self.raise_error(
+                "AttributeError",
+                "attribute '__mro__' of 'type' objects is not writable",
+            );
+        }
+        if class_receiver && matches!(name, "__name__" | "__qualname__" | "__module__") {
+            let class_name = match self.heap.get(receiver) {
+                Some(HeapObject::Type(class)) => class.name.clone(),
+                _ => unreachable!("class receiver was checked"),
+            };
+            return self.raise_error(
+                "TypeError",
+                format!("cannot delete '{name}' attribute of immutable type '{class_name}'"),
+            );
         }
         if !class_receiver
             && let Some((_, descriptor)) = self.class_attribute_with_owner(class, name)
@@ -2300,7 +4100,7 @@ impl RimeraContext {
         }
     }
 
-    fn namespace_value(&self, namespace: RValue, name: &str) -> Option<RValue> {
+    pub(crate) fn namespace_value(&self, namespace: RValue, name: &str) -> Option<RValue> {
         match self.heap.get(namespace) {
             Some(HeapObject::Dictionary(dictionary)) => dictionary.get(name),
             Some(HeapObject::ValueDictionary(dictionary)) => {
@@ -2344,7 +4144,18 @@ impl RimeraContext {
         let Some((_, method)) = self.class_attribute_with_owner(class, name) else {
             return Ok(None);
         };
-        self.bind_method(method, value).map(Some)
+        self.descriptor_get(method, Some(value), class).map(Some)
+    }
+
+    /// Slot-presence query used by reflection helpers such as `callable()`.
+    /// It deliberately does not invoke descriptor binding.
+    pub(crate) fn has_special_method_slot(
+        &mut self,
+        value: RValue,
+        name: &str,
+    ) -> Result<bool, String> {
+        let class = self.type_of(value)?;
+        Ok(self.class_attribute_with_owner(class, name).is_some())
     }
 
     pub(crate) fn invoke_special_method(
@@ -2963,8 +4774,62 @@ impl RimeraContext {
         self.kernel.as_ref().map(|kernel| kernel.globals)
     }
 
+    pub(crate) fn import_name(&mut self, name: &str) -> Result<RValue, String> {
+        self.initialize_kernel()?;
+        if let Some(module) = self.modules.get(name).copied() {
+            return Ok(module);
+        }
+        if !matches!(name, "inspect" | "weakref") {
+            return self.raise_error("ModuleNotFoundError", format!("No module named '{name}'"));
+        }
+
+        let namespace = self.allocate(HeapObject::Dictionary(DictionaryObject {
+            entries: Vec::new(),
+        }))?;
+        self.with_temporary_roots(&[namespace], |context| {
+            let module_name = crate::operations::string(context, name)?;
+            context.with_temporary_roots(&[namespace, module_name], |context| {
+                context.namespace_set(namespace, "__name__", module_name)?;
+                context.namespace_set(namespace, "__package__", RValue::NONE)?;
+                context.namespace_set(namespace, "__loader__", RValue::NONE)?;
+                context.namespace_set(namespace, "__spec__", RValue::NONE)?;
+                let module = context.allocate(HeapObject::Module(ModuleObject {
+                    name: name.to_owned(),
+                    namespace,
+                }))?;
+                context.modules.insert(name.to_owned(), module);
+                Ok(module)
+            })
+        })
+    }
+
     pub(crate) fn builtins(&self) -> Option<RValue> {
         self.kernel.as_ref().map(|kernel| kernel.builtins)
+    }
+
+    pub(crate) fn new_builtin_exception(
+        &mut self,
+        exception_type: &str,
+        arguments: &[RValue],
+    ) -> Result<RValue, String> {
+        self.initialize_kernel()?;
+        let type_value = self
+            .ensure_builtin_type(exception_type)?
+            .ok_or_else(|| format!("unknown built-in exception type `{exception_type}`"))?;
+        self.new_exception(type_value, arguments)
+    }
+
+    pub(crate) fn raise_stop_iteration(&mut self, value: RValue) -> Result<RValue, String> {
+        let arguments = if value == RValue::NONE {
+            Vec::new()
+        } else {
+            vec![value]
+        };
+        let exception = self.with_temporary_roots(&arguments, |context| {
+            context.new_builtin_exception("StopIteration", &arguments)
+        })?;
+        self.raise_value(exception, None, false)?;
+        Ok(exception)
     }
 
     pub(crate) fn raise_builtin(
@@ -3058,6 +4923,7 @@ impl RimeraContext {
                 context.allocate(HeapObject::Exception(ExceptionObject {
                     exception_type,
                     arguments,
+                    dictionary: None,
                     traceback: None,
                     cause: None,
                     context: None,
@@ -3125,6 +4991,7 @@ impl RimeraContext {
                     context.allocate(HeapObject::Exception(ExceptionObject {
                         exception_type,
                         arguments,
+                        dictionary: None,
                         traceback: None,
                         cause: None,
                         context: None,
@@ -3321,23 +5188,33 @@ impl RimeraContext {
         })
     }
 
+    /// Normalizes one source-level `raise` operand. This deliberately lives
+    /// outside `raise_value`: only the dedicated `rimera_raise` ABI needs the
+    /// generic call path for exception classes, so ordinary runtime error
+    /// machinery remains dead-strip friendly for programs that never execute
+    /// a source `raise`.
+    pub(crate) fn normalize_raise_operand(&mut self, value: RValue) -> Result<RValue, String> {
+        if matches!(self.heap.get(value), Some(HeapObject::Exception(_))) {
+            return Ok(value);
+        }
+        let Some(HeapObject::Type(exception_type)) = self.heap.get(value) else {
+            return Err("exceptions must derive from BaseException".to_owned());
+        };
+        let base_exception = self
+            .builtin_type("BaseException")
+            .ok_or_else(|| "exception kernel is not initialized".to_owned())?;
+        if !exception_type.mro.contains(&base_exception) {
+            return Err("exceptions must derive from BaseException".to_owned());
+        }
+        crate::call::invoke(self, value, &[], &[])
+    }
+
     pub(crate) fn raise_value(
         &mut self,
         exception: RValue,
         cause: Option<RValue>,
         suppress_context: bool,
     ) -> Result<(), String> {
-        let exception = if matches!(self.heap.get(exception), Some(HeapObject::Type(_))) {
-            self.new_exception(exception, &[])?
-        } else {
-            exception
-        };
-        let cause = self.with_temporary_roots(&[exception], |context| match cause {
-            Some(value) if matches!(context.heap.get(value), Some(HeapObject::Type(_))) => {
-                context.new_exception(value, &[]).map(Some)
-            }
-            cause => Ok(cause),
-        })?;
         if !matches!(self.heap.get(exception), Some(HeapObject::Exception(_))) {
             return Err("exceptions must derive from BaseException".to_owned());
         }
@@ -3422,12 +5299,39 @@ impl RimeraContext {
                 .any(|value| self.builtin_type("BaseException") == Some(*value)))
     }
 
+    pub(crate) fn attach_module_traceback(
+        &mut self,
+        filename: &str,
+        function: &str,
+        line: u32,
+        column: u32,
+    ) -> Result<(), String> {
+        let frame = Some(self.ensure_module_frame(filename, line)?);
+        self.attach_traceback_frame(filename, function, line, column, frame)
+    }
+
     pub(crate) fn attach_traceback(
         &mut self,
         filename: &str,
         function: &str,
         line: u32,
         column: u32,
+    ) -> Result<(), String> {
+        let frame = if self.active_calls.is_empty() {
+            Some(self.ensure_module_frame(filename, line)?)
+        } else {
+            Some(self.ensure_active_frame(self.active_calls.len() - 1, line)?)
+        };
+        self.attach_traceback_frame(filename, function, line, column, frame)
+    }
+
+    fn attach_traceback_frame(
+        &mut self,
+        filename: &str,
+        function: &str,
+        line: u32,
+        column: u32,
+        frame: Option<RValue>,
     ) -> Result<(), String> {
         let exception = self
             .raised
@@ -3437,13 +5341,18 @@ impl RimeraContext {
             _ => return Err("active exception handle is invalid".to_owned()),
         };
         let traceback = self.with_temporary_roots(
-            &next.into_iter().chain([exception]).collect::<Vec<_>>(),
+            &next
+                .into_iter()
+                .chain(frame)
+                .chain([exception])
+                .collect::<Vec<_>>(),
             |context| {
                 context.allocate(HeapObject::Traceback(TracebackObject {
                     filename: filename.to_owned(),
                     function: function.to_owned(),
                     line,
                     column,
+                    frame,
                     next,
                 }))
             },

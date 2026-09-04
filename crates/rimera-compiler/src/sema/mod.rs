@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use rimera_abi::RParameterKind;
@@ -6,19 +6,42 @@ use rimera_abi::RParameterKind;
 use crate::core::{Diagnostic, DiagnosticSet, Span};
 use crate::{hir, syntax};
 
+fn is_pulled_forward_native_module(name: &str) -> bool {
+    matches!(name, "inspect" | "weakref")
+}
+
+fn hir_type_parameters(parameters: &[syntax::TypeParameter]) -> Vec<hir::TypeParameter> {
+    parameters
+        .iter()
+        .map(|parameter| hir::TypeParameter {
+            span: parameter.span,
+            name: parameter.name.clone(),
+            kind: match parameter.kind {
+                syntax::TypeParameterKind::TypeVar => hir::TypeParameterKind::TypeVar,
+                syntax::TypeParameterKind::TypeVarTuple => hir::TypeParameterKind::TypeVarTuple,
+                syntax::TypeParameterKind::ParamSpec => hir::TypeParameterKind::ParamSpec,
+            },
+        })
+        .collect()
+}
+
 pub fn analyze(path: &Path, module: &syntax::Module) -> Result<hir::Module, DiagnosticSet> {
     let raw = RawScope::module(&module.statements);
     let builtin_print_stable = !raw.mutates_global_name("print", true);
+    let dynamic_builtin_stable =
+        ["eval", "exec", "compile"].map(|name| !raw.mutates_global_name(name, true));
     let plan = resolve_scope(path, raw, &[])?;
     let mut analyzer = Analyzer {
         path,
         plan: &plan,
+        definition_type_params: BTreeSet::new(),
         child_index: 0,
         in_function: false,
         loop_depth: 0,
         in_except_star: false,
         handler_depth: 0,
         builtin_print_stable,
+        dynamic_builtin_stable,
         class_depth: 0,
     };
     Ok(hir::Module {
@@ -31,39 +54,73 @@ pub fn analyze(path: &Path, module: &syntax::Module) -> Result<hir::Module, Diag
 #[derive(Debug)]
 struct RawScope {
     is_function: bool,
+    is_class: bool,
+    forced_free: BTreeSet<String>,
     parameters: BTreeSet<String>,
     assigned: BTreeSet<String>,
+    local_order: Vec<String>,
     used: BTreeSet<String>,
     explicit_globals: BTreeSet<String>,
     nonlocals: BTreeSet<String>,
+    global_spans: BTreeMap<String, Span>,
+    nonlocal_spans: BTreeMap<String, Span>,
     children: Vec<RawScope>,
 }
 
 impl RawScope {
     fn module(statements: &[syntax::Statement]) -> Self {
-        let mut scope = Self::empty(false);
+        let mut scope = Self::empty(false, false);
         scope.scan_statements(statements);
         scope
     }
 
-    fn function(parameters: &[syntax::Parameter], statements: &[syntax::Statement]) -> Self {
-        let mut scope = Self::empty(true);
+    fn function(
+        parameters: &[syntax::Parameter],
+        statements: &[syntax::Statement],
+        type_params: &[syntax::TypeParameter],
+    ) -> Self {
+        let mut scope = Self::empty(true, false);
         scope
-            .parameters
-            .extend(parameters.iter().map(|parameter| parameter.name.clone()));
+            .forced_free
+            .extend(type_params.iter().map(|parameter| parameter.name.clone()));
+        for parameter in parameters {
+            scope.parameters.insert(parameter.name.clone());
+            scope.local_order.push(parameter.name.clone());
+        }
         scope.scan_statements(statements);
         scope
     }
 
-    fn empty(is_function: bool) -> Self {
+    fn class(statements: &[syntax::Statement], type_params: &[syntax::TypeParameter]) -> Self {
+        let mut scope = Self::empty(false, true);
+        scope
+            .forced_free
+            .extend(type_params.iter().map(|parameter| parameter.name.clone()));
+        scope.scan_class_statements(statements);
+        scope
+    }
+
+    fn empty(is_function: bool, is_class: bool) -> Self {
         Self {
             is_function,
+            is_class,
+            forced_free: BTreeSet::new(),
             parameters: BTreeSet::new(),
             assigned: BTreeSet::new(),
+            local_order: Vec::new(),
             used: BTreeSet::new(),
             explicit_globals: BTreeSet::new(),
             nonlocals: BTreeSet::new(),
+            global_spans: BTreeMap::new(),
+            nonlocal_spans: BTreeMap::new(),
             children: Vec::new(),
+        }
+    }
+
+    fn record_assigned(&mut self, name: &str) {
+        self.assigned.insert(name.to_owned());
+        if !self.local_order.iter().any(|current| current == name) {
+            self.local_order.push(name.to_owned());
         }
     }
 
@@ -115,12 +172,13 @@ impl RawScope {
                 }
                 syntax::StatementKind::FunctionDef {
                     name,
+                    type_params,
                     decorators,
                     parameters,
                     return_annotation,
                     body,
                 } => {
-                    self.assigned.insert(name.clone());
+                    self.record_assigned(name);
                     for decorator in decorators {
                         self.scan_expression(decorator);
                     }
@@ -137,17 +195,19 @@ impl RawScope {
                     if let Some(annotation) = return_annotation {
                         self.scan_expression(annotation);
                     }
-                    self.children.push(Self::function(parameters, body));
+                    self.children
+                        .push(Self::function(parameters, body, type_params));
                 }
                 syntax::StatementKind::ClassDef {
                     name,
+                    type_params,
                     decorators,
                     bases,
                     metaclass,
                     keywords,
                     body,
                 } => {
-                    self.assigned.insert(name.clone());
+                    self.record_assigned(name);
                     for decorator in decorators {
                         self.scan_expression(decorator);
                     }
@@ -160,20 +220,43 @@ impl RawScope {
                     for (_, value) in keywords {
                         self.scan_expression(value);
                     }
-                    self.scan_class_body(body);
+                    self.children.push(Self::class(body, type_params));
+                }
+                syntax::StatementKind::TypeAlias {
+                    name,
+                    type_params: _,
+                    value,
+                } => {
+                    self.record_assigned(name);
+                    self.scan_expression(value);
                 }
                 syntax::StatementKind::Return { value } => {
                     if let Some(value) = value {
                         self.scan_expression(value);
                     }
                 }
+                syntax::StatementKind::Import { aliases } => {
+                    for alias in aliases {
+                        self.record_assigned(&alias.bind_name);
+                    }
+                }
                 syntax::StatementKind::Break | syntax::StatementKind::Continue => {}
                 syntax::StatementKind::Expression(value) => self.scan_expression(value),
                 syntax::StatementKind::Global(names) => {
                     self.explicit_globals.extend(names.iter().cloned());
+                    for name in names {
+                        self.global_spans
+                            .entry(name.clone())
+                            .or_insert(statement.span);
+                    }
                 }
                 syntax::StatementKind::Nonlocal(names) => {
                     self.nonlocals.extend(names.iter().cloned());
+                    for name in names {
+                        self.nonlocal_spans
+                            .entry(name.clone())
+                            .or_insert(statement.span);
+                    }
                 }
                 syntax::StatementKind::Raise { exception, cause } => {
                     if let Some(exception) = exception {
@@ -196,7 +279,7 @@ impl RawScope {
                             self.scan_expression(exception_type);
                         }
                         if let Some(name) = &handler.name {
-                            self.assigned.insert(name.clone());
+                            self.record_assigned(name);
                         }
                         self.scan_statements(&handler.body);
                     }
@@ -248,11 +331,11 @@ impl RawScope {
         match &pattern.kind {
             syntax::PatternKind::Value(value) => self.scan_expression(value),
             syntax::PatternKind::Capture(name) => {
-                self.assigned.insert(name.clone());
+                self.record_assigned(name);
             }
             syntax::PatternKind::As { pattern, name } => {
                 self.scan_pattern(pattern);
-                self.assigned.insert(name.clone());
+                self.record_assigned(name);
             }
             syntax::PatternKind::Or(patterns) | syntax::PatternKind::Sequence(patterns) => {
                 for pattern in patterns {
@@ -261,7 +344,7 @@ impl RawScope {
             }
             syntax::PatternKind::Star(name) => {
                 if let Some(name) = name {
-                    self.assigned.insert(name.clone());
+                    self.record_assigned(name);
                 }
             }
             syntax::PatternKind::Mapping {
@@ -276,7 +359,7 @@ impl RawScope {
                     self.scan_pattern(pattern);
                 }
                 if let Some(rest) = rest {
-                    self.assigned.insert(rest.clone());
+                    self.record_assigned(rest);
                 }
             }
             syntax::PatternKind::Class {
@@ -301,7 +384,7 @@ impl RawScope {
     fn scan_target(&mut self, target: &syntax::Target) {
         match &target.kind {
             syntax::TargetKind::Name(name) => {
-                self.assigned.insert(name.clone());
+                self.record_assigned(name);
             }
             syntax::TargetKind::Attribute { receiver, .. } => self.scan_expression(receiver),
             syntax::TargetKind::Item { collection, index } => {
@@ -336,29 +419,29 @@ impl RawScope {
 
     fn scan_augmented_target(&mut self, target: &syntax::Target) {
         if let syntax::TargetKind::Name(name) = &target.kind {
-            self.assigned.insert(name.clone());
+            self.record_assigned(name);
             self.used.insert(name.clone());
         } else {
             self.scan_target_reads(target);
         }
     }
 
-    fn scan_class_body(&mut self, statements: &[syntax::Statement]) {
+    fn scan_class_statements(&mut self, statements: &[syntax::Statement]) {
         for statement in statements {
             match &statement.kind {
                 syntax::StatementKind::Assign { targets, value } => {
                     for target in targets {
-                        self.scan_target_reads(target);
+                        self.scan_target(target);
                     }
                     self.scan_expression(value);
                 }
                 syntax::StatementKind::AugAssign { target, value, .. } => {
-                    self.scan_target_reads(target);
+                    self.scan_augmented_target(target);
                     self.scan_expression(value);
                 }
                 syntax::StatementKind::Delete { targets } => {
                     for target in targets {
-                        self.scan_target_reads(target);
+                        self.scan_target(target);
                     }
                 }
                 syntax::StatementKind::AnnAssign {
@@ -367,7 +450,7 @@ impl RawScope {
                     value,
                     ..
                 } => {
-                    self.scan_target_reads(target);
+                    self.scan_target(target);
                     if let Some(value) = value {
                         self.scan_expression(value);
                     }
@@ -385,12 +468,12 @@ impl RawScope {
                     else_body,
                 } => {
                     self.scan_expression(condition);
-                    self.scan_class_body(then_body);
-                    self.scan_class_body(else_body);
+                    self.scan_class_statements(then_body);
+                    self.scan_class_statements(else_body);
                 }
                 syntax::StatementKind::While { condition, body } => {
                     self.scan_expression(condition);
-                    self.scan_class_body(body);
+                    self.scan_class_statements(body);
                 }
                 syntax::StatementKind::For {
                     target,
@@ -398,22 +481,68 @@ impl RawScope {
                     body,
                     else_body,
                 } => {
-                    self.scan_target_reads(target);
+                    self.scan_target(target);
                     self.scan_expression(iterable);
-                    self.scan_class_body(body);
-                    self.scan_class_body(else_body);
+                    self.scan_class_statements(body);
+                    self.scan_class_statements(else_body);
+                }
+                syntax::StatementKind::Try {
+                    body,
+                    handlers,
+                    else_body,
+                    finally_body,
+                    ..
+                } => {
+                    self.scan_class_statements(body);
+                    for handler in handlers {
+                        if let Some(exception_type) = &handler.exception_type {
+                            self.scan_expression(exception_type);
+                        }
+                        if let Some(name) = &handler.name {
+                            self.record_assigned(name);
+                        }
+                        self.scan_class_statements(&handler.body);
+                    }
+                    self.scan_class_statements(else_body);
+                    self.scan_class_statements(finally_body);
+                }
+                syntax::StatementKind::Raise { exception, cause } => {
+                    if let Some(exception) = exception {
+                        self.scan_expression(exception);
+                    }
+                    if let Some(cause) = cause {
+                        self.scan_expression(cause);
+                    }
                 }
                 syntax::StatementKind::Expression(expression) => self.scan_expression(expression),
                 syntax::StatementKind::Print { values } => {
                     values.iter().for_each(|value| self.scan_expression(value));
                 }
+                syntax::StatementKind::Global(names) => {
+                    self.explicit_globals.extend(names.iter().cloned());
+                    for name in names {
+                        self.global_spans
+                            .entry(name.clone())
+                            .or_insert(statement.span);
+                    }
+                }
+                syntax::StatementKind::Nonlocal(names) => {
+                    self.nonlocals.extend(names.iter().cloned());
+                    for name in names {
+                        self.nonlocal_spans
+                            .entry(name.clone())
+                            .or_insert(statement.span);
+                    }
+                }
                 syntax::StatementKind::FunctionDef {
+                    name,
+                    type_params,
                     decorators,
                     parameters,
                     return_annotation,
                     body,
-                    ..
                 } => {
+                    self.record_assigned(name);
                     for decorator in decorators {
                         self.scan_expression(decorator);
                     }
@@ -421,8 +550,6 @@ impl RawScope {
                         if let Some(default) = &parameter.default {
                             self.scan_expression(default);
                         }
-                    }
-                    for parameter in parameters {
                         if let Some(annotation) = &parameter.annotation {
                             self.scan_expression(annotation);
                         }
@@ -430,13 +557,65 @@ impl RawScope {
                     if let Some(annotation) = return_annotation {
                         self.scan_expression(annotation);
                     }
-                    self.children.push(Self::function(parameters, body));
+                    self.children
+                        .push(Self::function(parameters, body, type_params));
                 }
-                _ => {}
+                syntax::StatementKind::ClassDef {
+                    name,
+                    type_params,
+                    decorators,
+                    bases,
+                    metaclass,
+                    keywords,
+                    body,
+                } => {
+                    self.record_assigned(name);
+                    for decorator in decorators {
+                        self.scan_expression(decorator);
+                    }
+                    for base in bases {
+                        self.scan_expression(base);
+                    }
+                    if let Some(metaclass) = metaclass {
+                        self.scan_expression(metaclass);
+                    }
+                    for (_, value) in keywords {
+                        self.scan_expression(value);
+                    }
+                    self.children.push(Self::class(body, type_params));
+                }
+                syntax::StatementKind::Break | syntax::StatementKind::Continue => {}
+                syntax::StatementKind::TypeAlias {
+                    name,
+                    type_params: _,
+                    value,
+                } => {
+                    self.record_assigned(name);
+                    self.scan_expression(value);
+                }
+                syntax::StatementKind::Return { value } => {
+                    if let Some(value) = value {
+                        self.scan_expression(value);
+                    }
+                }
+                syntax::StatementKind::Import { aliases } => {
+                    for alias in aliases {
+                        self.record_assigned(&alias.bind_name);
+                    }
+                }
+                syntax::StatementKind::Match { subject, cases } => {
+                    self.scan_expression(subject);
+                    for case in cases {
+                        self.scan_pattern(&case.pattern);
+                        if let Some(guard) = &case.guard {
+                            self.scan_expression(guard);
+                        }
+                        self.scan_class_statements(&case.body);
+                    }
+                }
             }
         }
     }
-
     fn scan_expression(&mut self, expression: &syntax::Expression) {
         match &expression.kind {
             syntax::ExpressionKind::Name(name) => {
@@ -472,10 +651,11 @@ impl RawScope {
                         self.scan_expression(default);
                     }
                 }
-                let mut child = Self::empty(true);
-                child
-                    .parameters
-                    .extend(parameters.iter().map(|parameter| parameter.name.clone()));
+                let mut child = Self::empty(true, false);
+                for parameter in parameters {
+                    child.parameters.insert(parameter.name.clone());
+                    child.local_order.push(parameter.name.clone());
+                }
                 child.scan_expression(body);
                 self.children.push(child);
             }
@@ -494,9 +674,15 @@ impl RawScope {
                     .for_each(|(_, right)| self.scan_expression(right));
             }
             syntax::ExpressionKind::NamedExpression { name, value } => {
-                self.assigned.insert(name.clone());
+                self.record_assigned(name);
                 self.scan_expression(value);
             }
+            syntax::ExpressionKind::Yield { value } => {
+                if let Some(value) = value {
+                    self.scan_expression(value);
+                }
+            }
+            syntax::ExpressionKind::YieldFrom { value } => self.scan_expression(value),
             syntax::ExpressionKind::Comprehension {
                 element,
                 key,
@@ -558,7 +744,9 @@ impl RawScope {
                 collect_comprehension_walrus_names(filter, &mut walrus);
             }
         }
-        self.assigned.extend(walrus.iter().cloned());
+        for name in &walrus {
+            self.record_assigned(name);
+        }
         let globals = walrus
             .iter()
             .filter(|name| !self.is_function || self.explicit_globals.contains(*name))
@@ -575,8 +763,9 @@ impl RawScope {
         walrus: &BTreeSet<String>,
         globals: &BTreeSet<String>,
     ) -> Self {
-        let mut scope = Self::empty(true);
+        let mut scope = Self::empty(true, false);
         scope.parameters.insert(".0".to_owned());
+        scope.local_order.push(".0".to_owned());
         for (index, clause) in clauses.iter().enumerate() {
             if index != 0 {
                 scope.scan_expression_in_comprehension(&clause.iterable, walrus, globals);
@@ -633,10 +822,11 @@ impl RawScope {
                         self.scan_expression_in_comprehension(default, walrus, globals);
                     }
                 }
-                let mut child = Self::empty(true);
-                child
-                    .parameters
-                    .extend(parameters.iter().map(|parameter| parameter.name.clone()));
+                let mut child = Self::empty(true, false);
+                for parameter in parameters {
+                    child.parameters.insert(parameter.name.clone());
+                    child.local_order.push(parameter.name.clone());
+                }
                 child.scan_expression(body);
                 self.children.push(child);
             }
@@ -709,7 +899,15 @@ impl RawScope {
                 }
             }
             syntax::ExpressionKind::NamedExpression { name, value } => {
-                self.assigned.insert(name.clone());
+                self.record_assigned(name);
+                self.scan_expression_in_comprehension(value, walrus, globals);
+            }
+            syntax::ExpressionKind::Yield { value } => {
+                if let Some(value) = value {
+                    self.scan_expression_in_comprehension(value, walrus, globals);
+                }
+            }
+            syntax::ExpressionKind::YieldFrom { value } => {
                 self.scan_expression_in_comprehension(value, walrus, globals);
             }
             syntax::ExpressionKind::None
@@ -820,6 +1018,14 @@ fn collect_comprehension_walrus_names(
                 };
                 collect_comprehension_walrus_names(value, names);
             }
+        }
+        syntax::ExpressionKind::Yield { value } => {
+            if let Some(value) = value {
+                collect_comprehension_walrus_names(value, names);
+            }
+        }
+        syntax::ExpressionKind::YieldFrom { value } => {
+            collect_comprehension_walrus_names(value, names);
         }
         syntax::ExpressionKind::Name(_)
         | syntax::ExpressionKind::None
@@ -1091,6 +1297,26 @@ fn validate_comprehension_expression(
                 )?;
             }
         }
+        syntax::ExpressionKind::Yield { value } => {
+            if let Some(value) = value {
+                validate_comprehension_expression(
+                    path,
+                    value,
+                    iteration_names,
+                    in_iterable,
+                    in_class_body,
+                )?;
+            }
+        }
+        syntax::ExpressionKind::YieldFrom { value } => {
+            validate_comprehension_expression(
+                path,
+                value,
+                iteration_names,
+                in_iterable,
+                in_class_body,
+            )?;
+        }
         syntax::ExpressionKind::Name(_)
         | syntax::ExpressionKind::None
         | syntax::ExpressionKind::Bool(_)
@@ -1106,10 +1332,14 @@ fn validate_comprehension_expression(
 #[derive(Debug)]
 struct ScopePlan {
     is_function: bool,
+    is_class: bool,
+    forced_free: BTreeSet<String>,
     locals: BTreeSet<String>,
+    local_order: Vec<String>,
     cells: BTreeSet<String>,
     free: BTreeSet<String>,
     explicit_globals: BTreeSet<String>,
+    nonlocals: BTreeSet<String>,
     children: Vec<ScopePlan>,
 }
 
@@ -1118,23 +1348,46 @@ fn resolve_scope(
     raw: RawScope,
     ancestors: &[BTreeSet<String>],
 ) -> Result<ScopePlan, DiagnosticSet> {
-    if !raw.explicit_globals.is_disjoint(&raw.nonlocals) {
-        return Err(sema_error(
+    if let Some(name) = raw.explicit_globals.intersection(&raw.nonlocals).next() {
+        let span = raw
+            .nonlocal_spans
+            .get(name)
+            .or_else(|| raw.global_spans.get(name))
+            .copied()
+            .unwrap_or_default();
+        return Err(sema_error_at(
             path,
+            span,
             "a name cannot be declared both global and nonlocal",
         ));
     }
-    if !raw.parameters.is_disjoint(&raw.explicit_globals)
-        || !raw.parameters.is_disjoint(&raw.nonlocals)
-    {
-        return Err(sema_error(
+    if let Some(name) = raw.parameters.intersection(&raw.explicit_globals).next() {
+        let span = raw.global_spans.get(name).copied().unwrap_or_default();
+        return Err(sema_error_at(
             path,
+            span,
             "a parameter cannot be declared global or nonlocal",
         ));
     }
-    if !raw.is_function && !raw.nonlocals.is_empty() {
-        return Err(sema_error(
+    if let Some(name) = raw.parameters.intersection(&raw.nonlocals).next() {
+        let span = raw.nonlocal_spans.get(name).copied().unwrap_or_default();
+        return Err(sema_error_at(
             path,
+            span,
+            "a parameter cannot be declared global or nonlocal",
+        ));
+    }
+    if !raw.is_function && !raw.is_class && !raw.nonlocals.is_empty() {
+        let span = raw
+            .nonlocals
+            .iter()
+            .next()
+            .and_then(|name| raw.nonlocal_spans.get(name))
+            .copied()
+            .unwrap_or_default();
+        return Err(sema_error_at(
+            path,
+            span,
             "nonlocal declaration is not allowed at module scope",
         ));
     }
@@ -1144,15 +1397,23 @@ fn resolve_scope(
     locals.retain(|name| !raw.explicit_globals.contains(name) && !raw.nonlocals.contains(name));
     for name in &raw.nonlocals {
         if !ancestors.iter().rev().any(|scope| scope.contains(name)) {
-            return Err(sema_error(
+            return Err(sema_error_at(
                 path,
+                raw.nonlocal_spans.get(name).copied().unwrap_or_default(),
                 format!("no binding for nonlocal `{name}` was found"),
             ));
         }
     }
 
-    let mut free = BTreeSet::new();
-    if raw.is_function {
+    let local_order = raw
+        .local_order
+        .iter()
+        .filter(|name| locals.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut free = raw.forced_free.clone();
+    if raw.is_function || raw.is_class {
         for name in raw.used.iter().chain(raw.nonlocals.iter()) {
             if !locals.contains(name)
                 && !raw.explicit_globals.contains(name)
@@ -1165,15 +1426,22 @@ fn resolve_scope(
     let mut child_ancestors = ancestors.to_vec();
     if raw.is_function {
         child_ancestors.push(locals.clone());
+    } else if raw.is_class {
+        child_ancestors.push(BTreeSet::from(["__class__".to_owned()]));
     }
     let mut children = Vec::with_capacity(raw.children.len());
     let mut cells = BTreeSet::new();
     for child in raw.children {
         let child = resolve_scope(path, child, &child_ancestors)?;
         for name in &child.free {
-            if locals.contains(name) {
+            if child.forced_free.contains(name) {
+                continue;
+            }
+            if raw.is_function && locals.contains(name) {
                 cells.insert(name.clone());
-            } else if raw.is_function && ancestors.iter().rev().any(|scope| scope.contains(name)) {
+            } else if (raw.is_function || raw.is_class)
+                && ancestors.iter().rev().any(|scope| scope.contains(name))
+            {
                 free.insert(name.clone());
             }
         }
@@ -1181,10 +1449,14 @@ fn resolve_scope(
     }
     Ok(ScopePlan {
         is_function: raw.is_function,
+        is_class: raw.is_class,
+        forced_free: raw.forced_free,
         locals,
+        local_order,
         cells,
         free,
         explicit_globals: raw.explicit_globals,
+        nonlocals: raw.nonlocals,
         children,
     })
 }
@@ -1192,16 +1464,35 @@ fn resolve_scope(
 struct Analyzer<'a> {
     path: &'a Path,
     plan: &'a ScopePlan,
+    definition_type_params: BTreeSet<String>,
     child_index: usize,
     in_function: bool,
     loop_depth: usize,
     in_except_star: bool,
     handler_depth: usize,
     builtin_print_stable: bool,
+    dynamic_builtin_stable: [bool; 3],
     class_depth: usize,
 }
 
 impl Analyzer<'_> {
+    fn with_definition_type_params<T>(
+        &mut self,
+        parameters: &[syntax::TypeParameter],
+        operation: impl FnOnce(&mut Self) -> Result<T, DiagnosticSet>,
+    ) -> Result<T, DiagnosticSet> {
+        let previous = std::mem::replace(
+            &mut self.definition_type_params,
+            parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect(),
+        );
+        let result = operation(self);
+        self.definition_type_params = previous;
+        result
+    }
+
     fn statements(
         &mut self,
         statements: &[syntax::Statement],
@@ -1279,17 +1570,16 @@ impl Analyzer<'_> {
             },
             syntax::StatementKind::FunctionDef {
                 name,
+                type_params,
                 decorators,
                 parameters,
                 return_annotation,
                 body,
             } => {
-                if !decorators.is_empty() {
-                    return Err(sema_error(
-                        self.path,
-                        "function decorators are supported only in class bodies",
-                    ));
-                }
+                let decorators = decorators
+                    .iter()
+                    .map(|decorator| self.expression(decorator))
+                    .collect::<Result<Vec<_>, _>>()?;
                 let defaults = parameters
                     .iter()
                     .map(|parameter| {
@@ -1300,20 +1590,24 @@ impl Analyzer<'_> {
                             .transpose()
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let parameter_annotations = parameters
-                    .iter()
-                    .map(|parameter| {
-                        parameter
-                            .annotation
+                let (parameter_annotations, return_annotation) =
+                    self.with_definition_type_params(type_params, |analyzer| {
+                        let parameter_annotations = parameters
+                            .iter()
+                            .map(|parameter| {
+                                parameter
+                                    .annotation
+                                    .as_ref()
+                                    .map(|annotation| analyzer.expression(annotation))
+                                    .transpose()
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let return_annotation = return_annotation
                             .as_ref()
-                            .map(|annotation| self.expression(annotation))
-                            .transpose()
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let return_annotation = return_annotation
-                    .as_ref()
-                    .map(|annotation| self.expression(annotation))
-                    .transpose()?;
+                            .map(|annotation| analyzer.expression(annotation))
+                            .transpose()?;
+                        Ok((parameter_annotations, return_annotation))
+                    })?;
                 let child = self
                     .plan
                     .children
@@ -1323,12 +1617,14 @@ impl Analyzer<'_> {
                 let mut analyzer = Analyzer {
                     path: self.path,
                     plan: child,
+                    definition_type_params: BTreeSet::new(),
                     child_index: 0,
                     in_function: true,
                     loop_depth: 0,
                     in_except_star: false,
                     handler_depth: 0,
                     builtin_print_stable: self.builtin_print_stable,
+                    dynamic_builtin_stable: self.dynamic_builtin_stable,
                     class_depth: 0,
                 };
                 let parameters = parameters
@@ -1353,49 +1649,84 @@ impl Analyzer<'_> {
                 hir::StatementKind::FunctionDef {
                     name: name.clone(),
                     binding: self.binding(name),
-                    decorators: Vec::new(),
+                    type_params: hir_type_parameters(type_params),
+                    decorators,
                     parameters,
                     return_annotation,
                     body: analyzer.statements(body)?,
-                    locals: child.locals.iter().cloned().collect(),
+                    locals: child.local_order.clone(),
                     cells: child.cells.iter().cloned().collect(),
                     free: child.free.iter().cloned().collect(),
                 }
             }
             syntax::StatementKind::ClassDef {
                 name,
+                type_params,
                 decorators,
                 bases,
                 metaclass,
                 keywords,
                 body,
+            } => hir::StatementKind::ClassDef {
+                name: name.clone(),
+                binding: self.binding(name),
+                type_params: hir_type_parameters(type_params),
+                decorators: decorators
+                    .iter()
+                    .map(|decorator| self.expression(decorator))
+                    .collect::<Result<Vec<_>, _>>()?,
+                bases: bases
+                    .iter()
+                    .map(|base| self.expression(base))
+                    .collect::<Result<Vec<_>, _>>()?,
+                metaclass: metaclass
+                    .as_ref()
+                    .map(|value| self.expression(value))
+                    .transpose()?,
+                keywords: keywords
+                    .iter()
+                    .map(|(name, value)| Ok((name.clone(), self.expression(value)?)))
+                    .collect::<Result<_, DiagnosticSet>>()?,
+                body: self.class_body(body)?,
+            },
+            syntax::StatementKind::TypeAlias {
+                name,
+                type_params,
+                value,
             } => {
-                if self.in_function {
-                    return Err(sema_error(
-                        self.path,
-                        "class definitions are supported only at module scope",
-                    ));
-                }
-                hir::StatementKind::ClassDef {
+                let value = self.with_definition_type_params(type_params, |analyzer| {
+                    analyzer.expression(value)
+                })?;
+                hir::StatementKind::TypeAlias {
                     name: name.clone(),
                     binding: self.binding(name),
-                    decorators: decorators
+                    type_params: hir_type_parameters(type_params),
+                    value,
+                }
+            }
+            syntax::StatementKind::Import { aliases } => {
+                for alias in aliases {
+                    if !is_pulled_forward_native_module(&alias.module) {
+                        return Err(capability_error(
+                            self.path,
+                            statement.span,
+                            "RIM-CAP-001",
+                            format!(
+                                "module `{}` is not registered in the pulled-forward native import foundation",
+                                alias.module
+                            ),
+                        ));
+                    }
+                }
+                hir::StatementKind::Import {
+                    aliases: aliases
                         .iter()
-                        .map(|decorator| self.expression(decorator))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    bases: bases
-                        .iter()
-                        .map(|base| self.expression(base))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    metaclass: metaclass
-                        .as_ref()
-                        .map(|value| self.expression(value))
-                        .transpose()?,
-                    keywords: keywords
-                        .iter()
-                        .map(|(name, value)| Ok((name.clone(), self.expression(value)?)))
-                        .collect::<Result<_, DiagnosticSet>>()?,
-                    body: self.class_members(body)?,
+                        .map(|alias| hir::ImportAlias {
+                            module: alias.module.clone(),
+                            bind_name: alias.bind_name.clone(),
+                            binding: self.binding(&alias.bind_name),
+                        })
+                        .collect(),
                 }
             }
             syntax::StatementKind::Return { value } => {
@@ -1471,12 +1802,10 @@ impl Analyzer<'_> {
                 }
             }
             syntax::StatementKind::Raise { exception, cause } => {
-                if exception.is_none() && self.handler_depth == 0 {
-                    return Err(sema_error(
-                        self.path,
-                        "bare `raise` requires an active exception handler",
-                    ));
-                }
+                // Bare raise is syntactically valid outside a lexical handler.
+                // The runtime handled-exception stack decides whether it reraises
+                // an active exception or produces RuntimeError, including across
+                // native function-call boundaries.
                 hir::StatementKind::Raise {
                     exception: exception
                         .as_ref()
@@ -1598,6 +1927,35 @@ impl Analyzer<'_> {
         }))
     }
 
+    fn class_body(
+        &mut self,
+        statements: &[syntax::Statement],
+    ) -> Result<Vec<hir::ClassMember>, DiagnosticSet> {
+        let child = self
+            .plan
+            .children
+            .get(self.child_index)
+            .ok_or_else(|| sema_error(self.path, "class scope plan is missing"))?;
+        self.child_index += 1;
+        if !child.is_class {
+            return Err(sema_error(self.path, "class scope plan has the wrong kind"));
+        }
+        let mut analyzer = Analyzer {
+            path: self.path,
+            plan: child,
+            definition_type_params: BTreeSet::new(),
+            child_index: 0,
+            in_function: false,
+            loop_depth: 0,
+            in_except_star: false,
+            handler_depth: 0,
+            builtin_print_stable: self.builtin_print_stable,
+            dynamic_builtin_stable: self.dynamic_builtin_stable,
+            class_depth: self.class_depth,
+        };
+        analyzer.class_members(statements)
+    }
+
     fn class_members(
         &mut self,
         statements: &[syntax::Statement],
@@ -1614,6 +1972,12 @@ impl Analyzer<'_> {
     ) -> Result<Vec<hir::ClassMember>, DiagnosticSet> {
         let mut members = Vec::with_capacity(statements.len());
         for statement in statements {
+            if matches!(
+                statement.kind,
+                syntax::StatementKind::Global(_) | syntax::StatementKind::Nonlocal(_)
+            ) {
+                continue;
+            }
             let member = match &statement.kind {
                 syntax::StatementKind::Assign { targets, value } => hir::ClassMember::Assign {
                     targets: targets
@@ -1693,7 +2057,10 @@ impl Analyzer<'_> {
                                     .as_ref()
                                     .map(|value| self.expression(value))
                                     .transpose()?,
-                                name: handler.name.clone(),
+                                name: handler
+                                    .name
+                                    .as_ref()
+                                    .map(|name| (name.clone(), self.binding(name))),
                                 body: self.class_members(&handler.body)?,
                             })
                         })
@@ -1702,8 +2069,34 @@ impl Analyzer<'_> {
                     finally_body: self.class_members(finally_body)?,
                     is_star: *is_star,
                 },
+                syntax::StatementKind::Import { aliases } => {
+                    for alias in aliases {
+                        if !is_pulled_forward_native_module(&alias.module) {
+                            return Err(capability_error(
+                                self.path,
+                                statement.span,
+                                "RIM-CAP-001",
+                                format!(
+                                    "module `{}` is not registered in the pulled-forward native import foundation",
+                                    alias.module
+                                ),
+                            ));
+                        }
+                    }
+                    hir::ClassMember::Import {
+                        aliases: aliases
+                            .iter()
+                            .map(|alias| hir::ImportAlias {
+                                module: alias.module.clone(),
+                                bind_name: alias.bind_name.clone(),
+                                binding: self.binding(&alias.bind_name),
+                            })
+                            .collect(),
+                    }
+                }
                 syntax::StatementKind::ClassDef {
                     name,
+                    type_params,
                     decorators,
                     bases,
                     metaclass,
@@ -1711,6 +2104,8 @@ impl Analyzer<'_> {
                     body,
                 } => hir::ClassMember::ClassDef {
                     name: name.clone(),
+                    binding: self.binding(name),
+                    type_params: hir_type_parameters(type_params),
                     decorators: decorators
                         .iter()
                         .map(|decorator| self.expression(decorator))
@@ -1727,8 +2122,23 @@ impl Analyzer<'_> {
                         .iter()
                         .map(|(name, value)| Ok((name.clone(), self.expression(value)?)))
                         .collect::<Result<_, DiagnosticSet>>()?,
-                    body: self.class_members(body)?,
+                    body: self.class_body(body)?,
                 },
+                syntax::StatementKind::TypeAlias {
+                    name,
+                    type_params,
+                    value,
+                } => {
+                    let value = self.with_definition_type_params(type_params, |analyzer| {
+                        analyzer.expression(value)
+                    })?;
+                    hir::ClassMember::TypeAlias {
+                        name: name.clone(),
+                        binding: self.binding(name),
+                        type_params: hir_type_parameters(type_params),
+                        value,
+                    }
+                }
                 syntax::StatementKind::Break => {
                     if self.loop_depth == 0 {
                         return Err(sema_error(self.path, "`break` is only valid inside a loop"));
@@ -1746,6 +2156,7 @@ impl Analyzer<'_> {
                 }
                 syntax::StatementKind::FunctionDef {
                     name,
+                    type_params,
                     decorators,
                     parameters,
                     return_annotation,
@@ -1761,20 +2172,24 @@ impl Analyzer<'_> {
                                 .transpose()
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    let parameter_annotations = parameters
-                        .iter()
-                        .map(|parameter| {
-                            parameter
-                                .annotation
+                    let (parameter_annotations, return_annotation) = self
+                        .with_definition_type_params(type_params, |analyzer| {
+                            let parameter_annotations = parameters
+                                .iter()
+                                .map(|parameter| {
+                                    parameter
+                                        .annotation
+                                        .as_ref()
+                                        .map(|annotation| analyzer.expression(annotation))
+                                        .transpose()
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let return_annotation = return_annotation
                                 .as_ref()
-                                .map(|annotation| self.expression(annotation))
-                                .transpose()
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let return_annotation = return_annotation
-                        .as_ref()
-                        .map(|annotation| self.expression(annotation))
-                        .transpose()?;
+                                .map(|annotation| analyzer.expression(annotation))
+                                .transpose()?;
+                            Ok((parameter_annotations, return_annotation))
+                        })?;
                     let child =
                         self.plan.children.get(self.child_index).ok_or_else(|| {
                             sema_error(self.path, "function scope plan is missing")
@@ -1783,12 +2198,14 @@ impl Analyzer<'_> {
                     let mut analyzer = Analyzer {
                         path: self.path,
                         plan: child,
+                        definition_type_params: BTreeSet::new(),
                         child_index: 0,
                         in_function: true,
                         loop_depth: 0,
                         in_except_star: false,
                         handler_depth: 0,
                         builtin_print_stable: self.builtin_print_stable,
+                        dynamic_builtin_stable: self.dynamic_builtin_stable,
                         class_depth: 0,
                     };
                     let parameters = parameters
@@ -1813,7 +2230,10 @@ impl Analyzer<'_> {
                         })
                         .collect();
                     hir::ClassMember::FunctionDef {
+                        span: statement.span,
                         name: name.clone(),
+                        binding: self.binding(name),
+                        type_params: hir_type_parameters(type_params),
                         decorators: decorators
                             .iter()
                             .map(|decorator| self.expression(decorator))
@@ -1822,7 +2242,7 @@ impl Analyzer<'_> {
                         parameters,
                         return_annotation,
                         body: analyzer.statements(body)?,
-                        locals: child.locals.iter().cloned().collect(),
+                        locals: child.local_order.clone(),
                         cells: child.cells.iter().cloned().collect(),
                         free: child.free.iter().cloned().collect(),
                     }
@@ -2096,12 +2516,14 @@ impl Analyzer<'_> {
                 let mut analyzer = Analyzer {
                     path: self.path,
                     plan: child,
+                    definition_type_params: BTreeSet::new(),
                     child_index: 0,
                     in_function: true,
                     loop_depth: 0,
                     in_except_star: false,
                     handler_depth: 0,
                     builtin_print_stable: self.builtin_print_stable,
+                    dynamic_builtin_stable: self.dynamic_builtin_stable,
                     class_depth: 0,
                 };
                 let parameters = parameters
@@ -2125,15 +2547,33 @@ impl Analyzer<'_> {
                 hir::ExpressionKind::Lambda {
                     parameters,
                     body: Box::new(analyzer.expression(body)?),
-                    locals: child.locals.iter().cloned().collect(),
+                    locals: child.local_order.clone(),
                     cells: child.cells.iter().cloned().collect(),
                     free: child.free.iter().cloned().collect(),
                 }
             }
-            syntax::ExpressionKind::Name(name) => hir::ExpressionKind::Name {
-                name: name.clone(),
-                binding: self.binding(name),
-            },
+            syntax::ExpressionKind::Name(name) => {
+                let binding = self.binding(name);
+                if let Some(index) = ["eval", "exec", "compile"]
+                    .iter()
+                    .position(|candidate| *candidate == name)
+                    && self.dynamic_builtin_stable[index]
+                    && matches!(binding, hir::Binding::Global)
+                {
+                    return Err(capability_error(
+                        self.path,
+                        expression.span,
+                        "RIM-CAP-G7-02",
+                        format!(
+                            "dynamic Python compilation via `{name}` is not supported by Gate 7"
+                        ),
+                    ));
+                }
+                hir::ExpressionKind::Name {
+                    name: name.clone(),
+                    binding,
+                }
+            }
             syntax::ExpressionKind::Unary { op, operand } => hir::ExpressionKind::Unary {
                 op: match op {
                     syntax::UnaryOperator::Positive => hir::UnaryOperator::Positive,
@@ -2185,6 +2625,34 @@ impl Analyzer<'_> {
                 hir::ExpressionKind::NamedExpression {
                     name: name.clone(),
                     binding: self.binding(name),
+                    value: Box::new(self.expression(value)?),
+                }
+            }
+            syntax::ExpressionKind::Yield { value } => {
+                if !self.in_function {
+                    return Err(sema_error_at(
+                        self.path,
+                        expression.span,
+                        "`yield` is only valid inside a function",
+                    ));
+                }
+                hir::ExpressionKind::Yield {
+                    value: value
+                        .as_deref()
+                        .map(|value| self.expression(value))
+                        .transpose()?
+                        .map(Box::new),
+                }
+            }
+            syntax::ExpressionKind::YieldFrom { value } => {
+                if !self.in_function {
+                    return Err(sema_error_at(
+                        self.path,
+                        expression.span,
+                        "`yield from` is only valid inside a function",
+                    ));
+                }
+                hir::ExpressionKind::YieldFrom {
                     value: Box::new(self.expression(value)?),
                 }
             }
@@ -2248,12 +2716,14 @@ impl Analyzer<'_> {
                 let mut analyzer = Analyzer {
                     path: self.path,
                     plan: child,
+                    definition_type_params: BTreeSet::new(),
                     child_index: 0,
                     in_function: true,
                     loop_depth: 0,
                     in_except_star: false,
                     handler_depth: 0,
                     builtin_print_stable: self.builtin_print_stable,
+                    dynamic_builtin_stable: self.dynamic_builtin_stable,
                     class_depth: 0,
                 };
                 let clauses = clauses
@@ -2431,7 +2901,19 @@ impl Analyzer<'_> {
     }
 
     fn binding(&self, name: &str) -> hir::Binding {
-        if !self.plan.is_function || self.plan.explicit_globals.contains(name) {
+        if self.definition_type_params.contains(name) {
+            hir::Binding::Free
+        } else if self.plan.is_class {
+            if self.plan.explicit_globals.contains(name) {
+                hir::Binding::Global
+            } else if self.plan.nonlocals.contains(name) {
+                hir::Binding::Free
+            } else if self.plan.free.contains(name) {
+                hir::Binding::ClassFree
+            } else {
+                hir::Binding::ClassName
+            }
+        } else if !self.plan.is_function || self.plan.explicit_globals.contains(name) {
             hir::Binding::Global
         } else if self.plan.cells.contains(name) {
             hir::Binding::Cell
@@ -2567,12 +3049,11 @@ fn pattern_is_irrefutable(pattern: &syntax::Pattern) -> bool {
 }
 
 fn sema_error(path: &Path, message: impl Into<String>) -> DiagnosticSet {
-    DiagnosticSet::one(Diagnostic::new(
-        "RIM-SEMA-001",
-        message,
-        path,
-        Span::default(),
-    ))
+    sema_error_at(path, Span::default(), message)
+}
+
+fn sema_error_at(path: &Path, span: Span, message: impl Into<String>) -> DiagnosticSet {
+    DiagnosticSet::one(Diagnostic::new("RIM-SEMA-001", message, path, span))
 }
 
 fn capability_error(
@@ -2691,8 +3172,12 @@ fn statement_contains_zero_argument_super(statement: &syntax::Statement) -> bool
                         || contains_zero_argument_super(&case.body)
                 })
         }
+        syntax::StatementKind::TypeAlias { value, .. } => {
+            expression_contains_zero_argument_super(value)
+        }
         syntax::StatementKind::FunctionDef { .. }
         | syntax::StatementKind::ClassDef { .. }
+        | syntax::StatementKind::Import { .. }
         | syntax::StatementKind::Return { value: None }
         | syntax::StatementKind::Break
         | syntax::StatementKind::Continue
@@ -2791,6 +3276,7 @@ fn expression_contains_zero_argument_super(expression: &syntax::Expression) -> b
         | syntax::ExpressionKind::Unary { operand: value, .. } => {
             expression_contains_zero_argument_super(value)
         }
+        syntax::ExpressionKind::Name(name) => name == "__class__",
         syntax::ExpressionKind::Lambda { .. }
         | syntax::ExpressionKind::None
         | syntax::ExpressionKind::Bool(_)
@@ -2798,13 +3284,18 @@ fn expression_contains_zero_argument_super(expression: &syntax::Expression) -> b
         | syntax::ExpressionKind::Float(_)
         | syntax::ExpressionKind::String(_)
         | syntax::ExpressionKind::Bytes(_)
-        | syntax::ExpressionKind::Complex { .. }
-        | syntax::ExpressionKind::Name(_) => false,
+        | syntax::ExpressionKind::Complex { .. } => false,
         syntax::ExpressionKind::Binary { left, right, .. } => {
             expression_contains_zero_argument_super(left)
                 || expression_contains_zero_argument_super(right)
         }
         syntax::ExpressionKind::NamedExpression { value, .. } => {
+            expression_contains_zero_argument_super(value)
+        }
+        syntax::ExpressionKind::Yield { value } => value
+            .as_deref()
+            .is_some_and(expression_contains_zero_argument_super),
+        syntax::ExpressionKind::YieldFrom { value } => {
             expression_contains_zero_argument_super(value)
         }
         syntax::ExpressionKind::Comprehension {
@@ -2855,6 +3346,8 @@ mod tests {
         let module = syntax::parse(path(), source).unwrap();
         let raw = RawScope::module(&module.statements);
         let builtin_print_stable = !raw.mutates_global_name("print", true);
+        let dynamic_builtin_stable =
+            ["eval", "exec", "compile"].map(|name| !raw.mutates_global_name(name, true));
         let plan = resolve_scope(path(), raw, &[]).unwrap();
         let mut analyzer = Analyzer {
             path: path(),
@@ -2865,7 +3358,9 @@ mod tests {
             in_except_star: false,
             handler_depth: 0,
             builtin_print_stable,
+            dynamic_builtin_stable,
             class_depth: 0,
+            definition_type_params: BTreeSet::new(),
         };
         let syntax::StatementKind::Assign { targets, .. } = &module.statements[0].kind else {
             panic!("expected assignment");
@@ -3066,5 +3561,82 @@ def f():
                 binding: hir::Binding::Local
             } if name == "value"
         ));
+    }
+
+    #[test]
+    fn gate5_function_analysis_preserves_decorators_defaults_annotations_and_scope_ownership() {
+        let source = r#"
+marker = 7
+
+def decorate(function):
+    return function
+
+@decorate
+def outer(value: int = marker, *, flag: int = marker) -> int:
+    captured = value
+    def inner():
+        return captured
+    return inner
+"#;
+        let module = syntax::parse(path(), source).unwrap();
+        let hir = analyze(path(), &module).unwrap();
+        let hir::StatementKind::FunctionDef {
+            decorators,
+            parameters,
+            return_annotation,
+            body,
+            cells,
+            ..
+        } = &hir.statements[2].kind
+        else {
+            panic!("expected outer function");
+        };
+        assert_eq!(decorators.len(), 1);
+        assert_eq!(parameters.len(), 2);
+        assert!(
+            parameters
+                .iter()
+                .all(|parameter| parameter.default.is_some())
+        );
+        assert!(
+            parameters
+                .iter()
+                .all(|parameter| parameter.annotation.is_some())
+        );
+        assert!(return_annotation.is_some());
+        assert!(cells.iter().any(|name| name == "captured"));
+        let hir::StatementKind::FunctionDef { free, .. } = &body[1].kind else {
+            panic!("expected inner function");
+        };
+        assert_eq!(free, &["captured".to_owned()]);
+    }
+
+    #[test]
+    fn gate7_local_observation_order_preserves_parameters_then_first_bindings() {
+        let source = r#"
+def ordered(z, a):
+    q = 1
+    b = 2
+    q = 3
+    for item in [1]:
+        loop_value = item
+    return locals()
+"#;
+        let module = syntax::parse(path(), source).unwrap();
+        let hir = analyze(path(), &module).unwrap();
+        let hir::StatementKind::FunctionDef { locals, .. } = &hir.statements[0].kind else {
+            panic!("expected ordered function");
+        };
+        assert_eq!(
+            locals,
+            &[
+                "z".to_owned(),
+                "a".to_owned(),
+                "q".to_owned(),
+                "b".to_owned(),
+                "item".to_owned(),
+                "loop_value".to_owned(),
+            ]
+        );
     }
 }

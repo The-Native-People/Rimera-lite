@@ -51,6 +51,7 @@ pub enum StatementKind {
     FunctionDef {
         name: String,
         binding: Binding,
+        type_params: Vec<TypeParameter>,
         decorators: Vec<Expression>,
         parameters: Vec<Parameter>,
         return_annotation: Option<Expression>,
@@ -62,14 +63,24 @@ pub enum StatementKind {
     ClassDef {
         name: String,
         binding: Binding,
+        type_params: Vec<TypeParameter>,
         decorators: Vec<Expression>,
         bases: Vec<Expression>,
         metaclass: Option<Expression>,
         keywords: Vec<(String, Expression)>,
         body: Vec<ClassMember>,
     },
+    TypeAlias {
+        name: String,
+        binding: Binding,
+        type_params: Vec<TypeParameter>,
+        value: Expression,
+    },
     Return {
         value: Option<Expression>,
+    },
+    Import {
+        aliases: Vec<ImportAlias>,
     },
     Break,
     Continue,
@@ -107,6 +118,27 @@ pub enum StatementKind {
         subject: Expression,
         cases: Vec<MatchCase>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportAlias {
+    pub module: String,
+    pub bind_name: String,
+    pub binding: Binding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeParameterKind {
+    TypeVar,
+    TypeVarTuple,
+    ParamSpec,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeParameter {
+    pub span: Span,
+    pub name: String,
+    pub kind: TypeParameterKind,
 }
 
 #[derive(Debug, Clone)]
@@ -220,18 +252,32 @@ pub enum ClassMember {
         finally_body: Vec<ClassMember>,
         is_star: bool,
     },
+    Import {
+        aliases: Vec<ImportAlias>,
+    },
     ClassDef {
         name: String,
+        binding: Binding,
+        type_params: Vec<TypeParameter>,
         decorators: Vec<Expression>,
         bases: Vec<Expression>,
         metaclass: Option<Expression>,
         keywords: Vec<(String, Expression)>,
         body: Vec<ClassMember>,
     },
+    TypeAlias {
+        name: String,
+        binding: Binding,
+        type_params: Vec<TypeParameter>,
+        value: Expression,
+    },
     Break,
     Continue,
     FunctionDef {
+        span: Span,
         name: String,
+        binding: Binding,
+        type_params: Vec<TypeParameter>,
         decorators: Vec<Expression>,
         uses_zero_argument_super: bool,
         parameters: Vec<Parameter>,
@@ -270,7 +316,7 @@ pub struct ExceptionHandler {
 #[derive(Debug, Clone)]
 pub struct ClassExceptionHandler {
     pub exception_type: Option<Expression>,
-    pub name: Option<String>,
+    pub name: Option<(String, Binding)>,
     pub body: Vec<ClassMember>,
 }
 
@@ -288,6 +334,10 @@ pub enum Binding {
     Cell,
     Free,
     Global,
+    /// Dynamic class-body name: prepared namespace first, then globals/builtins.
+    ClassName,
+    /// Class-body free name: prepared namespace first, then an enclosing cell.
+    ClassFree,
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +453,12 @@ pub enum ExpressionKind {
     NamedExpression {
         name: String,
         binding: Binding,
+        value: Box<Expression>,
+    },
+    Yield {
+        value: Option<Box<Expression>>,
+    },
+    YieldFrom {
         value: Box<Expression>,
     },
     Comprehension {

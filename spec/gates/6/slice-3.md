@@ -24,3 +24,11 @@ resume state machine with exact persistent state.
 MIR/verifier negative tests, generated-code tests, public multi-yield/send-value
 fixtures, closure mutation, loop control, forced collection, and slot-liveness
 assertions match CPython 3.12.11.
+
+## Completion evidence — 2026-09-03
+
+- MIR `Yield` records yielded value, optional resume-value SSA destination, normal continuation, injected-exception successor, and optional delegate; verifier checks generator ownership, targets, parameters, and delegate values.
+- Generated Cranelift saves only liveness-selected persistent values before suspension and restores them before the compiler-selected continuation; `x = yield y` receives the exact `send(x)` value.
+- `mir::tests::generator_yield_verification_and_persistent_liveness_are_explicit` and the constrained-heap source-generator differential are green.
+
+## DONE BY CHATGPT

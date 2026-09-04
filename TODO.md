@@ -145,7 +145,8 @@ remain governed by [`spec/architecture.md`](spec/architecture.md) and
   - [x] Slice attributes/`indices()` and the remaining native-exporter memoryview
     cast/equality/hash/raw-conversion parity are proven by
     `gate3_slice_and_memoryview_remaining_semantics_match_cpython_312`.
-    Python-level PEP 688 user buffer providers are explicitly owned by Gate 7.
+    Python-level PEP 688 user buffer providers remain outside the Gate 3 claim and
+    are now implemented by Gate 7 Slice 8 over this same memoryview core.
   - [x] Live dictionary views now finish reverse iteration, recursive repr,
     `.mapping`, set-like keys/items behavior, identity-style values equality,
     live mutation, tracing, and iterator invalidation; proven by
@@ -162,7 +163,8 @@ remain governed by [`spec/architecture.md`](spec/architecture.md) and
   - [x] Small Python-visible float/complex surfaces now use normal managed
     attribute lookup and bound calls (`real`, `imag`, `conjugate`, float
     `is_integer`, `as_integer_ratio`, and `hex`); class-level `float.fromhex`
-    is explicitly deferred to Gate 7's builtin/reflection method-table audit.
+    remains outside the Gate 3 claim and is now implemented by Gate 7 Slice 7
+    through ordinary type attribute lookup.
   - [x] Gate 3's compact regression matrix now explicitly covers the three set
     update methods, middle empty-slice insertion for list/bytearray, and
     negative-step slice deletion while reusing the existing focused public
@@ -245,41 +247,101 @@ These checks describe proven slices, not complete Python categories.
     doc tests, release build, and `git diff --check`. The release `hello` is
     485,144 bytes under the 512 KiB budget and passes the forbidden-symbol scan.
 
+## Completed Gate 6
+
+- [x] **Gate 6 — Native synchronous generators**
+  - General source `yield`, yield-expression resume values, lazy construction,
+    `__iter__`/`__next__`, `send`, `throw`, `close`, `GeneratorExit`, PEP 479,
+    suspension through handlers/`finally`, and generic `yield from` delegation
+    use the existing managed generator object and one native resume ABI.
+  - Delegation covers native generators, generator expressions, builtin
+    iterators, and user iterator/delegate objects with traced delegate and
+    pending-exception state; constrained-heap public CPython differentials and
+    runtime GC/failure-atomicity tests are green.
+  - Final acceptance is green: 3 ABI + 8 CLI + 40 compiler + 159 public native
+    pipeline + 59 runtime tests = 269 passed, zero failed/ignored; warning-denied
+    clippy/doc/diff checks pass. `scripts/verify_release.sh` produces a
+    485,176-byte `hello` under the 512 KiB ceiling with a clean forbidden-symbol
+    scan.
+
 ## Active gate
 
-- [ ] **Gate 6 — Native synchronous generators**
-  - Execute the substantial vertical slices in
-    [`spec/gates/6/README.md`](spec/gates/6/README.md) in numeric order, with
-    compiler, runtime/ABI, and proof lanes synchronized inside one active slice.
-  - Extend the existing single generator object/resume ABI; generator
-    expressions are already native and are not a fallback or Gate 6 placeholder.
-  - The active source work is `yield`, `send`, `throw`, `close`, and
-    `yield from`, including suspension cleanup, exception state, and lifecycle
-    semantics. Do not introduce a second generator implementation.
+- [ ] **Gate 5 Slice 6 — propagation, chaining, groups, and cleanup completion**
+  - Continue the existing Gate 5 conformance ledger at
+    [`spec/gates/5/README.md`](spec/gates/5/README.md); Slices 1–5 are already
+    complete and Slice 6 is the sole active compatibility slice.
+  - Preserve the single function/cell/exception/traceback/cleanup model and
+    close the remaining propagation/chaining/group/cleanup matrix before moving
+    to Gate 5 Slice 7.
 
 ## Queued compatibility gates
 
-These remain unchecked until their own end-to-end evidence lands. Gate 6 is the
-sole active implementation gate selected by the Gate 4 closure; the other areas
-below remain separate compatibility promotions and must not be implied complete.
-
-- [ ] Functions/LEGB/structured-exception closure work, split into the queued
-  substantial slices in [`spec/gates/5/README.md`](spec/gates/5/README.md).
-- [ ] Reflection and introspection.
-- [ ] Context managers.
-- [ ] Imports, packages, modules, and `sys.modules`.
-- [ ] Async/await and async protocols.
-- [ ] Capability-governed `eval`, `exec`, and runtime native compilation.
-- [ ] Weak references, finalizers, and resurrection semantics.
-- [ ] Python 3.12 edge-semantics corpus.
-- [ ] Pure-Python standard-library corpus.
-- [ ] Native standard-library/platform bindings.
-- [ ] Real PyPI package corpus and framework acceptance workloads.
+These remain unchecked until their own end-to-end evidence lands. Gate 5 Slice 6
+is the sole active implementation slice after Gate 6 closure; the areas below
+remain separate compatibility promotions and must not be implied complete.
+- [ ] Reflection and introspection, split into the substantial slices in
+  [`spec/gates/7/README.md`](spec/gates/7/README.md).
+  - [x] Gate 7 Slice 1 — ownership, observability, differential matrix, and the
+    narrow cached managed `inspect`/`weakref` import prerequisite.
+  - [x] Gate 7 Slice 2 — native `globals`/`locals`/`vars`/`dir` namespace views,
+    retained snapshots, comprehension/generator scope semantics, GC, and
+    low-heap failure proof.
+  - [x] Gate 7 Slice 3 — generic-call identity/type relations and reflective
+    attribute helpers, including metaclass hooks, descriptor/custom-hook
+    precedence, aliases/rebinding, stable managed IDs, callback mutation, and
+    forced-GC CPython differential proof.
+  - [x] Gate 7 Slice 4 — managed function/code/cell metadata with stable
+    `__code__`/`__closure__` identity, authoritative signature/source metadata,
+    legal code/cell mutation, retained-metadata GC proof, and atomic low-heap
+    `MemoryError` behavior.
+  - [x] Gate 7 Slice 5 — managed exception/traceback/frame inspection with
+    stable frame identity/order, retained-local GC proof, mutation boundaries,
+    and atomic low-heap `MemoryError` behavior.
+  - [x] Gate 7 Slice 6 — managed generator identity/state/suspension metadata,
+    stable retained frames/locals, delegation transitions, terminal detachment,
+    and atomic low-heap publication proof.
+  - [x] Gate 7 Slice 7 — audited type/class method-table metadata plus owned
+    Python 3.12 PEP 695 function/class/type-alias parameters, managed
+    `__type_params__`, forced-GC proof, `float.fromhex`, and stable deferred
+    lazy-bound diagnostics.
+  - [x] Gate 7 Slice 8 — Python-level PEP 688 `__buffer__`/
+    `__release_buffer__` dispatch over the Gate 3 memoryview core, with shared
+    traced leases, nested-view lifetime proof, callback-error semantics,
+    exporter-cycle collection, and low-heap failed-construction atomicity.
+  - [ ] Gate 7 Slices 9–10 remain queued; the parent Gate 7 promotion stays
+    unchecked until its final Slice 10 audit.
+- [ ] Synchronous context managers, split into the queued substantial slices in
+  [`spec/gates/8/README.md`](spec/gates/8/README.md).
+- [ ] **Gate 9 — imports, packages, modules, and `sys.modules`**, split into
+  eight queued slices in [`spec/gates/9/README.md`](spec/gates/9/README.md).
+- [ ] **Gate 10 — async, await, and asynchronous protocols**, split into eight
+  queued slices in [`spec/gates/10/README.md`](spec/gates/10/README.md).
+- [ ] **Gate 11 — capability-governed `compile`, `eval`, `exec`, and runtime
+  native compilation**, split into eight queued slices in
+  [`spec/gates/11/README.md`](spec/gates/11/README.md).
+- [ ] **Gate 12 — weak references, finalizers, and resurrection semantics**,
+  split into eight queued slices in
+  [`spec/gates/12/README.md`](spec/gates/12/README.md).
+- [ ] **Gate 13 — Python 3.12 language/runtime conformance corpus**, split into
+  eight queued slices in [`spec/gates/13/README.md`](spec/gates/13/README.md).
+- [ ] **Gate 14 — Python 3.12 standard library**, split into eight queued slices
+  in [`spec/gates/14/README.md`](spec/gates/14/README.md).
+- [ ] **Gate 15 — native extensions, platform ABI, and foreign
+  interoperability**, split into eight queued slices in
+  [`spec/gates/15/README.md`](spec/gates/15/README.md).
+- [ ] **Gate 16 — packaging and PyPI ecosystem compatibility**, split into
+  eight queued slices in
+  [`spec/gates/16/README.md`](spec/gates/16/README.md).
+- [ ] **Gate 17 — Python 3.12 drop-in release qualification**, split into eight
+  queued slices in [`spec/gates/17/README.md`](spec/gates/17/README.md).
 
 ## Permanent completion checks
 
 - [ ] General Python 3.12 compatibility claim — intentionally unchecked until
   the relevant language, stdlib, platform, and package corpora prove it.
+- [ ] Qualified Python 3.12 drop-in guarantee — intentionally unchecked until
+  Gate 17 closes for a published target, capability, stdlib, and extension-ABI
+  matrix with no partial required surface.
 - [x] Unsupported behavior fails with a stable source diagnostic and emits no
   fallback artifact for the currently tested boundaries.
 - [x] Tested native artifacts exclude CPython, generated-C, `setjmp`, and

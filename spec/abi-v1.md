@@ -43,8 +43,9 @@ The v1 ABI is defined by `rimera-abi` and implemented by `rimera-runtime`.
 The collector is precise, non-moving, and context-owned. Its root providers are
 generated shadow frames, native temporary roots, and context-owned roots. The
 current context roots its built-in type table, module globals, builtins,
-handled and raised exceptions, closure cells, function defaults, and an
-emergency `MemoryError` that remains usable when the heap cannot allocate.
+handled and raised exceptions, closure cells/tuples, function defaults,
+managed code objects, and an emergency `MemoryError` that remains usable when
+the heap cannot allocate.
 
 ## Execution-kernel objects and calls
 
@@ -64,19 +65,40 @@ emergency `MemoryError` that remains usable when the heap cannot allocate.
   values and deliberately map to `object` only within the runtime.
 
 - `RParameterSpec`, `RCallArguments`, and `RKeywordArgument` describe the
-  generic native call boundary. Every compiled Python function has the stable
-  `RNativeFunction(context, function, bound, count, output) -> RStatus`
+  generic native call boundary. `RNameSpec` and `RCodeMetadataSpec` transport
+  compiler-owned UTF-8 local/cell/free names plus filename and first source line
+  when a managed code object is created. Every compiled Python function has the
+  stable `RNativeFunction(context, function, bound, count, output) -> RStatus`
   signature.
-- `rimera_function_new` creates traceable function objects containing native
-  code, the complete parameter specification, defaults, closure cells, and an
-  optional traced annotations dictionary. Function `__annotations__` is
-  exposed through the ordinary attribute path: reading lazily materializes an
-  empty dictionary, assignment accepts a dictionary or `None` reset, and
-  deletion resets it to the lazy-empty state. Generated annotation lowering
-  installs an evaluated dictionary through `rimera_attr_set`; there is no
-  compiler-visible function metadata pointer.
+- `rimera_function_new` creates one traceable function object pointing at one
+  traceable code object. The code object owns the opaque native code identity,
+  complete authoritative parameter-kind specification, filename, first line,
+  local names, cell names, and free names; Python never observes the native
+  address or Cranelift representation. The function object owns mutable
+  Python-level `__name__`, `__qualname__`, positional-default tuple,
+  keyword-only-default dictionary, optional annotations dictionary, and an
+  immutable optional tuple of managed closure cells plus mutable Python-visible
+  `__type_params__` tuple metadata for Gate 7 generic declarations. Ordinary
+  attribute operations expose those fields plus stable `__closure__` and
+  `__code__` identities. Code attributes (`co_name`, `co_qualname`, `co_filename`,
+  `co_firstlineno`, argument counts, `co_nlocals`, `co_varnames`, `co_cellvars`,
+  `co_freevars`, and the supported synchronous `co_flags`) are read-only.
+  Closure tuple identity is read-only while each managed cell exposes mutable
+  and deletable `cell_contents`. `__code__` assignment accepts only a managed
+  code object with the same free-variable count, matching CPython's closure
+  compatibility rule; compatible replacement changes the function's executed
+  code and binder signature without creating a second signature model.
+  Names/qualified names require strings and cannot be deleted; defaults accept
+  tuple/`None`, keyword defaults and annotations accept dict/`None`, and deleting
+  the latter three resets their Python-visible empty/`None` state. Reading
+  missing annotations lazily materializes an empty dictionary. Generated
+  annotation lowering still installs its evaluated dictionary through
+  `rimera_attr_set`.
   `rimera_call` is the authoritative binder for positional-only,
-  positional-or-keyword, keyword-only, `*args`, and `**kwargs` parameters.
+  positional-or-keyword, keyword-only, `*args`, and `**kwargs` parameters. It
+  resolves the function's current managed code object on every activation and
+  reads the current defaults/keyword-defaults objects, so legal metadata and
+  code mutation affect later calls without introducing a second binding path.
 - Gate 4 expanded call sites preserve source-order parts with
   `RCallArgumentKind` (`Positional`, `Starred`, `Keyword`, and
   `KeywordUnpack`). `rimera_call_arguments_new` allocates an internal traced
@@ -90,34 +112,153 @@ emergency `MemoryError` that remains usable when the heap cannot allocate.
   refreshes that accounting before heap-limit enforcement. Duplicate expanded
   keyword names and non-string mapping keys fail before callee entry at the
   CPython 3.12 callback point.
-- `rimera_generator_function_new` creates a traceable callable with the same
-  binding metadata plus a persistent-slot count. Calling it through
+- `rimera_generator_function_new` creates the same traceable function/code pair
+  and marks the managed code object as a generator with its persistent-slot
+  count. Calling it through
   `rimera_call` performs ordinary argument binding but only allocates a
-  suspended generator; it does not start execution. Its resume entry uses
-  `RNativeGeneratorResume(context, generator, operation, input, output,
-  outcome) -> RStatus`. `RGeneratorOperation` selects next, send, throw, or
-  close, while an `Ok` result writes `RGeneratorOutcome::Yielded` or
-  `RGeneratorOutcome::Returned`. The generator's persistent slots, delegate,
-  saved handled-exception state, and terminal result are traced by its owning
-  context. Codegen must preserve every value live across suspension in those
-  explicit slots and clear obsolete slots on terminal completion. Gate 4
-  generator expressions are the first source feature using this resume ABI:
-  they compile to hidden `Generator` MIR functions with explicit `Yield`
-  terminators, ordinary `iter`/`next` behavior, repeated exhaustion, exception
-  termination, and public forced-GC proof. General source `yield`, `send`,
-  `throw`, `close`, and `yield from` remain Gate 6-owned.
+  suspended generator; it does not start execution. Its one permanent resume
+  entry is `RNativeGeneratorResume(context, generator, operation, input,
+  output, outcome) -> RStatus`. `RGeneratorOperation` selects `Next`, `Send`,
+  `Throw`, or `Close`; an `Ok` result writes `RGeneratorOutcome::Yielded` or
+  `RGeneratorOutcome::Returned`. Source generators and Gate 4 generator
+  expressions use this same object, binder, resume entry, and Cranelift state
+  dispatcher; there is no generator-specific interpreter or second ABI.
+- A source `Yield` MIR terminator records the yielded value, the SSA resume
+  input when the expression consumes `send`, its normal continuation, its
+  injected-exception successor, and an optional active delegation value.
+  Codegen saves every liveness-selected persistent value before publishing the
+  next state and restores those slots before entering the compiler-selected
+  continuation. The generator owns and traces persistent slots, the active
+  delegate, saved handled-exception stack, a pending managed exception that may
+  cross cleanup suspension, and its terminal return value; terminal completion
+  or failure clears obsolete slots/delegates/exception state exactly once.
+- Python-visible `__iter__`, `__next__`, `send`, `throw`, and `close` are bound
+  managed methods reached through ordinary attribute/call dispatch. Generator
+  `return` is surfaced by the caller as managed `StopIteration.value`; escaped
+  `StopIteration` is converted to `RuntimeError` under PEP 479. `throw` and
+  `close` inject the managed exception at the exact compiler suspension point,
+  so local handlers/finally blocks remain ordinary verified MIR control flow.
+- `yield from` uses the additive `RGeneratorDelegateOutcome` contract
+  (`Yielded`, `Completed`, `Propagate`) and three opaque helpers:
+  `rimera_generator_delegate_start` performs the first generic iterator step,
+  `rimera_generator_delegate_set` publishes/clears the traced active delegate,
+  and `rimera_generator_delegate_resume` forwards the current next/send/throw/
+  close operation. Delegated `StopIteration.value` becomes the `yield from`
+  expression result; a non-terminal delegate exception is returned as
+  `Propagate` while the managed exception remains installed so generated code
+  enters the delegator's compiled exception successor. Native generators,
+  generator expressions, builtin iterators, and user iterator objects all use
+  this path.
 - Generated generator-resume code keeps the heap representation opaque through
-  the narrow `rimera_generator_function_get`, `rimera_generator_state_get`,
-  `rimera_generator_state_set`, `rimera_generator_slot_get`, and
-  `rimera_generator_slot_set` helpers. A suspension saves every liveness-selected
-  persistent value before publishing the next state; resumption restores those
-  slots before entering the compiler-selected continuation. These helpers expose
-  neither heap pointers nor generator layout and are not a runtime MIR evaluator.
+  `rimera_generator_function_get`, `rimera_generator_state_get`,
+  `rimera_generator_state_set`, `rimera_generator_slot_get`,
+  `rimera_generator_slot_set`, and the delegation helpers above. These helpers
+  expose neither heap pointers nor generator layout and are not a runtime MIR
+  evaluator.
 - `rimera_cell_*`, `rimera_global_*`, and
   `rimera_function_closure_get` implement mutable lexical cells, module
   globals, and builtins fallback without exposing heap pointers to generated
   code. Global fallback lazily publishes known builtin types and native builtin
   functions in the context-owned builtins dictionary.
+- Gate 7 namespace reflection extends that same compiled-cell contract with two
+  additive opaque helpers: `rimera_reflection_scope_configure(context,
+  namespace_or_null, comprehension)` declares whether the active native
+  activation observes a live prepared namespace, a refreshed frame-style locals
+  snapshot, or an inlined-comprehension overlay; and
+  `rimera_reflection_local_register(context, name, name_len, cell)` registers the
+  authoritative compiled `Cell` for one Python-visible binding. Generated code
+  emits these operations from verified MIR; the runtime does not allocate a
+  second local-variable store, interpret MIR, or expose frame addresses.
+  Module `globals()`/`locals()` use the context-owned globals dictionary. Class
+  bodies pass their existing prepared namespace and therefore expose live
+  write-through class locals. Ordinary functions and source generators lazily
+  allocate one managed locals dictionary per activation/frame and refresh only
+  compiler-owned binding keys from registered cells; the dictionary identity is
+  stable during the activation, independently retained snapshots survive return,
+  and user-added non-binding keys survive later refreshes. Python 3.12 inlined
+  list/set/dict comprehensions temporarily overlay their registered iteration
+  cells onto the nearest non-comprehension owner view and restore/remove those
+  names on exit. Generator expressions instead use their own suspended
+  frame-style snapshot containing `.0`, iteration locals, and referenced frees.
+  Suspended generators persist the reflection cell registry and snapshot in the
+  managed generator object across resume boundaries and clear obsolete internal
+  reflection roots at terminal completion. All configured namespaces, cells,
+  snapshots, and overlay state participate in the context's precise root graph.
+  The lazily published managed builtins `globals`, `locals`, `vars`, and `dir`
+  are invoked through ordinary `rimera_call`: zero-argument `vars()` delegates
+  to the current locals rule; one-argument `vars()` uses ordinary `__dict__`
+  lookup; and `dir` uses current namespace/default attribute sources or a normal
+  bound `__dir__` callback, consuming its iterable generically and sorting the
+  resulting managed list through ordinary list semantics. Allocation failures
+  reached through these generic calls preserve the common managed `MemoryError`
+  path instead of being reclassified as argument-binding `TypeError`s.
+- Gate 7 Slice 1 adds the deliberately narrow opaque import helper
+  `rimera_import_name(context, name, name_len, output)`. Verified `ImportName`
+  MIR lowers directly to this ABI and may resolve only explicitly registered
+  managed module shells; the current registry is `inspect` and `weakref`.
+  Each successful first import allocates one traced `ModuleObject` over one live
+  managed namespace, publishes `__name__`, `__package__`, `__loader__`, and
+  `__spec__`, and only then inserts the completed module into the context-owned
+  cache. The cache is a precise context root, so repeated imports preserve module
+  identity and namespace mutation survives collection. A construction failure
+  publishes no cache entry; managed-heap exhaustion follows the ordinary
+  `MemoryError` ABI path, and an unregistered name raises managed
+  `ModuleNotFoundError`. This helper does not execute Python module source and
+  does not implement dotted/package imports, `from ... import ...`, public
+  `sys.modules`, a user-visible `__import__`, or either module shell's stdlib API.
+- Gate 7 Slice 5 extends the existing managed exception/traceback ABI without
+  exposing native frame pointers. Function/generator failures use
+  `rimera_traceback_append(context, filename, filename_len, function,
+  function_len, line, column)` to append one managed `TracebackObject` linked to
+  one stable managed `FrameObject`; the frame owns managed references to its
+  authoritative `CodeObject`, globals, refreshed locals snapshot, optional
+  caller frame, and source line. Module failures use the additive
+  `rimera_traceback_append_module` signature with the same arguments and status
+  contract but a module-only capture path, keeping function/generator
+  introspection machinery out of tiny module-only release artifacts. Compiler
+  exception edges append a frame only when crossing a new Python frame; bare
+  reraising and cleanup propagation preserve the existing chain. Traceback/frame
+  allocation failure publishes no partial link and maps heap exhaustion to the
+  ordinary managed `MemoryError` path.
+- Gate 7 Slice 6 keeps the Gate 6 native resume ABI opaque while publishing
+  Python-visible generator metadata from managed ownership. Each generator owns
+  stable name/qualified-name metadata and a managed frame whose code, globals,
+  locals, and suspension line are Python-visible; `gi_running`, `gi_suspended`,
+  and the current `yield from` delegate are derived from the authoritative
+  generator lifecycle. Verified generator-yield code calls
+  `rimera_generator_frame_line_set(context, generator, line)` solely to update
+  Python-visible suspension metadata; it does not expose or mutate the native
+  resume address/state-machine layout. Terminal completion/close/failure clears
+  the generator-to-frame edge while independently retained frames remain normal
+  traced managed objects. Generator and frame payloads are boxed inside the
+  managed-object union and their payload bytes are charged explicitly, so this
+  reflection surface does not inflate the common per-object managed-size base or
+  weaken the established 8 KiB startup contract.
+- Gate 7 Slice 7 adds two opaque construction helpers for Python 3.12 generic
+  metadata. `rimera_type_parameter_new(context, kind, name, name_len, output)`
+  receives the stable `RTypeParameterKind` (`TypeVar`, `TypeVarTuple`, or
+  `ParamSpec`) discriminator and allocates one traced managed parameter object.
+  `rimera_type_alias_new(context, name, name_len, type_params, value, output)`
+  allocates one traced managed type-alias object over an already-built parameter
+  tuple and alias value. Verified `TypeParameterNew`/`TypeAliasNew` MIR lowers
+  directly to these calls; generated code never observes their heap layout.
+  Functions/classes/type aliases publish the same managed parameter identities
+  through ordinary `__type_params__` attributes. Lazy PEP 695 bound/constraint
+  evaluation is not faked by this ABI and remains a source-level capability
+  boundary.
+- Gate 7 Slice 8 adds no buffer pointer ABI. Python-level PEP 688 providers are
+  reached through the existing generic special-method/call path: memoryview
+  construction descriptor-binds `__buffer__`, forwards the CPython constructor
+  flag mask, validates a managed memoryview result, and records one internal
+  traced `BufferLeaseObject` containing the provider and exact returned view.
+  Derived memoryviews trace and share that lease. The final live view invokes
+  `__release_buffer__` exactly once and releases the exact returned view;
+  callback failures are unraisable and cannot replace caller exception state.
+  Failed post-acquisition allocation and cyclic exporter graphs use the same
+  once-only release contract. GC discovers provider leases during lifecycle
+  processing but invokes Python only after the raw heap phase, then recollects
+  finalized cycles. Native bytes/bytearray/memoryview exporters continue using
+  the Gate 3 representation and resize/export accounting.
 - The rooted `type` object is callable through `rimera_call`; `isinstance` and
   `issubclass` are managed native builtin functions invoked through the same
   path, never compiler intrinsics. `isinstance` and `issubclass` use MRO
@@ -140,7 +281,7 @@ emergency `MemoryError` that remains usable when the heap cannot allocate.
   The three-argument `type(name, bases, namespace)` call uses this identical
   constructor after validating `str`, tuple, and dictionary inputs.
 - `rimera_namespace_new`, `rimera_namespace_set`, `rimera_namespace_get`,
-  `rimera_class_name_get`, and `rimera_namespace_delete` build and mutate the ordered,
+  `rimera_class_name_get`, `rimera_class_free_get`, and `rimera_namespace_delete` build and mutate the ordered,
   traceable namespace used by compiled class bodies. Gate 4 annotations add
   `rimera_annotations_ensure(context, namespace_or_null)`: a null namespace
   selects module globals, while a non-null value selects the prepared class
@@ -161,8 +302,13 @@ emergency `MemoryError` that remains usable when the heap cannot allocate.
   prepared namespace as an internal positional parameter. They use the normal
   five-word native function ABI and generic call path, so class-body failures,
   closures, GC roots, and traceback frames follow ordinary compiled-function
-  contracts. `rimera_class_name_get` resolves the prepared namespace before
-  module globals and lazy builtins. A custom `__prepare__` mapping is accessed
+  contracts. `rimera_class_name_get` resolves an ordinary dynamic class-body
+  name from the prepared namespace before module globals and lazy builtins.
+  `rimera_class_free_get(context, namespace, cell, name, len, output)` is the
+  class-body free-variable companion: it checks the prepared namespace first
+  and falls back to the explicit enclosing closure cell on a miss. Explicit
+  class `global` bindings bypass both helpers and explicit class `nonlocal`
+  bindings read/write/clear the enclosing cell directly. A custom `__prepare__` mapping is accessed
   through ordinary `__getitem__`, `__setitem__`, and `__delitem__` calls while
   the body executes; a missing `KeyError` continues class-scope fallback.
   As in CPython, default `type.__new__` still requires a dictionary, while a
@@ -255,9 +401,10 @@ emergency `MemoryError` that remains usable when the heap cannot allocate.
   with optional `@`, including `n`, `N`, and `P`, and use target-native widths
   for C `long`, ssize-sized, size-sized, and pointer-sized values. Equality is
   logical element/shape equality, while readonly byte-format hashing validates
-  the ultimate exporter. PEP 688 user-defined `__buffer__`/
-  `__release_buffer__` dispatch is intentionally deferred to Gate 7 rather than
-  being represented by a partial ABI-v1 exporter hook.
+  the ultimate exporter. Gate 7 Slice 8 extends this same managed memoryview
+  model to user-defined PEP 688 `__buffer__`/`__release_buffer__` providers via
+  ordinary generic dispatch and an internal traced lease; no partial exporter
+  pointer or duplicate buffer ABI is exposed to generated code.
 - `rimera_complex_new`, `rimera_bytes_new`, `rimera_bytearray_new`, and
   `rimera_slice_new` are additive ABI-v1 constructors for source literals and
   normalized slice bounds. Their inputs and outputs are opaque values; null
@@ -402,22 +549,43 @@ without changing the stable runtime ABI.
 - `rimera_exception_new` is structured-exception runtime scaffolding; generated
   source raises through the higher-level exception operations documented below.
 - `rimera_generator_function_new`, `rimera_generator_new`,
-  `rimera_generator_resume`, and the state/slot accessors are the single native
-  generator ABI. Gate 4 generator expressions now exercise that ABI through
-  verified suspension MIR and public native source tests. This does not imply
-  general generator completion: source `yield`, `send`, `throw`, `close`, and
-  `yield from` remain Gate 6-owned.
+  `rimera_generator_resume`, the state/slot accessors, and the three delegation
+  helpers form the single native synchronous-generator ABI. Gate 4 generator
+  expressions and Gate 6 source generators both exercise it through verified
+  suspension MIR and compiled Cranelift continuation blocks. The implemented
+  synchronous surface includes source `yield`, yield-expression resume values,
+  `send`, `throw`, `close`, PEP 479, suspension through handlers/finally, and
+  generic `yield from` delegation. Async generators and async iteration remain
+  later async-gate work.
 
 ## Structured exceptions
 
-- Exception instances are managed values containing their type, `args`,
-  traceback, explicit cause, implicit context, and suppression flag.
+- Exception instances are managed Python-visible values containing their type,
+  live `args`, an optional traced instance dictionary, traceback, explicit
+  cause, implicit context, and suppression flag. Ordinary attribute dispatch
+  exposes `args`, `__dict__`, `__traceback__`, `__cause__`, `__context__`,
+  `__suppress_context__`, user-defined exception attributes/methods, and
+  `with_traceback`; metadata mutations validate Python's value constraints and
+  are published only after any required allocation succeeds.
+- Calling a user exception subclass uses the ordinary type/class invocation
+  path and descriptor-bound `__init__`; raising an exception class normalizes
+  it through that same generic call path before installing it as the active
+  managed exception. Raising an existing exception preserves object identity.
+  Class/cause normalization is owned specifically by the source-level
+  `rimera_raise` ABI boundary; the lower-level `raise_value` operation accepts
+  already-normalized managed exception instances. This separation preserves
+  Python semantics while allowing programs with no source `raise` to dead-strip
+  the generic call/constructor graph.
 - `rimera_raise`, `rimera_reraise`, `rimera_handler_enter`,
   `rimera_handler_leave`, and `rimera_exception_propagate` maintain structured
   context-owned state. Generated code uses explicit normal and exception CFG
   edges; host unwinding is not exception control flow.
-- `rimera_traceback_append` attaches immutable filename/function/line frames
-  when an exception escapes a compiled function.
+- `rimera_traceback_append` attaches managed filename/function/line frames at
+  explicit source `raise` sites before a local handler receives the exception,
+  and again when an exception escapes a compiled function. Traceback objects
+  expose read-only `tb_lineno` and validated mutable `tb_next` through ordinary
+  attribute dispatch, so `__traceback__`/`with_traceback` reuse the same traced
+  object chain.
 - `rimera_exception_split` recursively partitions ordinary exceptions and
   exception groups while preserving subgroup shape. The split result is an
   internal two-element value array containing matched and remainder values;

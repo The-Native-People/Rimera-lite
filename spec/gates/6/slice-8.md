@@ -26,3 +26,11 @@ survives allocation, callbacks, exceptions, and collection pressure.
 A compact composition corpus matches CPython 3.12.11 stdout, stderr, status,
 traceback shape, and side-effect order with normal and constrained heaps. MIR
 root plans and ABI reachability are audited against the final artifact.
+
+## Completion evidence — 2026-09-03
+
+- Six public Gate 6 differentials pass through the real build API under 96–128 KiB heap limits, covering generators with classes/descriptors, comprehensions/genexpr, pattern matching, expanded calls, injected exceptions, cleanup, and delegation.
+- `generator_delegate_and_pending_exception_graphs_are_traced_and_fail_atomically` proves rooted delegate/pending-exception graphs survive collection, abandoned graphs collect, and zero-headroom generator construction publishes no partial object.
+- Public artifact scanning and the release verifier keep generated C, CPython, `setjmp`, and `longjmp` out of the native output.
+
+## DONE BY CHATGPT

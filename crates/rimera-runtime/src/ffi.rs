@@ -5,12 +5,16 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 use rimera_abi::{
-    ABI_VERSION, RCallArgumentKind, RCallArguments, RFormatConversion, RParameterSpec, RRootFrame,
-    RStatus, RValue,
+    ABI_VERSION, RCallArgumentKind, RCallArguments, RCodeMetadataSpec, RFormatConversion,
+    RGeneratorDelegateOutcome, RGeneratorOperation, RNameSpec, RParameterSpec, RRootFrame, RStatus,
+    RTypeParameterKind, RValue,
 };
 
 use crate::heap::HeapObject;
-use crate::object::{CellObject, DictionaryViewKind, FunctionKind, FunctionObject, Parameter};
+use crate::object::{
+    CellObject, CodeObject, DictionaryViewKind, FunctionKind, FunctionObject, Parameter,
+    TypeAliasObject, TypeParameterObject,
+};
 use crate::{ParameterKind, RimeraContext, call, operations};
 
 type StatusResult = Result<(), RStatus>;
@@ -172,6 +176,25 @@ unsafe fn utf8<'a>(bytes: *const u8, len: usize) -> Result<&'a str, RStatus> {
     std::str::from_utf8(bytes).map_err(|_| RStatus::InvalidArgument)
 }
 
+unsafe fn owned_name_specs(specs: *const RNameSpec, len: usize) -> Result<Vec<String>, RStatus> {
+    if specs.is_null() && len != 0 {
+        return Err(RStatus::InvalidArgument);
+    }
+    let specs = if len == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller promises `len` readable name specifications.
+        unsafe { std::slice::from_raw_parts(specs, len) }
+    };
+    specs
+        .iter()
+        .map(|spec| {
+            // SAFETY: every nested name follows the same readable UTF-8 slice contract.
+            unsafe { utf8(spec.name, spec.name_len) }.map(str::to_owned)
+        })
+        .collect()
+}
+
 /// Creates a context for the requested ABI version.
 ///
 /// # Safety
@@ -276,6 +299,7 @@ pub unsafe extern "C" fn rimera_function_new(
     parameter_len: usize,
     closure: *const RValue,
     closure_len: usize,
+    metadata: *const RCodeMetadataSpec,
     output: *mut RValue,
 ) -> RStatus {
     if code.is_null()
@@ -305,7 +329,35 @@ pub unsafe extern "C" fn rimera_function_new(
         // SAFETY: null was rejected and the caller supplies `closure_len` values.
         unsafe { std::slice::from_raw_parts(closure, closure_len) }
     };
+    let (filename, first_line, local_names, cell_names, free_names) = if metadata.is_null() {
+        (String::new(), 0, Vec::new(), Vec::new(), Vec::new())
+    } else {
+        // SAFETY: a non-null metadata pointer is readable for one ABI record.
+        let metadata = unsafe { *metadata };
+        let Ok(filename) = (unsafe { utf8(metadata.filename, metadata.filename_len) }) else {
+            return RStatus::InvalidArgument;
+        };
+        // SAFETY: nested arrays use the same readable-slice contract as parameters.
+        let (Ok(local_names), Ok(cell_names), Ok(free_names)) = (unsafe {
+            (
+                owned_name_specs(metadata.local_names, metadata.local_name_len),
+                owned_name_specs(metadata.cell_names, metadata.cell_name_len),
+                owned_name_specs(metadata.free_names, metadata.free_name_len),
+            )
+        }) else {
+            return RStatus::InvalidArgument;
+        };
+        (
+            filename.to_owned(),
+            metadata.first_line,
+            local_names,
+            cell_names,
+            free_names,
+        )
+    };
     let mut converted = Vec::with_capacity(parameter_len);
+    let mut positional_defaults = Vec::new();
+    let mut keyword_defaults = Vec::new();
     for parameter in parameter_specs {
         // SAFETY: each parameter name follows the same readable-slice contract.
         let Ok(parameter_name) = (unsafe { utf8(parameter.name, parameter.name_len) }) else {
@@ -314,25 +366,157 @@ pub unsafe extern "C" fn rimera_function_new(
         let Ok(kind) = ParameterKind::try_from(parameter.kind) else {
             return RStatus::InvalidArgument;
         };
+        let has_default = parameter.has_default != 0;
+        if has_default {
+            match kind {
+                ParameterKind::PositionalOnly | ParameterKind::PositionalOrKeyword => {
+                    positional_defaults.push(parameter.default);
+                }
+                ParameterKind::KeywordOnly => {
+                    keyword_defaults.push((parameter_name.to_owned(), parameter.default));
+                }
+                ParameterKind::VarArgs | ParameterKind::VarKeywords => {
+                    return RStatus::InvalidArgument;
+                }
+            }
+        }
         converted.push(Parameter {
             name: parameter_name.to_owned(),
             kind,
-            default: (parameter.has_default != 0).then_some(parameter.default),
+            has_default,
         });
     }
     let mut roots = closure.to_vec();
-    roots.extend(converted.iter().filter_map(|parameter| parameter.default));
+    roots.extend_from_slice(&positional_defaults);
+    roots.extend(keyword_defaults.iter().map(|(_, value)| *value));
     with_output(context, output, |context| {
         context.initialize_kernel()?;
         context.with_temporary_roots(&roots, |context| {
-            context.allocate(HeapObject::Function(FunctionObject {
-                code_address: code as usize,
-                kind: FunctionKind::Normal,
+            let defaults = (!positional_defaults.is_empty())
+                .then(|| operations::tuple(context, &positional_defaults))
+                .transpose()?;
+
+            let mut metadata_roots = roots.clone();
+            defaults
+                .into_iter()
+                .for_each(|value| metadata_roots.push(value));
+            let keyword_defaults_value = if keyword_defaults.is_empty() {
+                None
+            } else {
+                let mut keys = Vec::with_capacity(keyword_defaults.len());
+                for (key, _) in &keyword_defaults {
+                    let key = context.with_temporary_roots(&metadata_roots, |context| {
+                        operations::string(context, key)
+                    })?;
+                    metadata_roots.push(key);
+                    keys.push(key);
+                }
+                let values = keyword_defaults
+                    .iter()
+                    .map(|(_, value)| *value)
+                    .collect::<Vec<_>>();
+                Some(context.with_temporary_roots(&metadata_roots, |context| {
+                    operations::dictionary(context, &keys, &values)
+                })?)
+            };
+            keyword_defaults_value
+                .into_iter()
+                .for_each(|value| metadata_roots.push(value));
+            let closure_value = if closure.is_empty() {
+                None
+            } else {
+                let value = context.with_temporary_roots(&metadata_roots, |context| {
+                    operations::tuple(context, closure)
+                })?;
+                metadata_roots.push(value);
+                Some(value)
+            };
+            let code_value = context.with_temporary_roots(&metadata_roots, |context| {
+                context.allocate(HeapObject::Code(CodeObject {
+                    code_address: code as usize,
+                    kind: FunctionKind::Normal,
+                    name: name.to_owned(),
+                    qualified_name: qualified_name.to_owned(),
+                    parameters: converted.into_boxed_slice(),
+                    filename,
+                    first_line,
+                    local_names: local_names.into_boxed_slice(),
+                    cell_names: cell_names.into_boxed_slice(),
+                    free_names: free_names.into_boxed_slice(),
+                }))
+            })?;
+            metadata_roots.push(code_value);
+            context.with_temporary_roots(&metadata_roots, |context| {
+                context.allocate(HeapObject::Function(FunctionObject {
+                    code: code_value,
+                    name: name.to_owned(),
+                    qualified_name: qualified_name.to_owned(),
+                    closure: closure_value,
+                    defaults,
+                    keyword_defaults: keyword_defaults_value,
+                    annotations: None,
+                    type_params: None,
+                }))
+            })
+        })
+    })
+}
+
+/// Creates one managed Python 3.12 type parameter.
+///
+/// # Safety
+/// `name` must be readable UTF-8 and `output` writable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_type_parameter_new(
+    context: *mut RimeraContext,
+    kind: u8,
+    name: *const u8,
+    name_len: usize,
+    output: *mut RValue,
+) -> RStatus {
+    let Ok(kind) = RTypeParameterKind::try_from(kind) else {
+        return RStatus::InvalidArgument;
+    };
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    with_output(context, output, |context| {
+        context.allocate(HeapObject::TypeParameter(TypeParameterObject {
+            name: name.to_owned(),
+            kind,
+        }))
+    })
+}
+
+/// Creates one managed Python 3.12 `type` statement alias object.
+///
+/// # Safety
+/// Name storage and both input values must be readable; `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_type_alias_new(
+    context: *mut RimeraContext,
+    name: *const u8,
+    name_len: usize,
+    type_params: *const RValue,
+    value: *const RValue,
+    output: *mut RValue,
+) -> RStatus {
+    if type_params.is_null() || value.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let (type_params, value) = unsafe { (*type_params, *value) };
+    with_output(context, output, |context| {
+        if !matches!(context.heap.get(type_params), Some(HeapObject::Tuple(_))) {
+            return Err("type alias parameters must be a tuple".to_owned());
+        }
+        context.with_temporary_roots(&[type_params, value], |context| {
+            context.allocate(HeapObject::TypeAlias(TypeAliasObject {
                 name: name.to_owned(),
-                qualified_name: qualified_name.to_owned(),
-                parameters: converted.into_boxed_slice(),
-                closure: closure.to_vec().into_boxed_slice(),
-                annotations: None,
+                type_params,
+                value,
             }))
         })
     })
@@ -357,6 +541,7 @@ pub unsafe extern "C" fn rimera_generator_function_new(
     parameter_len: usize,
     closure: *const RValue,
     closure_len: usize,
+    metadata: *const RCodeMetadataSpec,
     persistent_slot_count: usize,
     output: *mut RValue,
 ) -> RStatus {
@@ -372,6 +557,7 @@ pub unsafe extern "C" fn rimera_generator_function_new(
             parameter_len,
             closure,
             closure_len,
+            metadata,
             output,
         )
     };
@@ -381,9 +567,13 @@ pub unsafe extern "C" fn rimera_generator_function_new(
     // SAFETY: success guarantees an initialized output and the context remains
     // owned by the caller for this ABI call.
     let (context, function) = unsafe { (&mut *context, *output) };
-    match context.heap.get_mut(function) {
-        Some(HeapObject::Function(function)) => {
-            function.kind = FunctionKind::Generator {
+    let code = match context.heap.get(function) {
+        Some(HeapObject::Function(function)) => function.code,
+        _ => return RStatus::InvalidArgument,
+    };
+    match context.heap.get_mut(code) {
+        Some(HeapObject::Code(code)) => {
+            code.kind = FunctionKind::Generator {
                 persistent_slot_count,
             };
             RStatus::Ok
@@ -448,10 +638,122 @@ pub unsafe extern "C" fn rimera_generator_resume(
             RStatus::Ok
         }
         Err(message) => {
-            context.fail(message);
+            if context.raised.is_none() {
+                context.fail(message);
+            }
             RStatus::Exception
         }
     }
+}
+
+/// Advances a freshly-created `yield from` delegate once through its generic
+/// iterator protocol. `value` is either the yielded item or completion value.
+///
+/// # Safety
+/// `iterator` must be readable and both outputs writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_generator_delegate_start(
+    context: *mut RimeraContext,
+    iterator: *const RValue,
+    value: *mut RValue,
+    outcome: *mut RGeneratorDelegateOutcome,
+) -> RStatus {
+    if iterator.is_null() || value.is_null() || outcome.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let iterator = unsafe { *iterator };
+    protect(context, |context| {
+        match call::generator_delegate_start(context, iterator) {
+            Ok((result, result_outcome)) => {
+                unsafe {
+                    value.write(result);
+                    outcome.write(result_outcome);
+                }
+                Ok(())
+            }
+            Err(message) => {
+                if context.raised.is_none() {
+                    context.fail(message);
+                }
+                Err(RStatus::Exception)
+            }
+        }
+    })
+}
+
+/// Publishes or clears the active `yield from` delegate on a generator object.
+///
+/// # Safety
+/// `generator` and `delegate` must be readable ABI values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_generator_delegate_set(
+    context: *mut RimeraContext,
+    generator: *const RValue,
+    delegate: *const RValue,
+) -> RStatus {
+    if generator.is_null() || delegate.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let (generator, delegate) = unsafe { (*generator, *delegate) };
+    protect(context, |context| {
+        let Some(HeapObject::Generator(object)) = context.heap.get_mut(generator) else {
+            return Err(RStatus::InvalidArgument);
+        };
+        object.delegate = (delegate != RValue::NONE).then_some(delegate);
+        Ok(())
+    })
+}
+
+/// Forwards one resume operation through the currently-published `yield from`
+/// delegate. The helper clears the delegate after completion or propagation.
+///
+/// # Safety
+/// Generator/input must be readable and outputs writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_generator_delegate_resume(
+    context: *mut RimeraContext,
+    generator: *const RValue,
+    operation: RGeneratorOperation,
+    input: *const RValue,
+    value: *mut RValue,
+    outcome: *mut RGeneratorDelegateOutcome,
+) -> RStatus {
+    if generator.is_null() || input.is_null() || value.is_null() || outcome.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let (generator, input) = unsafe { (*generator, *input) };
+    protect(context, |context| {
+        let delegate = match context.heap.get(generator) {
+            Some(HeapObject::Generator(object)) => object.delegate,
+            _ => return Err(RStatus::InvalidArgument),
+        };
+        let Some(delegate) = delegate else {
+            return Err(RStatus::InvalidArgument);
+        };
+        match call::generator_delegate_resume(context, delegate, operation, input) {
+            Ok((result, result_outcome)) => {
+                if result_outcome != RGeneratorDelegateOutcome::Yielded
+                    && let Some(HeapObject::Generator(object)) = context.heap.get_mut(generator)
+                {
+                    object.delegate = None;
+                }
+                unsafe {
+                    value.write(result);
+                    outcome.write(result_outcome);
+                }
+                Ok(())
+            }
+            Err(message) => {
+                if let Some(HeapObject::Generator(object)) = context.heap.get_mut(generator) {
+                    object.delegate = None;
+                }
+                if context.raised.is_none() {
+                    context.fail(message);
+                }
+                Err(RStatus::Exception)
+            }
+        }
+    })
 }
 
 /// Reads the compiled function owned by a suspended generator.
@@ -515,6 +817,31 @@ pub unsafe extern "C" fn rimera_generator_state_set(
     };
     generator.state = state;
     RStatus::Ok
+}
+
+/// Publishes the source line associated with the generator's current
+/// suspension point. This updates only Python-visible frame metadata; native
+/// resume state remains opaque and separately owned by `rimera_generator_state_set`.
+///
+/// # Safety
+/// `generator` must be readable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_generator_frame_line_set(
+    context: *mut RimeraContext,
+    generator: *const RValue,
+    line: u32,
+) -> RStatus {
+    if context.is_null() || generator.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let (context, generator) = unsafe { (&mut *context, *generator) };
+    match context.set_generator_frame_line(generator, line) {
+        Ok(()) => RStatus::Ok,
+        Err(message) => {
+            context.fail(message);
+            RStatus::InvalidArgument
+        }
+    }
 }
 
 /// Restores one compiler-planned value that is live across suspension.
@@ -587,6 +914,65 @@ pub unsafe extern "C" fn rimera_cell_new(
         context.with_temporary_roots(&initial.into_iter().collect::<Vec<_>>(), |context| {
             context.allocate(HeapObject::Cell(CellObject { value: initial }))
         })
+    })
+}
+
+/// Configures the Python-visible namespace semantics for the active compiled
+/// activation. A null namespace selects function-style snapshot locals.
+///
+/// # Safety
+/// A non-null namespace pointer must be readable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_reflection_scope_configure(
+    context: *mut RimeraContext,
+    namespace: *const RValue,
+    comprehension: u8,
+) -> RStatus {
+    if context.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let namespace = if namespace.is_null() {
+        None
+    } else {
+        Some(unsafe { *namespace })
+    };
+    protect(context, |context| {
+        context
+            .configure_active_scope(namespace, comprehension != 0)
+            .map_err(|message| {
+                record_exception(context, "RuntimeError", message);
+                RStatus::Exception
+            })
+    })
+}
+
+/// Registers one authoritative compiled local cell with the active activation.
+/// `locals()` refreshes values from these cells rather than from shadow frame
+/// storage.
+///
+/// # Safety
+/// Name storage and `cell` must be readable for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_reflection_local_register(
+    context: *mut RimeraContext,
+    name: *const u8,
+    name_len: usize,
+    cell: *const RValue,
+) -> RStatus {
+    if context.is_null() || cell.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let cell = unsafe { *cell };
+    protect(context, |context| {
+        context
+            .register_active_local(name, cell)
+            .map_err(|message| {
+                record_exception(context, "RuntimeError", message);
+                RStatus::Exception
+            })
     })
 }
 
@@ -735,7 +1121,14 @@ pub unsafe extern "C" fn rimera_function_closure_get(
     let function = unsafe { *function };
     protect(context, |context| {
         let value = match context.heap.get(function) {
-            Some(HeapObject::Function(function)) => function.closure.get(index).copied(),
+            Some(HeapObject::Function(function)) => {
+                function
+                    .closure
+                    .and_then(|closure| match context.heap.get(closure) {
+                        Some(HeapObject::Tuple(cells)) => cells.get(index).copied(),
+                        _ => None,
+                    })
+            }
             _ => return Err(RStatus::InvalidArgument),
         };
         let Some(value) = value else {
@@ -778,6 +1171,25 @@ pub unsafe extern "C" fn rimera_global_set(
             _ => Err(RStatus::InvalidArgument),
         }
     })
+}
+
+/// Imports one explicitly registered native module shell and returns its cached
+/// managed module object. This is the pulled-forward import foundation; it does
+/// not execute Python module source or expose `__import__`.
+///
+/// # Safety
+/// Name storage must be readable and `output` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_import_name(
+    context: *mut RimeraContext,
+    name: *const u8,
+    name_len: usize,
+    output: *mut RValue,
+) -> RStatus {
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    with_output(context, output, |context| context.import_name(name))
 }
 
 /// Reads a module global, falling back to the builtins dictionary.
@@ -983,6 +1395,39 @@ pub unsafe extern "C" fn rimera_class_name_get(
     })
 }
 
+/// Resolves a class-body free name from the prepared namespace and then an
+/// enclosing closure cell.
+///
+/// # Safety
+/// Namespace, cell, name, and output storage must be valid for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_class_free_get(
+    context: *mut RimeraContext,
+    namespace: *const RValue,
+    cell: *const RValue,
+    name: *const u8,
+    name_len: usize,
+    output: *mut RValue,
+) -> RStatus {
+    if namespace.is_null() || cell.is_null() || output.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let (namespace, cell) = unsafe { (*namespace, *cell) };
+    with_output(context, output, |context| {
+        context.initialize_kernel()?;
+        context
+            .class_free_get(namespace, cell, name)
+            .inspect_err(|message| {
+                if context.raised.is_none() {
+                    record_exception(context, "NameError", message.clone());
+                }
+            })
+    })
+}
+
 /// Deletes a name from a class namespace while the class body is executing.
 ///
 /// # Safety
@@ -1083,7 +1528,9 @@ pub unsafe extern "C" fn rimera_attr_set(
                 context.attribute_set(receiver, name, value)
             })
             .map_err(|message| {
-                record_exception(context, "AttributeError", message);
+                if context.raised.is_none() {
+                    record_exception(context, "AttributeError", message);
+                }
                 RStatus::Exception
             })
     })
@@ -1113,7 +1560,9 @@ pub unsafe extern "C" fn rimera_attr_delete(
                 context.attribute_delete(receiver, name)
             })
             .map_err(|message| {
-                record_exception(context, "AttributeError", message);
+                if context.raised.is_none() {
+                    record_exception(context, "AttributeError", message);
+                }
                 RStatus::Exception
             })
     })
@@ -1275,7 +1724,12 @@ pub unsafe extern "C" fn rimera_call(
             }
             Err(_) if context.raised.is_some() => Err(RStatus::Exception),
             Err(message) => {
-                record_exception(context, "TypeError", message);
+                let exception_type = if message == "managed heap limit exceeded" {
+                    "MemoryError"
+                } else {
+                    "TypeError"
+                };
+                record_exception(context, exception_type, message);
                 Err(RStatus::Exception)
             }
         }
@@ -1330,6 +1784,22 @@ pub unsafe extern "C" fn rimera_raise(
     let cause_is_none = cause_value == Some(RValue::NONE);
     let cause = cause_value.filter(|value| *value != RValue::NONE);
     protect(context, |context| {
+        let exception = context
+            .normalize_raise_operand(exception)
+            .map_err(|message| {
+                record_exception(context, "TypeError", message);
+                RStatus::Exception
+            })?;
+        let cause = context
+            .with_temporary_roots(&[exception], |context| {
+                cause
+                    .map(|value| context.normalize_raise_operand(value))
+                    .transpose()
+            })
+            .map_err(|message| {
+                record_exception(context, "TypeError", message);
+                RStatus::Exception
+            })?;
         context
             .raise_value(exception, cause, suppress_context != 0 || cause_is_none)
             .map_err(|message| {
@@ -1568,7 +2038,45 @@ pub unsafe extern "C" fn rimera_exception_clear_active(context: *mut RimeraConte
     })
 }
 
-/// Appends one immutable frame to the active exception traceback.
+/// Appends the module frame to the active exception traceback without linking
+/// function/generator activation-introspection machinery into module-only
+/// artifacts.
+///
+/// # Safety
+/// Filename and function slices must remain readable for the call.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn rimera_traceback_append_module(
+    context: *mut RimeraContext,
+    filename: *const u8,
+    filename_len: usize,
+    function: *const u8,
+    function_len: usize,
+    line: u32,
+    column: u32,
+) -> RStatus {
+    let (Ok(filename), Ok(function)) =
+        (unsafe { (utf8(filename, filename_len), utf8(function, function_len)) })
+    else {
+        return RStatus::InvalidArgument;
+    };
+    protect(context, |context| {
+        match context.attach_module_traceback(filename, function, line, column) {
+            Ok(()) => Ok(()),
+            Err(message) if message == "managed heap limit exceeded" => {
+                record_exception(context, "MemoryError", message);
+                Err(RStatus::Exception)
+            }
+            Err(message) => {
+                context.fail(message);
+                Err(RStatus::InvalidArgument)
+            }
+        }
+    })
+}
+
+/// Appends one immutable function/generator frame to the active exception
+/// traceback.
 ///
 /// # Safety
 /// Filename and function slices must remain readable for the call.
@@ -1589,12 +2097,17 @@ pub unsafe extern "C" fn rimera_traceback_append(
         return RStatus::InvalidArgument;
     };
     protect(context, |context| {
-        context
-            .attach_traceback(filename, function, line, column)
-            .map_err(|message| {
+        match context.attach_traceback(filename, function, line, column) {
+            Ok(()) => Ok(()),
+            Err(message) if message == "managed heap limit exceeded" => {
+                record_exception(context, "MemoryError", message);
+                Err(RStatus::Exception)
+            }
+            Err(message) => {
                 context.fail(message);
-                RStatus::InvalidArgument
-            })
+                Err(RStatus::InvalidArgument)
+            }
+        }
     })
 }
 
@@ -2767,6 +3280,11 @@ fn is_exception_summary(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    };
+
     use super::*;
     use crate::ParameterKind;
     use crate::heap::HeapObject;
@@ -2849,6 +3367,224 @@ mod tests {
         }
     }
 
+    fn test_function(
+        context: &mut RimeraContext,
+        code_address: usize,
+        kind: FunctionKind,
+        name: &str,
+        qualified_name: &str,
+        parameters: Vec<Parameter>,
+        closure: &[RValue],
+    ) -> RValue {
+        let roots = closure.to_vec();
+        context
+            .with_temporary_roots(&roots, |context| {
+                let closure_value = if closure.is_empty() {
+                    None
+                } else {
+                    Some(operations::tuple(context, closure)?)
+                };
+                let mut metadata_roots = roots.clone();
+                closure_value
+                    .into_iter()
+                    .for_each(|value| metadata_roots.push(value));
+                let free_names = (0..closure.len())
+                    .map(|index| format!("free_{index}"))
+                    .collect::<Vec<_>>();
+                let code = context.with_temporary_roots(&metadata_roots, |context| {
+                    context.allocate(HeapObject::Code(CodeObject {
+                        code_address,
+                        kind,
+                        name: name.to_owned(),
+                        qualified_name: qualified_name.to_owned(),
+                        parameters: parameters.into_boxed_slice(),
+                        filename: "<runtime-test>".to_owned(),
+                        first_line: 1,
+                        local_names: Box::new([]),
+                        cell_names: Box::new([]),
+                        free_names: free_names.into_boxed_slice(),
+                    }))
+                })?;
+                metadata_roots.push(code);
+                context.with_temporary_roots(&metadata_roots, |context| {
+                    context.allocate(HeapObject::Function(FunctionObject {
+                        code,
+                        name: name.to_owned(),
+                        qualified_name: qualified_name.to_owned(),
+                        closure: closure_value,
+                        defaults: None,
+                        keyword_defaults: None,
+                        annotations: None,
+                        type_params: None,
+                    }))
+                })
+            })
+            .unwrap()
+    }
+
+    static BUFFER_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static BUFFER_ACQUIRE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static BUFFER_RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn buffer_provider_native(
+        context: *mut c_void,
+        _function: *const RValue,
+        bound: *const RValue,
+        bound_len: usize,
+        output: *mut RValue,
+    ) -> RStatus {
+        if context.is_null() || bound.is_null() || bound_len != 2 || output.is_null() {
+            return RStatus::InvalidArgument;
+        }
+        let context = unsafe { &mut *context.cast::<RimeraContext>() };
+        let bound = unsafe { std::slice::from_raw_parts(bound, bound_len) };
+        if bound[1] != RValue::small_int(284) {
+            return RStatus::InvalidArgument;
+        }
+        BUFFER_ACQUIRE_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+        let view = match context.attribute_get(bound[0], "inner") {
+            Ok(view) if matches!(context.heap.get(view), Some(HeapObject::MemoryView(_))) => view,
+            Ok(_) => return RStatus::InvalidArgument,
+            Err(message) => {
+                context.fail(message);
+                return RStatus::Exception;
+            }
+        };
+        unsafe { output.write(view) };
+        RStatus::Ok
+    }
+
+    unsafe extern "C" fn constrained_buffer_provider_native(
+        context: *mut c_void,
+        function: *const RValue,
+        bound: *const RValue,
+        bound_len: usize,
+        output: *mut RValue,
+    ) -> RStatus {
+        let status = unsafe { buffer_provider_native(context, function, bound, bound_len, output) };
+        if status != RStatus::Ok {
+            return status;
+        }
+        let context = unsafe { &mut *context.cast::<RimeraContext>() };
+        let limit = context.stats().live_bytes;
+        match context.set_heap_limit(Some(limit)) {
+            Ok(()) => RStatus::Ok,
+            Err(message) => {
+                context.fail(message);
+                RStatus::Exception
+            }
+        }
+    }
+
+    unsafe extern "C" fn counting_buffer_release_native(
+        context: *mut c_void,
+        _function: *const RValue,
+        bound: *const RValue,
+        bound_len: usize,
+        output: *mut RValue,
+    ) -> RStatus {
+        if context.is_null() || bound.is_null() || bound_len != 2 || output.is_null() {
+            return RStatus::InvalidArgument;
+        }
+        let context = unsafe { &mut *context.cast::<RimeraContext>() };
+        let bound = unsafe { std::slice::from_raw_parts(bound, bound_len) };
+        if !matches!(context.heap.get(bound[1]), Some(HeapObject::MemoryView(_))) {
+            return RStatus::InvalidArgument;
+        }
+        BUFFER_RELEASE_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+        unsafe { output.write(RValue::NONE) };
+        RStatus::Ok
+    }
+
+    unsafe extern "C" fn raising_buffer_release_native(
+        context: *mut c_void,
+        function: *const RValue,
+        bound: *const RValue,
+        bound_len: usize,
+        output: *mut RValue,
+    ) -> RStatus {
+        let status =
+            unsafe { counting_buffer_release_native(context, function, bound, bound_len, output) };
+        if status != RStatus::Ok {
+            return status;
+        }
+        let context = unsafe { &mut *context.cast::<RimeraContext>() };
+        match context.raise_builtin("RuntimeError", "release boom") {
+            Ok(_) => RStatus::Exception,
+            Err(message) => {
+                context.fail(message);
+                RStatus::Exception
+            }
+        }
+    }
+
+    fn make_buffer_provider(
+        context: &mut RimeraContext,
+        buffer_code: usize,
+        release_code: usize,
+    ) -> (RValue, RValue, RValue) {
+        let namespace = context.namespace_new().unwrap();
+        let buffer = test_function(
+            context,
+            buffer_code,
+            FunctionKind::Normal,
+            "__buffer__",
+            "Provider.__buffer__",
+            vec![
+                Parameter {
+                    name: "self".to_owned(),
+                    kind: ParameterKind::PositionalOrKeyword,
+                    has_default: false,
+                },
+                Parameter {
+                    name: "flags".to_owned(),
+                    kind: ParameterKind::PositionalOrKeyword,
+                    has_default: false,
+                },
+            ],
+            &[],
+        );
+        let release = context.with_temporary_roots(&[namespace, buffer], |context| {
+            test_function(
+                context,
+                release_code,
+                FunctionKind::Normal,
+                "__release_buffer__",
+                "Provider.__release_buffer__",
+                vec![
+                    Parameter {
+                        name: "self".to_owned(),
+                        kind: ParameterKind::PositionalOrKeyword,
+                        has_default: false,
+                    },
+                    Parameter {
+                        name: "view".to_owned(),
+                        kind: ParameterKind::PositionalOrKeyword,
+                        has_default: false,
+                    },
+                ],
+                &[],
+            )
+        });
+        context
+            .namespace_set(namespace, "__buffer__", buffer)
+            .unwrap();
+        context
+            .namespace_set(namespace, "__release_buffer__", release)
+            .unwrap();
+        let class = context.new_class("Provider", &[], namespace).unwrap();
+        let provider = context.new_instance(class).unwrap();
+        let data = operations::bytearray(context, b"abcd").unwrap();
+        let inner = context
+            .with_temporary_roots(&[provider, data], |context| {
+                operations::memoryview(context, data)
+            })
+            .unwrap();
+        context.attribute_set(provider, "data", data).unwrap();
+        context.attribute_set(provider, "inner", inner).unwrap();
+        (provider, data, inner)
+    }
+
     unsafe extern "C" fn collecting_hash_native(
         context: *mut c_void,
         _function: *const RValue,
@@ -2883,7 +3619,14 @@ mod tests {
         let context = unsafe { &mut *context.cast::<RimeraContext>() };
         let function = unsafe { *function };
         let unrelated = match context.heap.get(function) {
-            Some(HeapObject::Function(function)) => function.closure.first().copied(),
+            Some(HeapObject::Function(function)) => {
+                function
+                    .closure
+                    .and_then(|closure| match context.heap.get(closure) {
+                        Some(HeapObject::Tuple(cells)) => cells.first().copied(),
+                        _ => None,
+                    })
+            }
             _ => None,
         };
         let Some(unrelated) = unrelated else {
@@ -3018,19 +3761,17 @@ mod tests {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
         let captured = operations::string(&mut context, "live across suspension").unwrap();
-        let function = context
-            .allocate(HeapObject::Function(FunctionObject {
-                code_address: two_stage_generator_resume as usize,
-                kind: FunctionKind::Generator {
-                    persistent_slot_count: 1,
-                },
-                name: "two_stage".to_owned(),
-                qualified_name: "two_stage".to_owned(),
-                parameters: Box::new([]),
-                closure: Box::new([]),
-                annotations: None,
-            }))
-            .unwrap();
+        let function = test_function(
+            &mut context,
+            two_stage_generator_resume as usize,
+            FunctionKind::Generator {
+                persistent_slot_count: 1,
+            },
+            "two_stage",
+            "two_stage",
+            Vec::new(),
+            &[],
+        );
         let mut generator = context.new_generator(function, &[captured]).unwrap();
         let mut frame = RRootFrame::new(&raw mut generator, 1);
         // SAFETY: the context and frame remain live for the registered scope.
@@ -3072,6 +3813,64 @@ mod tests {
             unsafe { rimera_roots_pop(&raw mut context, &raw mut frame) },
             RStatus::Ok
         );
+    }
+
+    #[test]
+    fn generator_delegate_and_pending_exception_graphs_are_traced_and_fail_atomically() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let function = test_function(
+            &mut context,
+            two_stage_generator_resume as usize,
+            FunctionKind::Generator {
+                persistent_slot_count: 1,
+            },
+            "delegating",
+            "delegating",
+            Vec::new(),
+            &[],
+        );
+        context.add_context_root(function);
+        let delegate =
+            operations::list(&mut context, &[RValue::small_int(1), RValue::small_int(2)]).unwrap();
+        let message = operations::string(&mut context, "pending").unwrap();
+        let pending = context
+            .new_builtin_exception("ValueError", &[message])
+            .unwrap();
+        let mut generator = context.new_generator(function, &[]).unwrap();
+        let Some(HeapObject::Generator(object)) = context.heap.get_mut(generator) else {
+            panic!("expected managed generator");
+        };
+        object.delegate = Some(delegate);
+        object.raised = Some(pending);
+        object.handled = vec![pending].into_boxed_slice();
+        let mut frame = RRootFrame::new(&raw mut generator, 1);
+        assert_eq!(
+            unsafe { rimera_roots_push(&raw mut context, &raw mut frame) },
+            RStatus::Ok
+        );
+        context.collect();
+        assert!(context.heap.get(generator).is_some());
+        assert!(context.heap.get(delegate).is_some());
+        assert!(context.heap.get(pending).is_some());
+        assert_eq!(
+            unsafe { rimera_roots_pop(&raw mut context, &raw mut frame) },
+            RStatus::Ok
+        );
+        context.collect();
+        assert!(context.heap.get(generator).is_none());
+        assert!(context.heap.get(delegate).is_none());
+        assert!(context.heap.get(pending).is_none());
+
+        let live_before = context.stats().live;
+        let live_bytes = context.stats().live_bytes;
+        context.set_heap_limit(Some(live_bytes)).unwrap();
+        assert_eq!(
+            context.new_generator(function, &[RValue::small_int(1)]),
+            Err("managed heap limit exceeded".to_owned())
+        );
+        assert_eq!(context.stats().live, live_before);
+        context.set_heap_limit(None).unwrap();
     }
 
     #[test]
@@ -3234,6 +4033,129 @@ mod tests {
     }
 
     #[test]
+    fn gate7_native_module_import_cache_namespace_and_failure_are_managed() {
+        let mut context = RimeraContext::default();
+        let inspect = context.import_name("inspect").unwrap();
+        assert_eq!(inspect, context.import_name("inspect").unwrap());
+        let weakref = context.import_name("weakref").unwrap();
+        assert_ne!(inspect, weakref);
+
+        let name = context.attribute_get(inspect, "__name__").unwrap();
+        assert!(
+            matches!(context.heap.get(name), Some(HeapObject::String(value)) if value == "inspect")
+        );
+        let dictionary = context.attribute_get(inspect, "__dict__").unwrap();
+        assert!(matches!(
+            context.heap.get(dictionary),
+            Some(HeapObject::Dictionary(_))
+        ));
+
+        let marker = RValue::small_int(7);
+        context.attribute_set(inspect, "marker", marker).unwrap();
+        assert_eq!(context.attribute_get(inspect, "marker").unwrap(), marker);
+        context.attribute_delete(inspect, "marker").unwrap();
+        assert!(context.attribute_get(inspect, "marker").is_err());
+
+        context.collect();
+        assert_eq!(context.import_name("inspect").unwrap(), inspect);
+        assert_eq!(
+            context.import_name("math").unwrap_err(),
+            "No module named 'math'"
+        );
+        assert!(context.consume_exception_type("ModuleNotFoundError"));
+    }
+
+    #[test]
+    fn gate7_import_heap_failure_is_memory_error_and_publication_is_atomic() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let limit = context.stats().live_bytes;
+        context.set_heap_limit(Some(limit)).unwrap();
+
+        let mut output = RValue::NONE;
+        let name = b"inspect";
+        assert_eq!(
+            unsafe {
+                rimera_import_name(&raw mut context, name.as_ptr(), name.len(), &raw mut output)
+            },
+            RStatus::Exception
+        );
+        assert_eq!(output, RValue::NONE);
+        assert!(context.consume_exception_type("MemoryError"));
+
+        context.set_heap_limit(None).unwrap();
+        assert_eq!(
+            unsafe {
+                rimera_import_name(&raw mut context, name.as_ptr(), name.len(), &raw mut output)
+            },
+            RStatus::Ok
+        );
+        let module_name = context.attribute_get(output, "__name__").unwrap();
+        assert!(
+            matches!(context.heap.get(module_name), Some(HeapObject::String(value)) if value == "inspect")
+        );
+        assert_eq!(context.import_name("inspect").unwrap(), output);
+    }
+
+    #[test]
+    fn gate7_reflection_call_heap_failure_is_memory_error_and_source_namespace_survives() {
+        let mut context = RimeraContext::default();
+        let inspect = context.import_name("inspect").unwrap();
+        let dir = context.ensure_builtin("dir").unwrap().unwrap();
+        context.type_of(inspect).unwrap();
+        let before_name = context.attribute_get(inspect, "__name__").unwrap();
+        let limit = context.stats().live_bytes;
+        context.set_heap_limit(Some(limit)).unwrap();
+
+        let positional = [inspect];
+        let arguments = RCallArguments {
+            positional: positional.as_ptr(),
+            positional_len: positional.len(),
+            keywords: ptr::null(),
+            keyword_len: 0,
+        };
+        let mut output = RValue::NONE;
+        assert_eq!(
+            unsafe {
+                rimera_call(
+                    &raw mut context,
+                    &raw const dir,
+                    &raw const arguments,
+                    &raw mut output,
+                )
+            },
+            RStatus::Exception
+        );
+        assert_eq!(output, RValue::NONE);
+        assert!(context.consume_exception_type("MemoryError"));
+        assert_eq!(
+            context.attribute_get(inspect, "__name__").unwrap(),
+            before_name
+        );
+
+        context.set_heap_limit(None).unwrap();
+        assert_eq!(
+            unsafe {
+                rimera_call(
+                    &raw mut context,
+                    &raw const dir,
+                    &raw const arguments,
+                    &raw mut output,
+                )
+            },
+            RStatus::Ok
+        );
+        assert!(matches!(
+            context.heap.get(output),
+            Some(HeapObject::List(_))
+        ));
+        assert_eq!(
+            context.attribute_get(inspect, "__name__").unwrap(),
+            before_name
+        );
+    }
+
+    #[test]
     fn lazy_kernel_fits_the_public_low_heap_budget() {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
@@ -3350,19 +4272,16 @@ mod tests {
                 "required Gate 3 builtin {name} is missing"
             );
         }
-        for excluded in [
-            "__import__",
-            "compile",
-            "eval",
-            "exec",
-            "dir",
-            "vars",
-            "globals",
-            "locals",
-        ] {
+        for reflection in ["dir", "vars", "globals", "locals"] {
+            assert!(
+                context.ensure_builtin(reflection).unwrap().is_some(),
+                "Gate 7 reflection builtin {reflection} is missing"
+            );
+        }
+        for excluded in ["__import__", "compile", "eval", "exec"] {
             assert!(
                 context.ensure_builtin(excluded).unwrap().is_none(),
-                "later-gate builtin {excluded} leaked into Gate 3"
+                "unsupported builtin {excluded} leaked into the native namespace"
             );
         }
 
@@ -3634,6 +4553,7 @@ mod tests {
                     parameters.len(),
                     std::ptr::null(),
                     0,
+                    std::ptr::null(),
                     &raw mut function,
                 )
             },
@@ -3667,6 +4587,165 @@ mod tests {
     }
 
     #[test]
+    fn gate7_slice4_code_metadata_allocation_is_low_heap_atomic() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let before = context.heap.live_bytes();
+        context
+            .set_heap_limit(Some(before.saturating_add(1)))
+            .unwrap();
+
+        let local = RNameSpec {
+            name: b"value".as_ptr(),
+            name_len: 5,
+        };
+        let metadata = RCodeMetadataSpec {
+            filename: b"gate7_low_heap.py".as_ptr(),
+            filename_len: 17,
+            first_line: 7,
+            reserved: 0,
+            local_names: &raw const local,
+            local_name_len: 1,
+            cell_names: std::ptr::null(),
+            cell_name_len: 0,
+            free_names: std::ptr::null(),
+            free_name_len: 0,
+        };
+        let mut output = RValue::small_int(2718);
+        let status = unsafe {
+            rimera_function_new(
+                &raw mut context,
+                add_native as *const c_void,
+                b"low_heap".as_ptr(),
+                8,
+                b"low_heap".as_ptr(),
+                8,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                &raw const metadata,
+                &raw mut output,
+            )
+        };
+        assert_eq!(status, RStatus::Exception);
+        assert_eq!(output, RValue::small_int(2718));
+        let raised = context
+            .raised
+            .expect("code metadata allocation should raise MemoryError");
+        assert_eq!(
+            context.type_of(raised).unwrap(),
+            context.builtin_type("MemoryError").unwrap()
+        );
+        context.collect();
+        assert!(context.heap.live_bytes() <= before);
+    }
+
+    #[test]
+    fn gate7_slice5_traceback_frame_allocation_is_low_heap_atomic() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let mut original = context.raise_builtin("ValueError", "boom").unwrap();
+        let mut frame = RRootFrame::new(&raw mut original, 1);
+        assert_eq!(
+            unsafe { rimera_roots_push(&raw mut context, &raw mut frame) },
+            RStatus::Ok
+        );
+        let before = context.heap.live_bytes();
+        context
+            .set_heap_limit(Some(before.saturating_add(1)))
+            .unwrap();
+
+        let status = unsafe {
+            rimera_traceback_append(
+                &raw mut context,
+                b"gate7_low_heap.py".as_ptr(),
+                17,
+                b"<module>".as_ptr(),
+                8,
+                1,
+                0,
+            )
+        };
+        assert_eq!(status, RStatus::Exception);
+        let raised = context
+            .raised
+            .expect("traceback metadata allocation should raise MemoryError");
+        assert_eq!(
+            context.type_of(raised).unwrap(),
+            context.builtin_type("MemoryError").unwrap()
+        );
+        assert_eq!(
+            match context.heap.get(original) {
+                Some(HeapObject::Exception(exception)) => exception.traceback,
+                _ => Some(RValue::NONE),
+            },
+            None
+        );
+        context.collect();
+        assert!(context.heap.get(original).is_some());
+        assert_eq!(
+            unsafe { rimera_roots_pop(&raw mut context, &raw mut frame) },
+            RStatus::Ok
+        );
+    }
+
+    #[test]
+    fn gate7_slice6_generator_frame_publication_is_low_heap_atomic() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let mut function = test_function(
+            &mut context,
+            two_stage_generator_resume as usize,
+            FunctionKind::Generator {
+                persistent_slot_count: 1,
+            },
+            "low_heap_generator",
+            "low_heap_generator",
+            Vec::new(),
+            &[],
+        );
+        let mut root = RRootFrame::new(&raw mut function, 1);
+        assert_eq!(
+            unsafe { rimera_roots_push(&raw mut context, &raw mut root) },
+            RStatus::Ok
+        );
+        let before = context.stats();
+        context.set_heap_limit(Some(before.live_bytes)).unwrap();
+        let arguments = RCallArguments {
+            positional: std::ptr::null(),
+            positional_len: 0,
+            keywords: std::ptr::null(),
+            keyword_len: 0,
+        };
+        let mut output = RValue::small_int(31415);
+        assert_eq!(
+            unsafe {
+                rimera_call(
+                    &raw mut context,
+                    &raw const function,
+                    &raw const arguments,
+                    &raw mut output,
+                )
+            },
+            RStatus::Exception
+        );
+        assert_eq!(output, RValue::small_int(31415));
+        let raised = context
+            .raised
+            .expect("generator metadata allocation should raise MemoryError");
+        assert_eq!(context.exception_type_name(raised), Some("MemoryError"));
+        assert_eq!(context.stats().live, before.live);
+        context.collect();
+        assert!(context.heap.get(function).is_some());
+        assert_eq!(
+            unsafe { rimera_roots_pop(&raw mut context, &raw mut root) },
+            RStatus::Ok
+        );
+        context.set_heap_limit(None).unwrap();
+    }
+
+    #[test]
     fn exception_state_tracks_handler_context_and_traceback() {
         let mut context = RimeraContext::default();
         let first = context.raise_builtin("ValueError", "inner").unwrap();
@@ -3685,6 +4764,72 @@ mod tests {
         let rendered = context.render_active_exception();
         assert!(rendered.contains("File \"program.py\", line 12, in worker"));
         assert!(rendered.ends_with("RuntimeError: outer"));
+    }
+
+    #[test]
+    fn gate5_exception_graphs_survive_low_heap_collection_and_failed_metadata_is_atomic() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let exception_type = context
+            .ensure_builtin_type("RuntimeError")
+            .unwrap()
+            .unwrap();
+        let mut exception = context.new_exception(exception_type, &[]).unwrap();
+        let mut frame = RRootFrame::new(&raw mut exception, 1);
+        assert_eq!(
+            unsafe { rimera_roots_push(&raw mut context, &raw mut frame) },
+            RStatus::Ok
+        );
+        context.attribute_set(exception, "peer", exception).unwrap();
+        let Some(HeapObject::Exception(object)) = context.heap.get_mut(exception) else {
+            panic!("expected managed exception");
+        };
+        object.cause = Some(exception);
+        object.context = Some(exception);
+        let live = context.stats().live_bytes;
+        context
+            .set_heap_limit(Some(live.saturating_add(4_096)))
+            .unwrap();
+        let collections_before = context.stats().collections;
+        for _ in 0..64 {
+            let _ = context.new_exception(exception_type, &[]).unwrap();
+        }
+        assert!(context.heap.get(exception).is_some());
+        assert!(context.stats().collections > collections_before);
+        context.set_heap_limit(None).unwrap();
+        assert_eq!(
+            unsafe { rimera_roots_pop(&raw mut context, &raw mut frame) },
+            RStatus::Ok
+        );
+        context.collect();
+        assert!(context.heap.get(exception).is_none());
+
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let exception_type = context
+            .ensure_builtin_type("RuntimeError")
+            .unwrap()
+            .unwrap();
+        let mut exception = context.new_exception(exception_type, &[]).unwrap();
+        let mut frame = RRootFrame::new(&raw mut exception, 1);
+        assert_eq!(
+            unsafe { rimera_roots_push(&raw mut context, &raw mut frame) },
+            RStatus::Ok
+        );
+        let live = context.stats().live_bytes;
+        context.set_heap_limit(Some(live)).unwrap();
+        assert_eq!(
+            context.attribute_set(exception, "new_field", RValue::small_int(1)),
+            Err("managed heap limit exceeded".to_owned())
+        );
+        let Some(HeapObject::Exception(object)) = context.heap.get(exception) else {
+            panic!("exception must remain valid after failed metadata allocation");
+        };
+        assert!(object.dictionary.is_none());
+        assert_eq!(
+            unsafe { rimera_roots_pop(&raw mut context, &raw mut frame) },
+            RStatus::Ok
+        );
     }
 
     #[test]
@@ -3797,6 +4942,7 @@ mod tests {
                 function: "<module>".to_owned(),
                 line: 1,
                 column: 0,
+                frame: None,
                 next: None,
             }))
             .unwrap();
@@ -3804,17 +4950,15 @@ mod tests {
             context.type_of(traceback).unwrap(),
             context.builtin_type("traceback").unwrap()
         );
-        let function = context
-            .allocate(HeapObject::Function(FunctionObject {
-                code_address: add_native as usize,
-                name: "native".to_owned(),
-                qualified_name: "native".to_owned(),
-                parameters: Box::new([]),
-                kind: FunctionKind::Normal,
-                closure: Box::new([]),
-                annotations: None,
-            }))
-            .unwrap();
+        let function = test_function(
+            &mut context,
+            add_native as usize,
+            FunctionKind::Normal,
+            "native",
+            "native",
+            Vec::new(),
+            &[],
+        );
         assert_eq!(
             context.type_of(function).unwrap(),
             context.builtin_type("function").unwrap()
@@ -3967,7 +5111,20 @@ mod tests {
             panic!("class constructor did not produce a type");
         };
         assert_eq!(class_object.name, "Empty");
-        assert_eq!(class_object.qualified_name, "__main__.Empty");
+        assert_eq!(class_object.qualified_name, "Empty");
+        assert_eq!(
+            context
+                .namespace_value(namespace, "__module__")
+                .and_then(|value| match context.heap.get(value) {
+                    Some(HeapObject::String(module)) => Some(module.as_str()),
+                    _ => None,
+                }),
+            Some("__main__")
+        );
+        assert_eq!(
+            operations::display(&context, class).unwrap(),
+            "<class '__main__.Empty'>"
+        );
         assert_eq!(class_object.bases.as_ref(), &[object]);
         assert_eq!(class_object.mro.as_ref(), &[class, object]);
         assert_eq!(context.type_of(class).unwrap(), type_type);
@@ -4143,17 +5300,15 @@ mod tests {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
         let namespace = context.namespace_new().unwrap();
-        let function = context
-            .allocate(HeapObject::Function(FunctionObject {
-                code_address: add_native as usize,
-                name: "method".to_owned(),
-                qualified_name: "Holder.method".to_owned(),
-                parameters: Box::new([]),
-                kind: FunctionKind::Normal,
-                closure: Box::new([]),
-                annotations: None,
-            }))
-            .unwrap();
+        let function = test_function(
+            &mut context,
+            add_native as usize,
+            FunctionKind::Normal,
+            "method",
+            "Holder.method",
+            Vec::new(),
+            &[],
+        );
         context
             .namespace_set(namespace, "method", function)
             .unwrap();
@@ -4453,26 +5608,134 @@ mod tests {
     }
 
     #[test]
+    fn gate7_buffer_release_callback_failure_is_unraisable_and_drops_export_once() {
+        let _guard = BUFFER_TEST_LOCK.lock().unwrap();
+        BUFFER_ACQUIRE_COUNT.store(0, AtomicOrdering::SeqCst);
+        BUFFER_RELEASE_COUNT.store(0, AtomicOrdering::SeqCst);
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let (provider, data, inner) = make_buffer_provider(
+            &mut context,
+            buffer_provider_native as usize,
+            raising_buffer_release_native as usize,
+        );
+        let view = context
+            .with_temporary_roots(&[provider, data, inner], |context| {
+                operations::memoryview(context, provider)
+            })
+            .unwrap();
+        assert_eq!(BUFFER_ACQUIRE_COUNT.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            match context.heap.get(data) {
+                Some(HeapObject::ByteArray(data)) => data.exports,
+                _ => panic!("provider backing bytearray disappeared"),
+            },
+            1
+        );
+
+        context.raised = None;
+        context.exception = None;
+        operations::memoryview_release(&mut context, view).unwrap();
+        assert_eq!(BUFFER_RELEASE_COUNT.load(AtomicOrdering::SeqCst), 1);
+        assert!(context.raised.is_none());
+        assert!(context.exception.is_none());
+        assert!(matches!(
+            context.heap.get(inner),
+            Some(HeapObject::MemoryView(inner)) if inner.released
+        ));
+        assert_eq!(
+            match context.heap.get(data) {
+                Some(HeapObject::ByteArray(data)) => data.exports,
+                _ => panic!("provider backing bytearray disappeared"),
+            },
+            0
+        );
+        operations::memoryview_release(&mut context, view).unwrap();
+        assert_eq!(BUFFER_RELEASE_COUNT.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn gate7_buffer_failed_construction_releases_acquired_export_once_under_low_heap() {
+        let _guard = BUFFER_TEST_LOCK.lock().unwrap();
+        BUFFER_ACQUIRE_COUNT.store(0, AtomicOrdering::SeqCst);
+        BUFFER_RELEASE_COUNT.store(0, AtomicOrdering::SeqCst);
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let (provider, data, inner) = make_buffer_provider(
+            &mut context,
+            constrained_buffer_provider_native as usize,
+            counting_buffer_release_native as usize,
+        );
+        let error = context
+            .with_temporary_roots(&[provider, data, inner], |context| {
+                operations::memoryview(context, provider)
+            })
+            .unwrap_err();
+        assert_eq!(error, "managed heap limit exceeded");
+        assert_eq!(BUFFER_ACQUIRE_COUNT.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(BUFFER_RELEASE_COUNT.load(AtomicOrdering::SeqCst), 1);
+        assert!(matches!(
+            context.heap.get(inner),
+            Some(HeapObject::MemoryView(inner)) if inner.released
+        ));
+        assert_eq!(
+            match context.heap.get(data) {
+                Some(HeapObject::ByteArray(data)) => data.exports,
+                _ => panic!("provider backing bytearray disappeared"),
+            },
+            0
+        );
+        context.set_heap_limit(None).unwrap();
+    }
+
+    #[test]
+    fn gate7_buffer_exporter_cycle_finalizes_once_and_collects() {
+        let _guard = BUFFER_TEST_LOCK.lock().unwrap();
+        BUFFER_ACQUIRE_COUNT.store(0, AtomicOrdering::SeqCst);
+        BUFFER_RELEASE_COUNT.store(0, AtomicOrdering::SeqCst);
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let (provider, data, inner) = make_buffer_provider(
+            &mut context,
+            buffer_provider_native as usize,
+            counting_buffer_release_native as usize,
+        );
+        let view = context
+            .with_temporary_roots(&[provider, data, inner], |context| {
+                operations::memoryview(context, provider)
+            })
+            .unwrap();
+        context.attribute_set(provider, "cycle", view).unwrap();
+        assert_eq!(BUFFER_ACQUIRE_COUNT.load(AtomicOrdering::SeqCst), 1);
+
+        context.collect();
+        assert_eq!(BUFFER_RELEASE_COUNT.load(AtomicOrdering::SeqCst), 1);
+        assert!(context.heap.get(provider).is_none());
+        assert!(context.heap.get(view).is_none());
+        assert!(context.heap.get(inner).is_none());
+        assert!(context.heap.get(data).is_none());
+        context.collect();
+        assert_eq!(BUFFER_RELEASE_COUNT.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
     fn gate4_boolean_truth_callback_survives_forced_collection() {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
         let namespace = context.namespace_new().unwrap();
-        let method = context
-            .allocate(HeapObject::Function(FunctionObject {
-                code_address: collecting_truth_native as usize,
-                kind: FunctionKind::Normal,
-                name: "__bool__".to_owned(),
-                qualified_name: "CollectingTruth.__bool__".to_owned(),
-                parameters: vec![Parameter {
-                    name: "self".to_owned(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    default: None,
-                }]
-                .into_boxed_slice(),
-                closure: Box::new([]),
-                annotations: None,
-            }))
-            .unwrap();
+        let method = test_function(
+            &mut context,
+            collecting_truth_native as usize,
+            FunctionKind::Normal,
+            "__bool__",
+            "CollectingTruth.__bool__",
+            vec![Parameter {
+                name: "self".to_owned(),
+                kind: ParameterKind::PositionalOrKeyword,
+                has_default: false,
+            }],
+            &[],
+        );
         context
             .namespace_set(namespace, "__bool__", method)
             .unwrap();
@@ -4495,29 +5758,26 @@ mod tests {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
         let namespace = context.namespace_new().unwrap();
-        let method = context
-            .allocate(HeapObject::Function(FunctionObject {
-                code_address: collecting_less_native as usize,
-                kind: FunctionKind::Normal,
-                name: "__lt__".to_owned(),
-                qualified_name: "CollectingCompare.__lt__".to_owned(),
-                parameters: vec![
-                    Parameter {
-                        name: "self".to_owned(),
-                        kind: ParameterKind::PositionalOrKeyword,
-                        default: None,
-                    },
-                    Parameter {
-                        name: "other".to_owned(),
-                        kind: ParameterKind::PositionalOrKeyword,
-                        default: None,
-                    },
-                ]
-                .into_boxed_slice(),
-                closure: Box::new([]),
-                annotations: None,
-            }))
-            .unwrap();
+        let method = test_function(
+            &mut context,
+            collecting_less_native as usize,
+            FunctionKind::Normal,
+            "__lt__",
+            "CollectingCompare.__lt__",
+            vec![
+                Parameter {
+                    name: "self".to_owned(),
+                    kind: ParameterKind::PositionalOrKeyword,
+                    has_default: false,
+                },
+                Parameter {
+                    name: "other".to_owned(),
+                    kind: ParameterKind::PositionalOrKeyword,
+                    has_default: false,
+                },
+            ],
+            &[],
+        );
         context.namespace_set(namespace, "__lt__", method).unwrap();
         let compare_type = context
             .new_class("CollectingCompare", &[], namespace)
@@ -4547,34 +5807,31 @@ mod tests {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
         let namespace = context.namespace_new().unwrap();
-        let method = context
-            .allocate(HeapObject::Function(FunctionObject {
-                code_address: collecting_setitem_native as usize,
-                kind: FunctionKind::Normal,
-                name: "__setitem__".to_owned(),
-                qualified_name: "CollectingSubscript.__setitem__".to_owned(),
-                parameters: vec![
-                    Parameter {
-                        name: "self".to_owned(),
-                        kind: ParameterKind::PositionalOrKeyword,
-                        default: None,
-                    },
-                    Parameter {
-                        name: "key".to_owned(),
-                        kind: ParameterKind::PositionalOrKeyword,
-                        default: None,
-                    },
-                    Parameter {
-                        name: "value".to_owned(),
-                        kind: ParameterKind::PositionalOrKeyword,
-                        default: None,
-                    },
-                ]
-                .into_boxed_slice(),
-                closure: Box::new([]),
-                annotations: None,
-            }))
-            .unwrap();
+        let method = test_function(
+            &mut context,
+            collecting_setitem_native as usize,
+            FunctionKind::Normal,
+            "__setitem__",
+            "CollectingSubscript.__setitem__",
+            vec![
+                Parameter {
+                    name: "self".to_owned(),
+                    kind: ParameterKind::PositionalOrKeyword,
+                    has_default: false,
+                },
+                Parameter {
+                    name: "key".to_owned(),
+                    kind: ParameterKind::PositionalOrKeyword,
+                    has_default: false,
+                },
+                Parameter {
+                    name: "value".to_owned(),
+                    kind: ParameterKind::PositionalOrKeyword,
+                    has_default: false,
+                },
+            ],
+            &[],
+        );
         context
             .namespace_set(namespace, "__setitem__", method)
             .unwrap();
@@ -4623,47 +5880,41 @@ mod tests {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
         let namespace = context.namespace_new().unwrap();
-        let hash_function = context
-            .allocate(HeapObject::Function(FunctionObject {
-                code_address: collecting_hash_native as usize,
-                kind: FunctionKind::Normal,
-                name: "__hash__".to_owned(),
-                qualified_name: "CollectingKey.__hash__".to_owned(),
-                parameters: vec![Parameter {
-                    name: "self".to_owned(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    default: None,
-                }]
-                .into_boxed_slice(),
-                closure: Box::new([]),
-                annotations: None,
-            }))
-            .unwrap();
-        let equal_function = context
-            .with_temporary_roots(&[namespace, hash_function], |context| {
-                context.allocate(HeapObject::Function(FunctionObject {
-                    code_address: collecting_equal_native as usize,
-                    kind: FunctionKind::Normal,
-                    name: "__eq__".to_owned(),
-                    qualified_name: "CollectingKey.__eq__".to_owned(),
-                    parameters: vec![
-                        Parameter {
-                            name: "self".to_owned(),
-                            kind: ParameterKind::PositionalOrKeyword,
-                            default: None,
-                        },
-                        Parameter {
-                            name: "other".to_owned(),
-                            kind: ParameterKind::PositionalOrKeyword,
-                            default: None,
-                        },
-                    ]
-                    .into_boxed_slice(),
-                    closure: Box::new([]),
-                    annotations: None,
-                }))
-            })
-            .unwrap();
+        let hash_function = test_function(
+            &mut context,
+            collecting_hash_native as usize,
+            FunctionKind::Normal,
+            "__hash__",
+            "CollectingKey.__hash__",
+            vec![Parameter {
+                name: "self".to_owned(),
+                kind: ParameterKind::PositionalOrKeyword,
+                has_default: false,
+            }],
+            &[],
+        );
+        let equal_function = context.with_temporary_roots(&[namespace, hash_function], |context| {
+            test_function(
+                context,
+                collecting_equal_native as usize,
+                FunctionKind::Normal,
+                "__eq__",
+                "CollectingKey.__eq__",
+                vec![
+                    Parameter {
+                        name: "self".to_owned(),
+                        kind: ParameterKind::PositionalOrKeyword,
+                        has_default: false,
+                    },
+                    Parameter {
+                        name: "other".to_owned(),
+                        kind: ParameterKind::PositionalOrKeyword,
+                        has_default: false,
+                    },
+                ],
+                &[],
+            )
+        });
         context
             .namespace_set(namespace, "__hash__", hash_function)
             .unwrap();
@@ -4719,17 +5970,15 @@ mod tests {
     fn gate4_prepared_call_arguments_trace_callable_and_accumulated_values() {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
-        let callable = context
-            .allocate(HeapObject::Function(FunctionObject {
-                code_address: add_native as usize,
-                kind: FunctionKind::Normal,
-                name: "prepared".to_owned(),
-                qualified_name: "prepared".to_owned(),
-                parameters: Box::new([]),
-                closure: Box::new([]),
-                annotations: None,
-            }))
-            .unwrap();
+        let callable = test_function(
+            &mut context,
+            add_native as usize,
+            FunctionKind::Normal,
+            "prepared",
+            "prepared",
+            Vec::new(),
+            &[],
+        );
         let arguments = call::call_arguments_new(&mut context, callable).unwrap();
         let first = operations::string(&mut context, "first").unwrap();
         call::call_argument_add(
@@ -4789,17 +6038,15 @@ mod tests {
     fn gate4_prepared_call_argument_growth_refreshes_managed_bytes_and_heap_limit() {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
-        let callable = context
-            .allocate(HeapObject::Function(FunctionObject {
-                code_address: add_native as usize,
-                kind: FunctionKind::Normal,
-                name: "prepared".to_owned(),
-                qualified_name: "prepared".to_owned(),
-                parameters: Box::new([]),
-                closure: Box::new([]),
-                annotations: None,
-            }))
-            .unwrap();
+        let callable = test_function(
+            &mut context,
+            add_native as usize,
+            FunctionKind::Normal,
+            "prepared",
+            "prepared",
+            Vec::new(),
+            &[],
+        );
         let mut arguments = RValue::NONE;
         assert_eq!(
             // SAFETY: callable/output storage and context remain live for the call.
@@ -4917,22 +6164,19 @@ mod tests {
         let unrelated = operations::dictionary(&mut context, &[], &[]).unwrap();
         context.add_context_root(unrelated);
         let namespace = context.namespace_new().unwrap();
-        let hash_function = context
-            .allocate(HeapObject::Function(FunctionObject {
-                code_address: collecting_mutating_hash_native as usize,
-                kind: FunctionKind::Normal,
-                name: "__hash__".to_owned(),
-                qualified_name: "ComprehensionKey.__hash__".to_owned(),
-                parameters: vec![Parameter {
-                    name: "self".to_owned(),
-                    kind: ParameterKind::PositionalOrKeyword,
-                    default: None,
-                }]
-                .into_boxed_slice(),
-                closure: vec![unrelated].into_boxed_slice(),
-                annotations: None,
-            }))
-            .unwrap();
+        let hash_function = test_function(
+            &mut context,
+            collecting_mutating_hash_native as usize,
+            FunctionKind::Normal,
+            "__hash__",
+            "ComprehensionKey.__hash__",
+            vec![Parameter {
+                name: "self".to_owned(),
+                kind: ParameterKind::PositionalOrKeyword,
+                has_default: false,
+            }],
+            &[unrelated],
+        );
         context
             .namespace_set(namespace, "__hash__", hash_function)
             .unwrap();

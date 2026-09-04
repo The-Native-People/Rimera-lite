@@ -8,8 +8,8 @@ use rimera_abi::{RFormatConversion, RGeneratorOperation, RGeneratorOutcome, RTag
 use crate::RimeraContext;
 use crate::heap::HeapObject;
 use crate::object::{
-    DictionaryViewKind, DictionaryViewObject, IteratorObject, MemoryViewObject, RangeObject,
-    SetObject, ValueDictionaryObject,
+    BufferLeaseObject, DictionaryViewKind, DictionaryViewObject, IteratorObject, MemoryViewObject,
+    RangeObject, SetObject, ValueDictionaryObject,
 };
 
 fn instance_storage(context: &RimeraContext, value: RValue) -> Option<RValue> {
@@ -410,15 +410,30 @@ fn allocate_memoryview_object(
     view: MemoryViewObject,
 ) -> Result<RValue, String> {
     let exporter = view.exporter;
-    let exported_bytearray = matches!(context.heap.get(exporter), Some(HeapObject::ByteArray(_)));
-    if exported_bytearray && let Some(HeapObject::ByteArray(bytes)) = context.heap.get_mut(exporter)
+    let lease = view.lease;
+    let exported_bytearray =
+        lease.is_none() && matches!(context.heap.get(exporter), Some(HeapObject::ByteArray(_)));
+    if let Some(lease) = lease {
+        let Some(HeapObject::BufferLease(lease)) = context.heap.get_mut(lease) else {
+            return Err("memoryview has an invalid provider lease".to_owned());
+        };
+        if lease.released {
+            return Err("operation forbidden on released memoryview object".to_owned());
+        }
+        lease.active_views = lease.active_views.saturating_add(1);
+    } else if exported_bytearray
+        && let Some(HeapObject::ByteArray(bytes)) = context.heap.get_mut(exporter)
     {
         bytes.exports = bytes.exports.saturating_add(1);
     }
     match context.allocate(HeapObject::MemoryView(view)) {
         Ok(value) => Ok(value),
         Err(error) => {
-            if exported_bytearray
+            if let Some(lease) = lease {
+                if let Some(HeapObject::BufferLease(lease)) = context.heap.get_mut(lease) {
+                    lease.active_views = lease.active_views.saturating_sub(1);
+                }
+            } else if exported_bytearray
                 && let Some(HeapObject::ByteArray(bytes)) = context.heap.get_mut(exporter)
             {
                 bytes.exports = bytes.exports.saturating_sub(1);
@@ -430,9 +445,10 @@ fn allocate_memoryview_object(
 
 pub fn memoryview(context: &mut RimeraContext, exporter: RValue) -> Result<RValue, String> {
     context.with_temporary_roots(&[exporter], |context| {
-        let view = match context.heap.get(exporter) {
-            Some(HeapObject::Bytes(bytes)) => MemoryViewObject {
+        let direct = match context.heap.get(exporter) {
+            Some(HeapObject::Bytes(bytes)) => Some(MemoryViewObject {
                 exporter,
+                lease: None,
                 format: "B".to_owned(),
                 item_size: 1,
                 shape: vec![bytes.len()].into_boxed_slice(),
@@ -441,9 +457,10 @@ pub fn memoryview(context: &mut RimeraContext, exporter: RValue) -> Result<RValu
                 offset: 0,
                 readonly: true,
                 released: false,
-            },
-            Some(HeapObject::ByteArray(bytes)) => MemoryViewObject {
+            }),
+            Some(HeapObject::ByteArray(bytes)) => Some(MemoryViewObject {
                 exporter,
+                lease: None,
                 format: "B".to_owned(),
                 item_size: 1,
                 shape: vec![bytes.bytes.len()].into_boxed_slice(),
@@ -452,9 +469,10 @@ pub fn memoryview(context: &mut RimeraContext, exporter: RValue) -> Result<RValu
                 offset: 0,
                 readonly: false,
                 released: false,
-            },
-            Some(HeapObject::MemoryView(parent)) if !parent.released => MemoryViewObject {
+            }),
+            Some(HeapObject::MemoryView(parent)) if !parent.released => Some(MemoryViewObject {
                 exporter: parent.exporter,
+                lease: parent.lease,
                 format: parent.format.clone(),
                 item_size: parent.item_size,
                 shape: parent.shape.clone(),
@@ -463,32 +481,86 @@ pub fn memoryview(context: &mut RimeraContext, exporter: RValue) -> Result<RValu
                 offset: parent.offset,
                 readonly: parent.readonly,
                 released: false,
-            },
+            }),
             Some(HeapObject::MemoryView(_)) => {
                 return Err("operation forbidden on released memoryview object".to_owned());
             }
-            Some(_) => return Err("memoryview: a bytes-like object is required".to_owned()),
+            Some(_) => None,
             None => return Err("value contains a stale heap handle".to_owned()),
         };
-        context.with_temporary_roots(&[view.exporter], |context| {
-            allocate_memoryview_object(context, view)
-        })
+        if let Some(view) = direct {
+            let mut roots = vec![view.exporter];
+            roots.extend(view.lease);
+            return context
+                .with_temporary_roots(&roots, |context| allocate_memoryview_object(context, view));
+        }
+
+        context.enable_buffer_lease_finalizer();
+        let flags = RValue::small_int(284);
+        let Some(exported_view) =
+            context.invoke_special_method(exporter, "__buffer__", &[flags])?
+        else {
+            return Err("memoryview: a bytes-like object is required".to_owned());
+        };
+        let source = match context.heap.get(exported_view) {
+            Some(HeapObject::MemoryView(view)) if !view.released => view.clone(),
+            Some(HeapObject::MemoryView(_)) => {
+                return context
+                    .raise_error("ValueError", "__buffer__ returned a released memoryview");
+            }
+            _ => {
+                return context
+                    .raise_error("TypeError", "__buffer__ returned non-memoryview object");
+            }
+        };
+        let lease = match context.with_temporary_roots(&[exporter, exported_view], |context| {
+            context.allocate(HeapObject::BufferLease(BufferLeaseObject {
+                provider: exporter,
+                exported_view,
+                active_views: 0,
+                released: false,
+            }))
+        }) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ =
+                    context.invoke_special_method(exporter, "__release_buffer__", &[exported_view]);
+                let _ = memoryview_release(context, exported_view);
+                return Err(error);
+            }
+        };
+        let mut view = source;
+        view.lease = Some(lease);
+        let roots = [exporter, exported_view, lease, view.exporter];
+        match context
+            .with_temporary_roots(&roots, |context| allocate_memoryview_object(context, view))
+        {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let _ = context
+                    .with_temporary_roots(&[lease], |context| context.finalize_buffer_lease(lease));
+                Err(error)
+            }
+        }
     })
 }
 
 pub fn memoryview_release(context: &mut RimeraContext, value: RValue) -> Result<(), String> {
-    let exporter = match context.heap.get(value) {
-        Some(HeapObject::MemoryView(view)) => view.exporter,
+    let (exporter, lease, released) = match context.heap.get(value) {
+        Some(HeapObject::MemoryView(view)) => (view.exporter, view.lease, view.released),
         Some(_) => return Err("operation requires a memoryview".to_owned()),
         None => return Err("value contains a stale heap handle".to_owned()),
     };
+    if released {
+        return Ok(());
+    }
     let Some(HeapObject::MemoryView(view)) = context.heap.get_mut(value) else {
         unreachable!()
     };
-    if view.released {
-        return Ok(());
-    }
     view.released = true;
+    if let Some(lease) = lease {
+        return context.release_buffer_lease_view(lease);
+    }
     if let Some(HeapObject::ByteArray(bytes)) = context.heap.get_mut(exporter) {
         bytes.exports = bytes.exports.saturating_sub(1);
     }
@@ -565,9 +637,9 @@ pub fn memoryview_to_readonly(
         None => return Err("value contains a stale heap handle".to_owned()),
     };
     view.readonly = true;
-    context.with_temporary_roots(&[view.exporter], |context| {
-        allocate_memoryview_object(context, view)
-    })
+    let mut roots = vec![view.exporter];
+    roots.extend(view.lease);
+    context.with_temporary_roots(&roots, |context| allocate_memoryview_object(context, view))
 }
 
 pub fn memoryview_hex(
@@ -714,11 +786,14 @@ pub fn memoryview_cast(
     for index in (0..shape.len().saturating_sub(1)).rev() {
         strides[index] = strides[index + 1].saturating_mul(shape[index + 1] as isize);
     }
-    context.with_temporary_roots(&[view.exporter], |context| {
+    let mut roots = vec![view.exporter];
+    roots.extend(view.lease);
+    context.with_temporary_roots(&roots, |context| {
         allocate_memoryview_object(
             context,
             MemoryViewObject {
                 exporter: view.exporter,
+                lease: view.lease,
                 format: format.to_owned(),
                 item_size,
                 shape: shape.into_boxed_slice(),
@@ -1685,6 +1760,7 @@ fn slice_item(
             strides[0] = strides[0].saturating_mul(step);
             let child = MemoryViewObject {
                 exporter: view.exporter,
+                lease: view.lease,
                 format: view.format.clone(),
                 item_size: view.item_size,
                 shape: shape.into_boxed_slice(),
@@ -1694,7 +1770,9 @@ fn slice_item(
                 readonly: view.readonly,
                 released: false,
             };
-            return context.with_temporary_roots(&[child.exporter], |context| {
+            let mut roots = vec![child.exporter];
+            roots.extend(child.lease);
+            return context.with_temporary_roots(&roots, |context| {
                 allocate_memoryview_object(context, child)
             });
         }
@@ -5572,9 +5650,13 @@ pub fn truthy(context: &mut RimeraContext, value: RValue) -> Result<bool, String
                 HeapObject::NotImplemented
                 | HeapObject::Ellipsis
                 | HeapObject::Type(_)
+                | HeapObject::Module(_)
+                | HeapObject::TypeParameter(_)
+                | HeapObject::TypeAlias(_)
                 | HeapObject::Instance(_)
                 | HeapObject::BoundMethod(_)
                 | HeapObject::CallArguments(_)
+                | HeapObject::BufferLease(_)
                 | HeapObject::Super(_)
                 | HeapObject::Property(_)
                 | HeapObject::PropertyMethod(_)
@@ -5582,11 +5664,13 @@ pub fn truthy(context: &mut RimeraContext, value: RValue) -> Result<bool, String
                 | HeapObject::ClassMethod(_)
                 | HeapObject::MemberDescriptor(_)
                 | HeapObject::Function(_)
+                | HeapObject::Code(_)
                 | HeapObject::Generator(_)
                 | HeapObject::BuiltinFunction(_)
                 | HeapObject::Cell(_)
                 | HeapObject::Exception(_)
                 | HeapObject::Traceback(_)
+                | HeapObject::Frame(_)
                 | HeapObject::Range(_)
                 | HeapObject::Iterator(_),
             ) => Ok(true),
@@ -5733,6 +5817,19 @@ fn dictionary_view_repr(
     Ok(format!("{name}([{body}])"))
 }
 
+fn type_display_name(context: &RimeraContext, object: &crate::object::TypeObject) -> String {
+    let module = context
+        .namespace_value(object.namespace, "__module__")
+        .and_then(|value| match context.heap.get(value) {
+            Some(HeapObject::String(module)) => Some(module.as_str()),
+            _ => None,
+        });
+    match module {
+        Some("builtins") | None => object.qualified_name.clone(),
+        Some(module) => format!("{module}.{}", object.qualified_name),
+    }
+}
+
 pub fn display(context: &RimeraContext, value: RValue) -> Result<String, String> {
     match value.tag {
         tag if tag == RTag::None as u32 => Ok("None".to_owned()),
@@ -5769,6 +5866,9 @@ pub fn display(context: &RimeraContext, value: RValue) -> Result<String, String>
             Some(HeapObject::DictionaryView(view)) => dictionary_view_repr(context, view),
             Some(HeapObject::MappingProxy(proxy)) => display(context, proxy.dictionary)
                 .map(|dictionary| format!("mappingproxy({dictionary})")),
+            Some(HeapObject::Module(module)) => Ok(format!("<module '{}'>", module.name)),
+            Some(HeapObject::TypeParameter(parameter)) => Ok(parameter.name.clone()),
+            Some(HeapObject::TypeAlias(alias)) => Ok(alias.name.clone()),
             Some(HeapObject::MemoryView(_)) => Ok(format!("<memory at 0x{:x}>", value.payload)),
             Some(HeapObject::Tuple(values)) => {
                 let mut items = values
@@ -5824,16 +5924,21 @@ pub fn display(context: &RimeraContext, value: RValue) -> Result<String, String>
                     ))
                 }
             }
-            Some(HeapObject::Type(object)) => Ok(format!("<class '{}'>", object.qualified_name)),
+            Some(HeapObject::Type(object)) => {
+                Ok(format!("<class '{}'>", type_display_name(context, object)))
+            }
             Some(HeapObject::Instance(object)) if object.storage.is_some() => {
                 display(context, object.storage.expect("storage was checked"))
             }
             Some(HeapObject::Instance(object)) => match context.heap.get(object.class) {
-                Some(HeapObject::Type(class)) => Ok(format!("<{} object>", class.qualified_name)),
+                Some(HeapObject::Type(class)) => {
+                    Ok(format!("<{} object>", type_display_name(context, class)))
+                }
                 _ => Err("instance has an invalid class".to_owned()),
             },
             Some(HeapObject::BoundMethod(_)) => Ok("<bound method>".to_owned()),
             Some(HeapObject::CallArguments(_)) => Ok("<internal call arguments>".to_owned()),
+            Some(HeapObject::BufferLease(_)) => Ok("<internal buffer lease>".to_owned()),
             Some(HeapObject::Super(_)) => Ok("<super object>".to_owned()),
             Some(HeapObject::Property(_)) => Ok("<property object>".to_owned()),
             Some(HeapObject::PropertyMethod(_)) => Ok("<property method>".to_owned()),
@@ -5843,6 +5948,7 @@ pub fn display(context: &RimeraContext, value: RValue) -> Result<String, String>
             Some(HeapObject::Function(object)) => {
                 Ok(format!("<function {}>", object.qualified_name))
             }
+            Some(HeapObject::Code(object)) => Ok(format!("<code object {}>", object.name)),
             Some(HeapObject::Generator(_)) => Ok("<generator object>".to_owned()),
             Some(HeapObject::BuiltinFunction(object)) => {
                 Ok(format!("<built-in function {}>", object.name))
@@ -5861,6 +5967,7 @@ pub fn display(context: &RimeraContext, value: RValue) -> Result<String, String>
                 }
             }
             Some(HeapObject::Traceback(_)) => Ok("<traceback object>".to_owned()),
+            Some(HeapObject::Frame(_)) => Ok("<frame object>".to_owned()),
             Some(HeapObject::Range(range)) => {
                 if range.step == BigInt::from(1_u8) {
                     Ok(format!("range({}, {})", range.start, range.stop))

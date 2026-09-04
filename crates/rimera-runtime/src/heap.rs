@@ -128,12 +128,23 @@ impl Heap {
             .collect()
     }
 
-    pub(crate) fn collect(&mut self, roots: impl IntoIterator<Item = RValue>) {
+    pub(crate) fn collect(&mut self, roots: impl IntoIterator<Item = RValue>) -> Vec<RValue> {
         debug_assert_eq!(self.phase, CollectionPhase::Idle);
         self.refresh_managed_bytes();
         self.collections += 1;
         self.phase = CollectionPhase::Mark;
-        let mut worklist = roots.into_iter().collect::<Vec<_>>();
+        let worklist = roots.into_iter().collect::<Vec<_>>();
+        self.mark_values(worklist);
+
+        self.phase = CollectionPhase::Lifecycle;
+        let finalizers = self.process_lifecycle_hooks();
+        self.phase = CollectionPhase::Sweep;
+        self.sweep();
+        self.phase = CollectionPhase::Idle;
+        finalizers
+    }
+
+    fn mark_values(&mut self, mut worklist: Vec<RValue>) {
         while let Some(value) = worklist.pop() {
             let Some((index, generation)) = value.handle_parts() else {
                 continue;
@@ -150,18 +161,58 @@ impl Heap {
                 object.trace_children(&mut |child| worklist.push(child));
             }
         }
-
-        self.phase = CollectionPhase::Lifecycle;
-        self.process_lifecycle_hooks();
-        self.phase = CollectionPhase::Sweep;
-        self.sweep();
-        self.phase = CollectionPhase::Idle;
     }
 
-    fn process_lifecycle_hooks(&mut self) {
-        // A native bytearray export is an external lifetime obligation, not a
-        // Python finalizer. Release unreachable views here, before sweep, so
-        // a surviving bytearray can resize once its last view disappears.
+    fn process_lifecycle_hooks(&mut self) -> Vec<RValue> {
+        // First remove dead user-visible views from their shared PEP 688 lease.
+        // A still-marked lease means another derived view remains alive.
+        let leases_from_dead_views = self
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                (!slot.marked)
+                    .then_some(slot.object.as_ref())
+                    .flatten()
+                    .and_then(|object| match object {
+                        HeapObject::MemoryView(view) if !view.released => view.lease,
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        for lease in leases_from_dead_views {
+            if let Some(HeapObject::BufferLease(lease)) = self.get_mut(lease) {
+                lease.active_views = lease.active_views.saturating_sub(1);
+            }
+        }
+
+        // Python callbacks cannot run while the raw heap owns the collection
+        // phase. Preserve each unreachable provider lease and its traced graph
+        // for one turn; RimeraContext runs __release_buffer__, then collects
+        // again to reclaim the now-finalized cycle.
+        let finalizers = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                if slot.marked {
+                    return None;
+                }
+                match slot.object.as_ref() {
+                    Some(HeapObject::BufferLease(lease)) if !lease.released => {
+                        Some(RValue::handle(
+                            u32::try_from(index).expect("heap slot index must fit the handle ABI"),
+                            slot.generation,
+                        ))
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        self.mark_values(finalizers.clone());
+
+        // Native bytearray export counting remains one obligation per native
+        // memoryview. Provider-derived views carry a lease instead and do not
+        // independently increment/decrement the backing exporter count.
         let exporters = self
             .slots
             .iter()
@@ -170,7 +221,9 @@ impl Heap {
                     .then_some(slot.object.as_ref())
                     .flatten()
                     .and_then(|object| match object {
-                        HeapObject::MemoryView(view) if !view.released => Some(view.exporter),
+                        HeapObject::MemoryView(view) if !view.released && view.lease.is_none() => {
+                            Some(view.exporter)
+                        }
                         _ => None,
                     })
             })
@@ -180,9 +233,7 @@ impl Heap {
                 bytes.exports = bytes.exports.saturating_sub(1);
             }
         }
-        // Weak-reference clearing and finalizer discovery belong between mark
-        // and sweep. The phase remains the extension point for those later
-        // Python behaviors.
+        finalizers
     }
 
     fn sweep(&mut self) {

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::mem::size_of;
 
 use num_bigint::BigInt;
-use rimera_abi::{RParameterKind as ParameterKind, RValue};
+use rimera_abi::{RParameterKind as ParameterKind, RTypeParameterKind, RValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionKind {
@@ -14,7 +14,7 @@ pub enum FunctionKind {
 pub struct Parameter {
     pub name: String,
     pub kind: ParameterKind,
-    pub default: Option<RValue>,
+    pub has_default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,25 +25,67 @@ pub struct CallArgumentsObject {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FunctionObject {
+pub struct CodeObject {
     pub code_address: usize,
     pub kind: FunctionKind,
     pub name: String,
     pub qualified_name: String,
     pub parameters: Box<[Parameter]>,
-    pub closure: Box<[RValue]>,
+    pub filename: String,
+    pub first_line: u32,
+    pub local_names: Box<[String]>,
+    pub cell_names: Box<[String]>,
+    pub free_names: Box<[String]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionObject {
+    pub code: RValue,
+    pub name: String,
+    pub qualified_name: String,
+    pub closure: Option<RValue>,
+    pub defaults: Option<RValue>,
+    pub keyword_defaults: Option<RValue>,
     pub annotations: Option<RValue>,
+    pub type_params: Option<RValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeParameterObject {
+    pub name: String,
+    pub kind: RTypeParameterKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeAliasObject {
+    pub name: String,
+    pub type_params: RValue,
+    pub value: RValue,
 }
 
 /// Persistent execution state for one compiled synchronous generator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratorObject {
     pub function: RValue,
+    pub name: String,
+    pub qualified_name: String,
     pub resume_address: usize,
     pub state: u32,
     pub slots: Box<[Option<RValue>]>,
+    /// Reflection-only cell registry for the generator activation. The cells
+    /// are the same cells used by compiled execution; no duplicate locals
+    /// storage or frame interpreter is introduced.
+    pub local_cells: Vec<(String, RValue)>,
+    /// CPython 3.12 keeps one refreshed locals dictionary per generator frame.
+    /// It survives suspension but is dropped from the generator at terminal
+    /// completion; independently retained dictionaries remain ordinary GC
+    /// managed values.
+    pub locals_snapshot: Option<RValue>,
+    /// Stable Python-visible frame identity while the generator is live.
+    pub frame: Option<RValue>,
     pub delegate: Option<RValue>,
     pub handled: Box<[RValue]>,
+    pub raised: Option<RValue>,
     pub started: bool,
     pub running: bool,
     pub closed: bool,
@@ -85,6 +127,7 @@ pub enum BuiltinFunctionKind {
     FloatIsInteger,
     FloatAsIntegerRatio,
     FloatHex,
+    FloatFromHex,
     ComplexConjugate,
     RangeCount,
     RangeIndex,
@@ -120,6 +163,12 @@ pub enum BuiltinFunctionKind {
     ListIndex,
     ListReverse,
     ListSort,
+    GeneratorIter,
+    GeneratorNext,
+    GeneratorSend,
+    GeneratorThrow,
+    GeneratorClose,
+    ExceptionWithTraceback,
     BuiltinStorageInit,
     MemoryViewRelease,
     MemoryViewToBytes,
@@ -151,6 +200,10 @@ pub enum BuiltinFunctionKind {
     Sorted,
     Id,
     Ascii,
+    Dir,
+    Vars,
+    Globals,
+    Locals,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,11 +492,24 @@ pub struct MappingProxyObject {
     pub dictionary: RValue,
 }
 
+/// One Python-level PEP 688 export lease shared by every derived view. The
+/// provider callback is fired exactly once when the last live view releases or
+/// when the entire lease becomes unreachable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferLeaseObject {
+    pub provider: RValue,
+    pub exported_view: RValue,
+    pub active_views: usize,
+    pub released: bool,
+}
+
 /// Native buffer metadata. The initial exporters are bytes, bytearray, and
-/// memoryview; the exporter handle keeps the backing allocation alive.
+/// memoryview; the exporter handle keeps the backing allocation alive. A
+/// provider lease is present only for Python-level PEP 688 exports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryViewObject {
     pub exporter: RValue,
+    pub lease: Option<RValue>,
     pub format: String,
     pub item_size: usize,
     pub shape: Box<[usize]>,
@@ -480,6 +546,7 @@ impl DictionaryObject {
 pub struct ExceptionObject {
     pub exception_type: RValue,
     pub arguments: RValue,
+    pub dictionary: Option<RValue>,
     pub traceback: Option<RValue>,
     pub cause: Option<RValue>,
     pub context: Option<RValue>,
@@ -495,7 +562,26 @@ pub struct TracebackObject {
     pub function: String,
     pub line: u32,
     pub column: u32,
+    pub frame: Option<RValue>,
     pub next: Option<RValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameObject {
+    pub code: RValue,
+    pub globals: RValue,
+    pub locals: RValue,
+    pub back: Option<RValue>,
+    pub line: u32,
+    /// Present only while this frame is owned by a live generator. This lets
+    /// reflection refresh `f_locals` from the authoritative generator state.
+    pub generator: Option<RValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleObject {
+    pub name: String,
+    pub namespace: RValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -581,6 +667,10 @@ pub enum ManagedObject {
     DictionaryView(DictionaryViewObject),
     MappingProxy(MappingProxyObject),
     MemoryView(MemoryViewObject),
+    BufferLease(BufferLeaseObject),
+    Module(ModuleObject),
+    TypeParameter(TypeParameterObject),
+    TypeAlias(TypeAliasObject),
     Type(TypeObject),
     Instance(InstanceObject),
     BoundMethod(BoundMethodObject),
@@ -592,11 +682,13 @@ pub enum ManagedObject {
     MemberDescriptor(MemberDescriptorObject),
     Super(SuperObject),
     Function(FunctionObject),
-    Generator(GeneratorObject),
+    Code(CodeObject),
+    Generator(Box<GeneratorObject>),
     BuiltinFunction(BuiltinFunctionObject),
     Cell(CellObject),
     Exception(ExceptionObject),
     Traceback(TracebackObject),
+    Frame(Box<FrameObject>),
     Range(RangeObject),
     Iterator(IteratorObject),
 }
@@ -636,7 +728,20 @@ impl ManagedObject {
             Self::FrozenSet(set) => set.table.values().copied().for_each(visitor),
             Self::DictionaryView(object) => visitor(object.dictionary),
             Self::MappingProxy(object) => visitor(object.dictionary),
-            Self::MemoryView(object) => visitor(object.exporter),
+            Self::MemoryView(object) => {
+                visitor(object.exporter);
+                object.lease.into_iter().for_each(visitor);
+            }
+            Self::BufferLease(object) => {
+                visitor(object.provider);
+                visitor(object.exported_view);
+            }
+            Self::Module(object) => visitor(object.namespace),
+            Self::TypeParameter(_) => {}
+            Self::TypeAlias(object) => {
+                visitor(object.type_params);
+                visitor(object.value);
+            }
             Self::Type(object) => object
                 .bases
                 .iter()
@@ -684,14 +789,14 @@ impl ManagedObject {
                 visitor(object.receiver_type);
             }
             Self::Function(object) => {
-                object
-                    .parameters
-                    .iter()
-                    .filter_map(|parameter| parameter.default)
-                    .for_each(&mut *visitor);
-                object.closure.iter().copied().for_each(&mut *visitor);
-                object.annotations.into_iter().for_each(visitor);
+                visitor(object.code);
+                object.closure.into_iter().for_each(&mut *visitor);
+                object.defaults.into_iter().for_each(&mut *visitor);
+                object.keyword_defaults.into_iter().for_each(&mut *visitor);
+                object.annotations.into_iter().for_each(&mut *visitor);
+                object.type_params.into_iter().for_each(visitor);
             }
+            Self::Code(_) => {}
             Self::Generator(object) => {
                 visitor(object.function);
                 object
@@ -700,8 +805,16 @@ impl ManagedObject {
                     .flatten()
                     .copied()
                     .for_each(&mut *visitor);
+                object
+                    .local_cells
+                    .iter()
+                    .map(|(_, cell)| *cell)
+                    .for_each(&mut *visitor);
+                object.locals_snapshot.into_iter().for_each(&mut *visitor);
+                object.frame.into_iter().for_each(&mut *visitor);
                 object.delegate.into_iter().for_each(&mut *visitor);
                 object.handled.iter().copied().for_each(&mut *visitor);
+                object.raised.into_iter().for_each(&mut *visitor);
                 object.return_value.into_iter().for_each(visitor);
             }
             Self::BuiltinFunction(_) => {}
@@ -709,13 +822,24 @@ impl ManagedObject {
             Self::Exception(object) => {
                 visitor(object.exception_type);
                 visitor(object.arguments);
+                object.dictionary.into_iter().for_each(&mut *visitor);
                 object.traceback.into_iter().for_each(&mut *visitor);
                 object.cause.into_iter().for_each(&mut *visitor);
                 object.context.into_iter().for_each(&mut *visitor);
                 object.group_exceptions.into_iter().for_each(&mut *visitor);
                 object.group_origin.into_iter().for_each(visitor);
             }
-            Self::Traceback(object) => object.next.into_iter().for_each(visitor),
+            Self::Traceback(object) => {
+                object.frame.into_iter().for_each(&mut *visitor);
+                object.next.into_iter().for_each(visitor);
+            }
+            Self::Frame(object) => {
+                visitor(object.code);
+                visitor(object.globals);
+                visitor(object.locals);
+                object.back.into_iter().for_each(&mut *visitor);
+                object.generator.into_iter().for_each(visitor);
+            }
             Self::Iterator(
                 IteratorObject::Sequence { source, .. }
                 | IteratorObject::SequenceProtocol { source, .. }
@@ -774,6 +898,16 @@ impl ManagedObject {
                 .saturating_add(object.shape.len().saturating_mul(size_of::<usize>()))
                 .saturating_add(object.strides.len().saturating_mul(size_of::<isize>()))
                 .saturating_add(object.suboffsets.len().saturating_mul(size_of::<isize>())),
+            Self::BufferLease(_) => size_of::<BufferLeaseObject>(),
+            Self::Module(object) => {
+                size_of::<ModuleObject>().saturating_add(object.name.capacity())
+            }
+            Self::TypeParameter(object) => {
+                size_of::<TypeParameterObject>().saturating_add(object.name.capacity())
+            }
+            Self::TypeAlias(object) => {
+                size_of::<TypeAliasObject>().saturating_add(object.name.capacity())
+            }
             Self::Type(object) => object
                 .name
                 .capacity()
@@ -823,6 +957,12 @@ impl ManagedObject {
                 .name
                 .capacity()
                 .saturating_add(object.qualified_name.capacity())
+                .saturating_add(size_of::<FunctionObject>()),
+            Self::Code(object) => object
+                .name
+                .capacity()
+                .saturating_add(object.qualified_name.capacity())
+                .saturating_add(object.filename.capacity())
                 .saturating_add(
                     object
                         .parameters
@@ -836,13 +976,40 @@ impl ManagedObject {
                         .map(|parameter| parameter.name.capacity())
                         .sum::<usize>(),
                 )
-                .saturating_add(object.closure.len().saturating_mul(size_of::<RValue>())),
+                .saturating_add(
+                    object
+                        .local_names
+                        .iter()
+                        .chain(object.cell_names.iter())
+                        .chain(object.free_names.iter())
+                        .map(String::capacity)
+                        .sum::<usize>(),
+                )
+                .saturating_add(
+                    (object.local_names.len() + object.cell_names.len() + object.free_names.len())
+                        .saturating_mul(size_of::<String>()),
+                ),
             Self::Generator(object) => size_of::<GeneratorObject>()
+                .saturating_add(object.name.capacity())
+                .saturating_add(object.qualified_name.capacity())
                 .saturating_add(
                     object
                         .slots
                         .len()
                         .saturating_mul(size_of::<Option<RValue>>()),
+                )
+                .saturating_add(
+                    object
+                        .local_cells
+                        .capacity()
+                        .saturating_mul(size_of::<(String, RValue)>()),
+                )
+                .saturating_add(
+                    object
+                        .local_cells
+                        .iter()
+                        .map(|(name, _)| name.capacity())
+                        .sum::<usize>(),
                 )
                 .saturating_add(object.handled.len().saturating_mul(size_of::<RValue>())),
             Self::BuiltinFunction(object) => object.name.capacity(),
@@ -857,6 +1024,7 @@ impl ManagedObject {
                 .capacity()
                 .saturating_add(object.function.capacity())
                 .saturating_add(size_of::<TracebackObject>()),
+            Self::Frame(_) => size_of::<FrameObject>(),
             Self::Range(object) => usize::try_from(
                 object
                     .start

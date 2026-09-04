@@ -1,0 +1,109 @@
+---
+title: Configuration
+description: Configure a Rimera build from pyproject.toml.
+icon: Settings
+---
+
+Put project-wide defaults in the `[tool.rimera]` table in the nearest
+`pyproject.toml` above your entry file. A value passed on the command line
+wins over the value in this file.
+
+```toml
+[tool.rimera]
+output = "dist/app"
+target = "aarch64-apple-darwin"
+profile = "release"
+run = false
+debug = false
+heap_limit_bytes = 1048576
+```
+
+<Callout type="warn" title="Current target support">
+  Rimera Lite currently produces native executables for Apple Silicon macOS
+  only. Use `aarch64-apple-darwin`; another target value stops the build with
+  an unsupported-target error.
+</Callout>
+
+## Settings reference
+
+<Accordions>
+  <Accordion title="output — where the executable is written">
+    `output` is a file path for the compiled native executable. A relative path
+    is resolved from the folder containing `pyproject.toml`, not from your
+    shell's current folder. For example, `output = "dist/app"` creates
+    `<project>/dist/app`.
+
+    If neither `output` nor `--output` is supplied, Rimera needs `run = true`
+    (or `--run`). Otherwise it stops before compiling because it has nowhere to
+    place the executable.
+  </Accordion>
+
+  <Accordion title="target — the platform to build for">
+    `target` selects the executable's platform. The only supported value today
+    is `aarch64-apple-darwin`, which means Apple Silicon Macs. It defaults to
+    that value when omitted.
+  </Accordion>
+
+  <Accordion title="profile — debug or release">
+    `profile` accepts exactly `debug` or `release`; it defaults to `debug`.
+    Use `debug` while developing. Use `release` when you want the optimized,
+    smaller artifact. It does not change which Python features Rimera supports.
+  </Accordion>
+
+  <Accordion title="run — compile, then start the executable">
+    Set `run = true` to start the executable immediately after a successful
+    compile. If no output path was chosen, Rimera writes a temporary-style
+    build output at `<entry folder>/.rimera/bin/<entry name>` and runs it.
+    Rimera returns the program's exit status to your shell.
+  </Accordion>
+
+  <Accordion title="debug — compiler diagnostics for investigating a build">
+    `debug = true` turns on compiler trace details and writes a readable IR
+    inspection file under `.rimera/ir/`. This is for investigating compilation;
+    it does not enable Python debug mode and it does not change program output.
+  </Accordion>
+
+  <Accordion title="heap_limit_bytes — cap Rimera-managed program memory">
+    `heap_limit_bytes` is an optional per-executable ceiling, measured in
+    bytes, for memory managed by Rimera's runtime. `1048576` is 1 MiB. It is
+    **not** a limit on the process's total memory: executable code, the native
+    stack, system libraries, and OS allocations are outside this budget.
+
+    Before refusing an allocation, Rimera collects objects that are no longer
+    reachable. If the live Rimera-managed objects still exceed the ceiling, the
+    running program raises `MemoryError: managed heap limit exceeded` and exits
+    unsuccessfully. Omit this setting for no managed-heap ceiling. Use it when
+    you need a predictable budget for values such as strings, lists, dicts,
+    instances, and other Python values owned by the Rimera runtime.
+  </Accordion>
+</Accordions>
+
+## Build cache and output
+
+Rimera keeps disposable compiler intermediates in `.rimera/` within your
+project. Do not commit that directory. `--run` without an output path also uses
+`.rimera/bin/` for the executable it launches. Choose `output` when the
+executable is something you intend to keep, package, or invoke later.
+
+## Command-line overrides
+
+Use these flags for a one-off change without editing `pyproject.toml`:
+
+```bash
+rimlite --help
+```
+
+`--output`, `--target`, `--profile`, and `--heap-limit-bytes` replace their
+matching project setting for that command. `--run` and `--debug` turn those
+behaviours on for the command; they cannot turn a `true` project default off.
+
+```bash
+# Keep the project defaults, but write this build somewhere else.
+rimlite app.py --output dist/app
+
+# Build an optimized executable with a 32 MiB managed-memory ceiling.
+rimlite app.py --profile release --heap-limit-bytes 33554432 --output dist/app
+
+# Compile and run once without choosing a permanent output path.
+rimlite app.py --run
+```

@@ -41,15 +41,15 @@ Python source -> owned syntax/HIR -> semantic analysis -> verified MIR
 
 ## Progress ledger
 
-- [ ] Slice 1 — ownership, ABI baseline, and differential matrix
-- [ ] Slice 2 — source generator classification and lazy construction
-- [ ] Slice 3 — yield/resume CFG, values, and persistent liveness
-- [ ] Slice 4 — generator protocol surface, return values, and exhaustion
-- [ ] Slice 5 — exception injection, `throw`, `close`, and PEP 479
-- [ ] Slice 6 — suspension through handlers and cleanup regions
-- [ ] Slice 7 — complete `yield from` delegation state machine
-- [ ] Slice 8 — composition, GC, failure atomicity, and artifact proof
-- [ ] Slice 9 — final audit, documentation, and gate closure
+- [x] Slice 1 — ownership, ABI baseline, and differential matrix
+- [x] Slice 2 — source generator classification and lazy construction
+- [x] Slice 3 — yield/resume CFG, values, and persistent liveness
+- [x] Slice 4 — generator protocol surface, return values, and exhaustion
+- [x] Slice 5 — exception injection, `throw`, `close`, and PEP 479
+- [x] Slice 6 — suspension through handlers and cleanup regions
+- [x] Slice 7 — complete `yield from` delegation state machine
+- [x] Slice 8 — composition, GC, failure atomicity, and artifact proof
+- [x] Slice 9 — final audit, documentation, and gate closure
 
 ## Slice order
 

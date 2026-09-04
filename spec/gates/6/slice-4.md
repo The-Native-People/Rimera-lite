@@ -24,3 +24,11 @@ through managed methods and generic calls.
 Public differentials cover iteration, sends, returns, `StopIteration.value`,
 reentrancy, repeated exhaustion, method aliasing, reclamation, and low-heap
 behavior through the generic call and iterator paths.
+
+## Completion evidence — 2026-09-03
+
+- Managed generator attribute dispatch exposes `__iter__`, `__next__`, `send`, `throw`, and `close`; builtin `next()` uses the same native resume state.
+- Bare/fallthrough return and valued return produce CPython-shaped repeated exhaustion and `StopIteration.value` behavior; just-started non-`None` send is a managed `TypeError`.
+- `gate6_source_generator_protocol_matches_cpython_312_under_gc_pressure` matches CPython 3.12.11 status/stdout/stderr through the public build pipeline.
+
+## DONE BY CHATGPT

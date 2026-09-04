@@ -1,0 +1,8 @@
+{
+  "title": "Reference",
+  "description": "Language coverage and measured performance.",
+  "icon": "BookOpenCheck",
+  "collapsible": true,
+  "defaultOpen": true,
+  "pages": ["supported-python", "benchmarks"]
+}

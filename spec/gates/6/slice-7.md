@@ -24,3 +24,11 @@ generator/iterator protocols.
 Public CPython differentials cover every forwarded operation and fallback,
 nested/native/user delegation, return extraction, callback logs, failures,
 tracebacks, cleanup, and collection under constrained heaps.
+
+## Completion evidence — 2026-09-03
+
+- `RGeneratorDelegateOutcome::{Yielded, Completed, Propagate}` plus `rimera_generator_delegate_start/set/resume` form the additive delegation ABI; the active delegate is stored on and traced by the existing generator object.
+- Native generators, generator expressions, builtin iterators, and user iterator/delegate objects all use generic iterator/method dispatch; delegated completion yields `StopIteration.value` as the `yield from` expression result.
+- `gate6_yield_from_native_builtin_and_nested_match_cpython_312_under_gc_pressure` and `gate6_yield_from_user_delegate_matches_cpython_312_under_gc_pressure` prove send/throw/close forwarding, nested delegation, completion, and propagation.
+
+## DONE BY CHATGPT

@@ -734,29 +734,298 @@ fn unsupported_and_malformed_source_emit_no_artifact() {
 
 #[test]
 fn gate4_invalid_target_forms_have_stable_semantic_diagnostics() {
-    for (fixture, code) in [("gate4_cap_multiple_star.py", "RIM-SEMA-001")] {
+    let fixture = "gate4_cap_multiple_star.py";
+    let code = "RIM-SEMA-001";
+    let output = output(fixture);
+    let diagnostics = rimera_compiler::build(request(fixture, output.clone())).unwrap_err();
+    let diagnostic = &diagnostics.as_slice()[0];
+    assert_eq!(diagnostic.code, code, "fixture: {fixture}");
+    assert!(
+        diagnostic.span.end > diagnostic.span.start,
+        "fixture: {fixture}: {diagnostic:?}"
+    );
+    assert!(!output.exists(), "fixture emitted an artifact: {fixture}");
+}
+
+#[test]
+fn gate7_slice7_lazy_type_parameter_bounds_have_a_stable_no_artifact_boundary() {
+    let fixture = "gate7_cap_type_param_bound.py";
+    let output = output(fixture);
+    let diagnostics = rimera_compiler::build(request(fixture, output.clone())).unwrap_err();
+    let diagnostic = &diagnostics.as_slice()[0];
+    assert_eq!(diagnostic.code, "RIM-CAP-G7-03");
+    assert!(diagnostic.message.contains("lazy PEP 695"));
+    assert!(diagnostic.span.end > diagnostic.span.start);
+    assert!(!output.exists());
+}
+
+#[test]
+fn gate5_slice1_existing_function_scope_exception_kernel_remains_native_and_differential() {
+    for fixture in [
+        "functions.py",
+        "lambdas.py",
+        "scopes.py",
+        "exceptions.py",
+        "exception_control_flow.py",
+        "gate4_composition.py",
+    ] {
+        assert_gate4_fixture_matches_cpython(fixture);
+    }
+}
+
+#[test]
+fn gate5_slice1_later_gate_boundaries_are_stable_and_emit_no_artifact() {
+    for (fixture, code) in [
+        ("gate5_cap_async_def.py", "RIM-CAP-001"),
+        ("gate5_cap_import.py", "RIM-CAP-001"),
+        ("gate7_cap_type_param_bound.py", "RIM-CAP-G7-03"),
+    ] {
         let output = output(fixture);
         let diagnostics = rimera_compiler::build(request(fixture, output.clone())).unwrap_err();
         let diagnostic = &diagnostics.as_slice()[0];
         assert_eq!(diagnostic.code, code, "fixture: {fixture}");
         assert!(
             diagnostic.span.end > diagnostic.span.start,
-            "fixture: {fixture}: {diagnostic:?}"
+            "fixture: {fixture}"
         );
         assert!(!output.exists(), "fixture emitted an artifact: {fixture}");
     }
 }
 
 #[test]
-fn gate4_audit_defers_pep695_type_parameters_to_gate7() {
-    let fixture = "gate7_cap_type_params.py";
-    let output = output(fixture);
-    let diagnostics = rimera_compiler::build(request(fixture, output.clone())).unwrap_err();
-    let diagnostic = &diagnostics.as_slice()[0];
-    assert_eq!(diagnostic.code, "RIM-CAP-G7-01");
-    assert!(diagnostic.message.contains("Gate 7"));
-    assert!(diagnostic.span.end > diagnostic.span.start);
-    assert!(!output.exists());
+fn gate5_slice2_function_metadata_defaults_and_decorators_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate5_function_metadata.py");
+}
+
+#[test]
+fn gate5_slice2_function_metadata_graphs_survive_gc_and_dead_cycles_collect() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate5_function_metadata_gc.py",
+        Some(32_768),
+    );
+}
+
+#[test]
+fn gate5_slice3_authoritative_binding_and_activation_isolation_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate5_binding_activation.py",
+        Some(65_536),
+    );
+}
+
+#[test]
+fn gate5_slice4_scope_matrix_matches_cpython_312_under_gc_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate5_scope_matrix.py", Some(96_000));
+}
+
+#[test]
+fn gate5_slice4_declaration_conflicts_have_stable_spans_and_emit_no_artifact() {
+    for fixture in [
+        "gate5_scope_conflict_global_nonlocal.py",
+        "gate5_scope_conflict_parameter_global.py",
+        "gate5_scope_conflict_missing_nonlocal.py",
+    ] {
+        let output = output(fixture);
+        let diagnostics = rimera_compiler::build(request(fixture, output.clone())).unwrap_err();
+        let diagnostic = &diagnostics.as_slice()[0];
+        assert_eq!(diagnostic.code, "RIM-SEMA-001", "fixture: {fixture}");
+        assert!(
+            diagnostic.span.end > diagnostic.span.start,
+            "declaration diagnostic has no source span: {fixture}"
+        );
+        assert!(!output.exists(), "fixture emitted an artifact: {fixture}");
+    }
+}
+
+#[test]
+fn gate5_slice5_exception_objects_tracebacks_and_normalization_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate5_exception_objects.py",
+        Some(96_000),
+    );
+}
+
+#[test]
+fn gate7_slice1_deferred_reflection_boundaries_are_stable_and_emit_no_artifact() {
+    for (fixture, code) in [
+        ("gate7_cap_eval.py", "RIM-CAP-G7-02"),
+        ("gate7_cap_exec.py", "RIM-CAP-G7-02"),
+        ("gate7_cap_compile.py", "RIM-CAP-G7-02"),
+        ("gate7_cap_unregistered_import.py", "RIM-CAP-001"),
+        ("gate7_cap_dotted_import.py", "RIM-CAP-001"),
+        ("gate7_cap_from_import.py", "RIM-CAP-001"),
+        ("gate5_cap_async_def.py", "RIM-CAP-001"),
+        ("gate7_cap_type_param_bound.py", "RIM-CAP-G7-03"),
+    ] {
+        let output = output(fixture);
+        let diagnostics = rimera_compiler::build(request(fixture, output.clone())).unwrap_err();
+        let diagnostic = &diagnostics.as_slice()[0];
+        assert_eq!(diagnostic.code, code, "fixture: {fixture}");
+        assert!(
+            diagnostic.span.end > diagnostic.span.start,
+            "fixture: {fixture}"
+        );
+        assert!(!output.exists(), "fixture emitted an artifact: {fixture}");
+    }
+}
+
+#[test]
+fn gate7_slice1_pulled_forward_import_foundation_matches_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate7_import_foundation.py");
+}
+
+#[test]
+fn gate7_slice1_dynamic_builtin_names_allow_user_rebinding() {
+    assert_gate4_fixture_matches_cpython("gate7_dynamic_builtin_rebinding.py");
+}
+
+#[test]
+fn gate7_slice2_namespace_views_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate7_namespace_views.py");
+}
+
+#[test]
+fn gate7_slice2_namespace_views_survive_gc_and_dead_activation_cycles_collect() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate7_namespace_views_gc.py",
+        Some(96_000),
+    );
+}
+
+#[test]
+fn gate7_slice3_identity_type_relations_and_attribute_reflection_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate7_identity_attribute_reflection.py",
+        Some(128_000),
+    );
+}
+
+#[test]
+fn gate7_slice4_function_closure_signature_and_code_metadata_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate7_function_code_metadata.py");
+}
+
+#[test]
+fn gate7_slice4_retained_code_and_closure_metadata_survive_gc_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate7_function_code_metadata_gc.py",
+        Some(96_000),
+    );
+}
+
+#[test]
+fn gate7_slice5_exception_traceback_and_frame_metadata_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython("gate7_exception_traceback_frames.py");
+}
+
+#[test]
+fn gate7_slice5_retained_traceback_frames_survive_gc_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate7_exception_traceback_frames_gc.py",
+        Some(128_000),
+    );
+}
+
+#[test]
+fn gate7_slice6_generator_identity_state_and_suspension_metadata_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate7_generator_metadata.py",
+        Some(160_000),
+    );
+}
+
+#[test]
+fn gate7_slice6_retained_generator_frames_survive_gc_and_terminal_detach() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate7_generator_metadata_gc.py",
+        Some(128_000),
+    );
+}
+
+#[test]
+fn gate7_slice7_python312_type_parameter_metadata_matches_cpython() {
+    assert_gate4_fixture_matches_cpython("gate7_type_parameters.py");
+}
+
+#[test]
+fn gate7_slice7_type_method_tables_and_class_metadata_match_cpython() {
+    assert_gate4_fixture_matches_cpython("gate7_type_metadata.py");
+}
+
+#[test]
+fn gate7_slice7_type_parameter_graphs_survive_forced_gc() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate7_type_parameters_gc.py",
+        Some(48_000),
+    );
+}
+
+#[test]
+fn gate7_slice8_python_level_buffer_protocol_matches_cpython_312() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate7_pep688_buffer.py", Some(96_000));
+}
+
+#[test]
+fn gate7_slice8_provider_graph_survives_forced_gc_and_heap_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate7_pep688_buffer_gc.py", Some(48_000));
+}
+
+#[test]
+fn gate7_slice8_release_callback_exception_semantics_match_cpython_312() {
+    let fixture = "gate7_pep688_release_callback_error.py";
+    let request = request(fixture, output(fixture));
+    let artifact = rimera_compiler::build(request.clone()).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&request.entry)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code(), "{fixture}");
+    assert_eq!(native.stdout, python.stdout, "{fixture}");
+    // CPython reports __release_buffer__ callback failures through the
+    // unraisable hook, whose stderr includes a nondeterministic object address.
+    // The semantic differential is release() success + callback side effects;
+    // Rimera's runtime unit proof separately verifies the export is dropped.
+    assert!(
+        native.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert!(String::from_utf8_lossy(&python.stderr).contains("Exception ignored in:"));
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate6_source_generator_protocol_matches_cpython_312_under_gc_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate6_source_generators.py",
+        Some(96_000),
+    );
+}
+
+#[test]
+fn gate6_throw_close_and_pep479_match_cpython_312_under_gc_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate6_throw_close.py", Some(96_000));
+}
+
+#[test]
+fn gate6_cleanup_suspension_matches_cpython_312_under_gc_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate6_cleanup_suspend.py", Some(96_000));
+}
+
+#[test]
+fn gate6_yield_from_native_builtin_and_nested_match_cpython_312_under_gc_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate6_yield_from.py", Some(96_000));
+}
+
+#[test]
+fn gate6_yield_from_user_delegate_matches_cpython_312_under_gc_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate6_yield_from_user.py", Some(96_000));
+}
+
+#[test]
+fn gate6_composition_matches_cpython_312_under_gc_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate6_composition.py", Some(128_000));
 }
 
 fn assert_gate4_fixture_matches_cpython(fixture: &str) {

@@ -6,10 +6,10 @@ function objects, cells, call binder, exception graph, traceback model, and
 cleanup CFG. It may not introduce a second call path, scope model, unwinder, or
 exception representation.
 
-Gate 6 is the sole active implementation gate. Gate 5 remains queued until
-Gate 6 closes, except that a concrete Gate 5 defect exposed by an active Gate 6
-slice is repaired as that slice's prerequisite. Such a repair does not promote
-Gate 5 or skip this ledger.
+Gate 6 is closed. Gate 5 Slices 1–5 are complete and **Slice 6 is the sole
+active compatibility slice**. Continue this ledger in numeric order; the Gate 6
+prerequisite repairs already landed do not skip the remaining propagation,
+composition, and final-audit slices.
 
 Every slice must reach the complete native path:
 
@@ -47,11 +47,11 @@ Python source -> owned syntax/HIR -> semantic analysis -> verified MIR
 
 ## Progress ledger
 
-- [ ] Slice 1 — ownership, oracle, and gap matrix
-- [ ] Slice 2 — function identity, metadata, defaults, and decorators
-- [ ] Slice 3 — authoritative binding and activation isolation
-- [ ] Slice 4 — complete LEGB, cells, and scope interactions
-- [ ] Slice 5 — exception objects, hierarchy, normalization, and traceback API
+- [x] Slice 1 — ownership, oracle, and gap matrix
+- [x] Slice 2 — function identity, metadata, defaults, and decorators
+- [x] Slice 3 — authoritative binding and activation isolation
+- [x] Slice 4 — complete LEGB, cells, and scope interactions
+- [x] Slice 5 — exception objects, hierarchy, normalization, and traceback API
 - [ ] Slice 6 — propagation, chaining, groups, and cleanup completion
 - [ ] Slice 7 — cross-feature composition, GC, and traceback fidelity
 - [ ] Slice 8 — final audit, documentation, and gate closure

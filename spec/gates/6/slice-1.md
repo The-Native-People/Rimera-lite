@@ -26,3 +26,11 @@ state-machine, ABI, runtime, and proof delta for general generators.
 ABI layout tests, MIR/verifier baseline tests, public generator-expression
 regressions, and invalid-source diagnostics are green. The matrix names one
 owner and one slice for every unresolved synchronous generator behavior.
+
+## Completion evidence — 2026-09-03
+
+- The existing managed `GeneratorObject`, `RNativeGeneratorResume`, persistent-slot ABI, and Cranelift resume dispatcher remain the sole synchronous-generator model; source generators and Gate 4 generator expressions share them.
+- CPython `/opt/homebrew/bin/python3.12` reports 3.12.11 and is the public differential oracle.
+- Final Gate 6 acceptance is green: 269 workspace tests passed with 0 failed/ignored, warning-denied clippy and doc tests pass, and the release verifier emits a 485,176-byte `hello` with a clean forbidden-symbol scan.
+
+## DONE BY CHATGPT

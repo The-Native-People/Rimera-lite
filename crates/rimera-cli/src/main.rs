@@ -120,7 +120,7 @@ fn execute(cli: Cli, color: bool) -> Result<ExitCode, CliFailure> {
                 .or_else(|| run.then(|| run_output_path(&entry)))
                 .ok_or_else(|| CliFailure::Message("an output path is required unless `--run` or `tool.rimera.run = true` is set".to_owned()))?;
             let mut progress = ProgressRenderer::new(color);
-            progress.begin(&entry, &target, profile, debug);
+            progress.begin(&entry, &output, &target, profile, debug);
             let started = Instant::now();
             let result = rimera_compiler::build_with_progress(
                 BuildRequest {
@@ -177,11 +177,11 @@ fn find_project_root(entry: &Path) -> PathBuf {
 fn run_artifact(executable: &Path, color: bool) -> Result<ExitCode, CliFailure> {
     if color {
         eprintln!(
-            "\n\x1b[1;36m[▶] Running\x1b[0m  \x1b[1m{}\x1b[0m",
+            "\n\x1b[1;36mRunning [▹]\x1b[0m  \x1b[1m{}\x1b[0m",
             executable.display()
         );
     } else {
-        eprintln!("\n[▶] Running  {}", executable.display());
+        eprintln!("\nRunning [▹]   {}", executable.display());
     }
     let status = ProcessCommand::new(executable).status().map_err(|error| {
         CliFailure::Message(format!("failed to run native executable: {error}"))
@@ -191,6 +191,9 @@ fn run_artifact(executable: &Path, color: bool) -> Result<ExitCode, CliFailure> 
 
 struct ProgressRenderer {
     color: bool,
+    live_updates: bool,
+    last_measurement: Option<rimera_compiler::ProgressMeasure>,
+    has_live_row: bool,
 }
 
 #[derive(Debug, Default)]
@@ -258,12 +261,25 @@ fn load_config(project_root: &Path) -> Result<RimeraConfig, CliFailure> {
 }
 
 impl ProgressRenderer {
-    const fn new(color: bool) -> Self {
-        Self { color }
+    fn new(color: bool) -> Self {
+        Self {
+            color,
+            live_updates: std::io::stderr().is_terminal(),
+            last_measurement: None,
+            has_live_row: false,
+        }
     }
 
-    fn begin(&self, entry: &Path, target: &TargetTriple, profile: BuildProfile, debug: bool) {
+    fn begin(
+        &self,
+        entry: &Path,
+        output: &Path,
+        target: &TargetTriple,
+        profile: BuildProfile,
+        debug: bool,
+    ) {
         let entry = display_path(entry);
+        let output = display_path(output);
         let profile = match profile {
             BuildProfile::Debug => "debug",
             BuildProfile::Release => "release",
@@ -276,11 +292,15 @@ impl ProgressRenderer {
                 "  \x1b[2m|-+ target\x1b[0m  \x1b[1m{}\x1b[0m \x1b[2m· {profile}{mode}\x1b[0m",
                 target.as_str()
             );
+            eprintln!("  \x1b[2m|-+ output\x1b[0m  \x1b[1m{output}\x1b[0m");
+            eprintln!("  \x1b[2m|-+ linker\x1b[0m  \x1b[1mclang\x1b[0m");
             eprintln!();
         } else {
             eprintln!("Rimera Lite [♣]");
             eprintln!("  |-+ source  {entry}");
             eprintln!("  |-+ target  {} · {profile}{mode}", target.as_str());
+            eprintln!("  |-+ output  {output}");
+            eprintln!("  |-+ linker  clang");
             eprintln!();
         }
     }
@@ -288,36 +308,32 @@ impl ProgressRenderer {
     fn render(&mut self, event: BuildProgress) {
         match event {
             BuildProgress::Started(stage) => {
-                let progress = stage_progress(stage, false);
-                let bar = progress_bar(progress);
-                if self.color {
-                    eprint!(
-                        "\r\x1b[2K\x1b[1;36m{bar} {progress:>3}%\x1b[0m {}…",
-                        stage.label()
-                    );
+                self.last_measurement = None;
+                if self.live_updates {
+                    self.render_live(stage, None, false);
                 } else {
-                    eprintln!("{bar} {progress:>3}% {}…", stage.label());
+                    eprintln!("  ○  {}/5  {}", stage_step(stage), stage_title(stage));
                 }
             }
             BuildProgress::Finished(stage) => {
-                let progress = stage_progress(stage, true);
-                let bar = progress_bar(progress);
-                if stage == rimera_compiler::BuildStage::LinkRuntime && self.color {
-                    eprint!("\r\x1b[2K\x1b[1;32m{bar} {progress:>3}% [♣]\x1b[0m");
-                } else if stage == rimera_compiler::BuildStage::LinkRuntime {
-                    eprintln!("{bar} {progress:>3}% [♣]");
-                } else if self.color {
-                    eprint!(
-                        "\r\x1b[2K\x1b[1;32m{bar} {progress:>3}% [✔]\x1b[0m {}",
-                        stage.label()
-                    );
+                let measurement = self
+                    .last_measurement
+                    .as_ref()
+                    .filter(|measurement| measurement.stage == stage)
+                    .cloned();
+                if self.live_updates {
+                    self.render_live(stage, measurement.as_ref(), true);
+                    eprintln!();
                 } else {
-                    eprintln!("{bar} {progress:>3}% [✔] {}", stage.label());
+                    eprintln!("{}", self.stage_line(stage, measurement.as_ref(), true));
                 }
+                self.last_measurement = None;
+                self.has_live_row = false;
             }
+            BuildProgress::Measured(measurement) => self.render_measurement(measurement),
             BuildProgress::Trace(message) => {
+                self.clear_live_row();
                 if self.color {
-                    eprint!("\r\x1b[2K");
                     eprintln!("  \x1b[2m│\x1b[0m \x1b[35mdebug\x1b[0m \x1b[2m{message}\x1b[0m");
                 } else {
                     eprintln!("  │ debug {message}");
@@ -326,15 +342,77 @@ impl ProgressRenderer {
         }
     }
 
-    fn fail(&self) {
-        if self.color {
-            eprintln!("\r\x1b[2K\x1b[1;31m[✘] Build failed\x1b[0m\n");
-        } else {
-            eprintln!("[✘] Build failed\n");
+    fn render_measurement(&mut self, measurement: rimera_compiler::ProgressMeasure) {
+        let stage = measurement.stage;
+        self.last_measurement = Some(measurement);
+        if self.live_updates {
+            let measurement = self.last_measurement.clone();
+            self.render_live(stage, measurement.as_ref(), false);
         }
     }
 
-    fn finish(&self, artifact: &rimera_compiler::project::BuildArtifact, elapsed_seconds: f32) {
+    fn render_live(
+        &mut self,
+        stage: rimera_compiler::BuildStage,
+        measurement: Option<&rimera_compiler::ProgressMeasure>,
+        completed: bool,
+    ) {
+        eprint!(
+            "\r\x1b[2K{}",
+            self.stage_line(stage, measurement, completed)
+        );
+        self.has_live_row = true;
+    }
+
+    fn clear_live_row(&mut self) {
+        if self.live_updates && self.has_live_row {
+            eprint!("\r\x1b[2K");
+            self.has_live_row = false;
+        }
+    }
+
+    fn stage_line(
+        &self,
+        stage: rimera_compiler::BuildStage,
+        measurement: Option<&rimera_compiler::ProgressMeasure>,
+        completed: bool,
+    ) -> String {
+        let percent = measurement.map_or(0, measurement_percent);
+        let marker = if completed { "✓" } else { "○" };
+        let metric = measurement.map_or_else(|| "preparing…".to_owned(), measurement_summary);
+        let line = format!(
+            "  {marker}  {}/5  {:<18} {} {percent:>3}%  {metric}",
+            stage_step(stage),
+            stage_title(stage),
+            progress_bar(percent),
+        );
+        if !self.color {
+            return line;
+        }
+        let accent = if completed {
+            "\x1b[1;32m"
+        } else {
+            "\x1b[1;36m"
+        };
+        format!(
+            "  {accent}{marker}\x1b[0m  \x1b[2m{}/5\x1b[0m  \x1b[1m{:<18}\x1b[0m {accent}{} {percent:>3}%\x1b[0m  \x1b[2m{metric}\x1b[0m",
+            stage_step(stage),
+            stage_title(stage),
+            progress_bar(percent),
+        )
+    }
+
+    fn fail(&mut self) {
+        self.clear_live_row();
+        if self.color {
+            eprintln!("\x1b[1;31m✗  Build failed\x1b[0m\n");
+        } else {
+            eprintln!("✗  Build failed\n");
+        }
+    }
+
+    fn finish(&mut self, artifact: &rimera_compiler::project::BuildArtifact, elapsed_seconds: f32) {
+        self.clear_live_row();
         let bytes = std::fs::metadata(&artifact.executable)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
@@ -344,11 +422,15 @@ impl ProgressRenderer {
                 eprintln!("\x1b[1;35mDebug:\x1b[0m");
                 eprintln!("  \x1b[2m-+ cache\x1b[0m  {}", artifact.cache_dir.display());
                 eprintln!("  \x1b[2m-+ ir\x1b[0m     {}", ir_dump.display());
+                eprintln!(
+                    "  \x1b[2m-+ ir\x1b[0m     {}",
+                    artifact.executable.display()
+                );
             }
-            eprintln!(
-                "\x1b[1;32m[✔] Build complete \x1b[0m @ \x1b[1m{}\x1b[0m",
-                artifact.executable.display()
-            );
+            //eprintln!(
+            //    "\x1b[1;32m[✔] Build complete \x1b[0m @ \x1b[1m{}\x1b[0m",
+            //   artifact.executable.display()
+            //);
             eprintln!(
                 "\n\x1b[1mDone in {elapsed_seconds:.2}s\x1b[0m \x1b[2m+|+\x1b[0m \x1b[1mSize:\x1b[0m {bytes} bytes."
             );
@@ -358,32 +440,111 @@ impl ProgressRenderer {
                 eprintln!("  -+ cache  {}", artifact.cache_dir.display());
                 eprintln!("  -+ ir     {}", ir_dump.display());
             }
-            eprintln!("[✔] Build complete @  {}", artifact.executable.display());
+            //eprintln!("[✔] Build complete @  {}", artifact.executable.display());
             eprintln!("\nDone in {elapsed_seconds:.2}s +|+ Size: {bytes} bytes.");
         }
     }
 }
 
-fn stage_progress(stage: rimera_compiler::BuildStage, finished: bool) -> u8 {
-    let start = match stage {
-        rimera_compiler::BuildStage::AnalyzeSource => 10,
-        rimera_compiler::BuildStage::AnalyzeSemantics => 30,
-        rimera_compiler::BuildStage::LowerMir => 50,
-        rimera_compiler::BuildStage::EmitObject => 70,
-        rimera_compiler::BuildStage::LinkRuntime => 90,
+fn stage_step(stage: rimera_compiler::BuildStage) -> u8 {
+    match stage {
+        rimera_compiler::BuildStage::AnalyzeSource => 1,
+        rimera_compiler::BuildStage::AnalyzeSemantics => 2,
+        rimera_compiler::BuildStage::LowerMir => 3,
+        rimera_compiler::BuildStage::EmitObject => 4,
+        rimera_compiler::BuildStage::LinkRuntime => 5,
+    }
+}
+
+fn stage_title(stage: rimera_compiler::BuildStage) -> &'static str {
+    match stage {
+        rimera_compiler::BuildStage::AnalyzeSource => "Read source",
+        rimera_compiler::BuildStage::AnalyzeSemantics => "Analyze semantics",
+        rimera_compiler::BuildStage::LowerMir => "Lower native IR",
+        rimera_compiler::BuildStage::EmitObject => "Emit object",
+        rimera_compiler::BuildStage::LinkRuntime => "Link with clang",
+    }
+}
+
+fn measurement_percent(measurement: &rimera_compiler::ProgressMeasure) -> u8 {
+    measurement
+        .total
+        .filter(|total| *total > 0)
+        .map_or(0, |total| {
+            (measurement.completed.saturating_mul(100) / total).min(100) as u8
+        })
+}
+
+fn measurement_summary(measurement: &rimera_compiler::ProgressMeasure) -> String {
+    let completed = format_count(measurement.completed, measurement.unit);
+    let metric = measurement.total.map_or(completed.clone(), |total| {
+        format!("{completed} / {}", format_count(total, measurement.unit))
+    });
+    if measurement.detail.is_empty() {
+        metric
+    } else {
+        format!("{metric}  ·  {}", measurement.detail)
+    }
+}
+
+fn format_count(value: u64, unit: &str) -> String {
+    if unit == "source bytes" {
+        format_bytes(value)
+    } else if value == 1 {
+        format!("1 {}", singular_unit(unit))
+    } else {
+        format!("{} {unit}", format_number(value))
+    }
+}
+
+fn singular_unit(unit: &str) -> &str {
+    unit.strip_suffix('s').unwrap_or(unit)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_number(value: u64) -> String {
+    let digits = value.to_string();
+    let first_group = match digits.len() % 3 {
+        0 => 3,
+        length => length,
     };
-    if finished { start + 10 } else { start }
+    let mut formatted = String::with_capacity(digits.len() + (digits.len() - 1) / 3);
+    formatted.push_str(&digits[..first_group]);
+    for group in digits.as_bytes()[first_group..].chunks(3) {
+        formatted.push(',');
+        formatted.push_str(std::str::from_utf8(group).expect("number digits are valid UTF-8"));
+    }
+    formatted
 }
 
 fn progress_bar(percent: u8) -> String {
-    const WIDTH: usize = 12;
+    const WIDTH: usize = 9;
     let percent = percent.min(100);
+    let filled = if percent == 0 {
+        1
+    } else {
+        ((usize::from(percent) * (WIDTH - 1)).div_ceil(100)).max(1)
+    };
     if percent == 100 {
-        return format!("[{}]", "=".repeat(WIDTH));
+        format!("[{}]", "=".repeat(WIDTH))
+    } else {
+        format!(
+            "[{}>{}]",
+            "=".repeat(filled),
+            " ".repeat(WIDTH - filled - 1)
+        )
     }
-    let filled = usize::from(percent) * WIDTH / 100;
-    let remaining = WIDTH.saturating_sub(filled + 1);
-    format!("[{}>{}]", "=".repeat(filled), "-".repeat(remaining))
 }
 
 fn format_failure(failure: &CliFailure, color: bool) -> String {
@@ -599,10 +760,32 @@ mod tests {
     }
 
     #[test]
-    fn progress_bar_uses_a_single_moving_indicator() {
-        assert_eq!(progress_bar(10), "[=>----------]");
-        assert_eq!(progress_bar(80), "[=========>--]");
-        assert_eq!(progress_bar(100), "[============]");
+    fn progress_rendering_uses_measured_counts_and_stage_order() {
+        assert_eq!(stage_step(rimera_compiler::BuildStage::AnalyzeSource), 1);
+        assert_eq!(stage_step(rimera_compiler::BuildStage::LinkRuntime), 5);
+        assert_eq!(
+            stage_title(rimera_compiler::BuildStage::AnalyzeSource),
+            "Read source"
+        );
+        assert_eq!(format_count(1, "native functions"), "1 native function");
+        assert_eq!(
+            format_count(39_369, "native functions"),
+            "39,369 native functions"
+        );
+        assert_eq!(format_bytes(1_536), "1.50 KiB");
+        assert_eq!(progress_bar(8), "[=>       ]");
+        assert_eq!(progress_bar(80), "[=======> ]");
+        assert_eq!(progress_bar(100), "[=========]");
+
+        let measurement = rimera_compiler::ProgressMeasure {
+            stage: rimera_compiler::BuildStage::AnalyzeSource,
+            completed: 64,
+            total: Some(726),
+            unit: "source bytes",
+            detail: "read".to_owned(),
+        };
+        assert_eq!(measurement_percent(&measurement), 8);
+        assert_eq!(measurement_summary(&measurement), "64 B / 726 B  ·  read");
     }
 
     #[test]

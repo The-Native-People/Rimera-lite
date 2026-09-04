@@ -5,7 +5,7 @@ use rimera_abi::RParameterKind;
 pub use rimera_abi::{
     RBinaryOperator as BinaryOperator, RCallArgumentKind as CallArgumentKind,
     RCompareOperator as CompareOperator, RFormatConversion as FormatConversion,
-    RUnaryOperator as UnaryOperator,
+    RTypeParameterKind as TypeParameterKind, RUnaryOperator as UnaryOperator,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -185,6 +185,12 @@ pub enum OperationKind {
         has_value: ValueId,
         iterator: ValueId,
     },
+    YieldFromNext {
+        yielded: ValueId,
+        result: ValueId,
+        complete: ValueId,
+        iterator: ValueId,
+    },
     Range {
         dest: ValueId,
         start: ValueId,
@@ -238,6 +244,20 @@ pub enum OperationKind {
         function: FunctionId,
         defaults: Vec<(u32, ValueId)>,
         closure: Vec<ValueId>,
+        local_names: Vec<String>,
+        cell_names: Vec<String>,
+        free_names: Vec<String>,
+    },
+    TypeParameterNew {
+        dest: ValueId,
+        name: String,
+        kind: TypeParameterKind,
+    },
+    TypeAliasNew {
+        dest: ValueId,
+        name: String,
+        type_params: ValueId,
+        value: ValueId,
     },
     ClassNamespaceNew {
         dest: ValueId,
@@ -260,6 +280,14 @@ pub enum OperationKind {
     ClassNameGet {
         dest: ValueId,
         namespace: ValueId,
+        name: String,
+    },
+    /// Resolves a class-body free name from the prepared namespace first and
+    /// falls back to the enclosing closure cell when the namespace misses.
+    ClassFreeGet {
+        dest: ValueId,
+        namespace: ValueId,
+        cell: ValueId,
         name: String,
     },
     ClassNamespaceDelete {
@@ -314,6 +342,14 @@ pub enum OperationKind {
         dest: ValueId,
         initial: Option<ValueId>,
     },
+    ReflectionScopeConfigure {
+        namespace: Option<ValueId>,
+        comprehension: bool,
+    },
+    ReflectionLocalRegister {
+        name: String,
+        cell: ValueId,
+    },
     CellGet {
         dest: ValueId,
         cell: ValueId,
@@ -330,6 +366,10 @@ pub enum OperationKind {
     },
     CellClear {
         cell: ValueId,
+    },
+    ImportName {
+        dest: ValueId,
+        name: String,
     },
     GlobalGet {
         dest: ValueId,
@@ -416,9 +456,12 @@ impl OperationKind {
             | Self::PatternMapping { values: dest, .. }
             | Self::PatternClass { values: dest, .. }
             | Self::MakeFunction { dest, .. }
+            | Self::TypeParameterNew { dest, .. }
+            | Self::TypeAliasNew { dest, .. }
             | Self::ClassNamespaceNew { dest }
             | Self::ClassNamespaceGet { dest, .. }
             | Self::ClassNameGet { dest, .. }
+            | Self::ClassFreeGet { dest, .. }
             | Self::ClassNew { dest, .. }
             | Self::AttributeGet { dest, .. }
             | Self::Call { dest, .. }
@@ -427,13 +470,16 @@ impl OperationKind {
             | Self::CellNew { dest, .. }
             | Self::CellGet { dest, .. }
             | Self::ClosureGet { dest, .. }
+            | Self::ImportName { dest, .. }
             | Self::GlobalGet { dest, .. } => Some(*dest),
             Self::ExceptionActive { dest }
             | Self::ExceptionMatches { dest, .. }
             | Self::ExceptionSplit { dest, .. }
             | Self::ExceptionCombine { dest, .. }
             | Self::HandlerEnter { dest } => Some(*dest),
-            Self::CellSet { .. }
+            Self::ReflectionScopeConfigure { .. }
+            | Self::ReflectionLocalRegister { .. }
+            | Self::CellSet { .. }
             | Self::CellClear { .. }
             | Self::GlobalSet { .. }
             | Self::GlobalDelete { .. }
@@ -454,6 +500,7 @@ impl OperationKind {
             | Self::SetInsert { .. }
             | Self::CallArgumentAdd { .. }
             | Self::IteratorNext { .. }
+            | Self::YieldFromNext { .. }
             | Self::CallModuleChunk { .. }
             | Self::Raise { .. }
             | Self::Reraise
@@ -469,6 +516,12 @@ impl OperationKind {
             Self::IteratorNext {
                 item, has_value, ..
             } => vec![*item, *has_value],
+            Self::YieldFromNext {
+                yielded,
+                result,
+                complete,
+                ..
+            } => vec![*yielded, *result, *complete],
             Self::PatternSequence {
                 values, matched, ..
             }
@@ -515,7 +568,10 @@ pub enum Terminator {
     },
     Yield {
         value: ValueId,
+        resume_value: Option<ValueId>,
         resume_target: BlockId,
+        exception_target: Option<BlockId>,
+        delegate: Option<ValueId>,
     },
     Unreachable,
 }
@@ -691,6 +747,7 @@ fn operation_is_safepoint(operation: &OperationKind) -> bool {
         | OperationKind::Length { .. }
         | OperationKind::IteratorNew { .. }
         | OperationKind::IteratorNext { .. }
+        | OperationKind::YieldFromNext { .. }
         | OperationKind::Range { .. }
         | OperationKind::ItemSet { .. }
         | OperationKind::ItemDelete { .. }
@@ -700,10 +757,13 @@ fn operation_is_safepoint(operation: &OperationKind) -> bool {
         | OperationKind::PatternMapping { .. }
         | OperationKind::PatternClass { .. }
         | OperationKind::MakeFunction { .. }
+        | OperationKind::TypeParameterNew { .. }
+        | OperationKind::TypeAliasNew { .. }
         | OperationKind::ClassNamespaceNew { .. }
         | OperationKind::AnnotationsEnsure { .. }
         | OperationKind::ClassNamespaceGet { .. }
         | OperationKind::ClassNameGet { .. }
+        | OperationKind::ClassFreeGet { .. }
         | OperationKind::ClassNamespaceSet { .. }
         | OperationKind::ClassNamespaceDelete { .. }
         | OperationKind::ClassNew { .. }
@@ -716,10 +776,13 @@ fn operation_is_safepoint(operation: &OperationKind) -> bool {
         | OperationKind::CallPrepared { .. }
         | OperationKind::CallModuleChunk { .. }
         | OperationKind::CellNew { .. }
+        | OperationKind::ReflectionScopeConfigure { .. }
+        | OperationKind::ReflectionLocalRegister { .. }
         | OperationKind::CellGet { .. }
         | OperationKind::ClosureGet { .. }
         | OperationKind::CellSet { .. }
         | OperationKind::CellClear { .. }
+        | OperationKind::ImportName { .. }
         | OperationKind::GlobalGet { .. }
         | OperationKind::GlobalSet { .. }
         | OperationKind::GlobalDelete { .. }
@@ -756,7 +819,11 @@ fn terminator_inputs(terminator: &Terminator) -> Vec<ValueId> {
             .collect(),
         Terminator::Return { .. } | Terminator::Unreachable => Vec::new(),
         Terminator::ReturnValue { value } => value.iter().copied().collect(),
-        Terminator::Yield { value, .. } => vec![*value],
+        Terminator::Yield {
+            value, delegate, ..
+        } => std::iter::once(*value)
+            .chain(delegate.iter().copied())
+            .collect(),
     }
 }
 
@@ -768,7 +835,13 @@ fn terminator_successors(terminator: &Terminator) -> Vec<BlockId> {
             else_target,
             ..
         } => vec![*then_target, *else_target],
-        Terminator::Yield { resume_target, .. } => vec![*resume_target],
+        Terminator::Yield {
+            resume_target,
+            exception_target,
+            ..
+        } => std::iter::once(*resume_target)
+            .chain(exception_target.iter().copied())
+            .collect(),
         Terminator::Return { .. } | Terminator::ReturnValue { .. } | Terminator::Unreachable => {
             Vec::new()
         }
@@ -1128,6 +1201,15 @@ fn render_operation(operation: &Operation) -> String {
             has_value,
             iterator,
         } => format!("v{}, v{} = next(v{})", item.0, has_value.0, iterator.0),
+        OperationKind::YieldFromNext {
+            yielded,
+            result,
+            complete,
+            iterator,
+        } => format!(
+            "v{}, v{}, v{} = yield_from_next(v{})",
+            yielded.0, result.0, complete.0, iterator.0
+        ),
         OperationKind::Range {
             dest,
             start,
@@ -1193,9 +1275,22 @@ fn render_operation(operation: &Operation) -> String {
             function,
             defaults,
             closure,
+            ..
         } => format!(
             "v{} = make_function({}, defaults={:?}, closure={:?})",
             dest.0, function.0, defaults, closure
+        ),
+        OperationKind::TypeParameterNew { dest, name, kind } => {
+            format!("v{} = type_parameter_new({name:?}, {kind:?})", dest.0)
+        }
+        OperationKind::TypeAliasNew {
+            dest,
+            name,
+            type_params,
+            value,
+        } => format!(
+            "v{} = type_alias_new({name:?}, v{}, v{})",
+            dest.0, type_params.0, value.0
         ),
         OperationKind::ClassNamespaceNew { dest } => format!("v{} = class_namespace_new()", dest.0),
         OperationKind::AnnotationsEnsure { namespace } => {
@@ -1222,6 +1317,15 @@ fn render_operation(operation: &Operation) -> String {
             namespace,
             name,
         } => format!("v{} = class_name_get(v{}, {name:?})", dest.0, namespace.0),
+        OperationKind::ClassFreeGet {
+            dest,
+            namespace,
+            cell,
+            name,
+        } => format!(
+            "v{} = class_free_get(v{}, v{}, {name:?})",
+            dest.0, namespace.0, cell.0
+        ),
         OperationKind::ClassNamespaceDelete { namespace, name } => {
             format!("class_namespace_delete(v{}, {name:?})", namespace.0)
         }
@@ -1282,6 +1386,16 @@ fn render_operation(operation: &Operation) -> String {
         OperationKind::CellNew { dest, initial } => {
             format!("v{} = cell_new({initial:?})", dest.0)
         }
+        OperationKind::ReflectionScopeConfigure {
+            namespace,
+            comprehension,
+        } => format!(
+            "reflection_scope_configure({:?}, comprehension={comprehension})",
+            namespace.map(|value| value.0)
+        ),
+        OperationKind::ReflectionLocalRegister { name, cell } => {
+            format!("reflection_local_register({name:?}, v{})", cell.0)
+        }
         OperationKind::CellGet {
             dest,
             cell,
@@ -1295,6 +1409,9 @@ fn render_operation(operation: &Operation) -> String {
             format!("cell_set(v{}, v{})", cell.0, value.0)
         }
         OperationKind::CellClear { cell } => format!("cell_clear(v{})", cell.0),
+        OperationKind::ImportName { dest, name } => {
+            format!("v{} = import_name({name:?})", dest.0)
+        }
         OperationKind::GlobalGet { dest, name } => {
             format!("v{} = global_get({name:?})", dest.0)
         }
@@ -1380,8 +1497,14 @@ fn render_terminator(terminator: &Terminator) -> String {
         Terminator::ReturnValue { value } => format!("# return {value:?}"),
         Terminator::Yield {
             value,
+            resume_value,
             resume_target,
-        } => format!("# yield {value:?} -> block{}", resume_target.0),
+            exception_target,
+            delegate,
+        } => format!(
+            "# yield {value:?} -> block{} resume={resume_value:?} exception={exception_target:?} delegate={delegate:?}",
+            resume_target.0
+        ),
         Terminator::Unreachable => "# unreachable".to_owned(),
     }
 }
@@ -1397,6 +1520,8 @@ fn verify_value(value: ValueId, count: u32) -> Result<(), String> {
 fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
     match operation {
         OperationKind::Constant { .. }
+        | OperationKind::TypeParameterNew { .. }
+        | OperationKind::ImportName { .. }
         | OperationKind::GlobalGet { .. }
         | OperationKind::ClosureGet { .. }
         | OperationKind::ExceptionActive { .. }
@@ -1449,7 +1574,8 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
         } => vec![*collection, *index],
         OperationKind::Length { value, .. } => vec![*value],
         OperationKind::IteratorNew { value, .. } => vec![*value],
-        OperationKind::IteratorNext { iterator, .. } => vec![*iterator],
+        OperationKind::IteratorNext { iterator, .. }
+        | OperationKind::YieldFromNext { iterator, .. } => vec![*iterator],
         OperationKind::Range {
             start, stop, step, ..
         } => vec![*start, *stop, *step],
@@ -1473,6 +1599,9 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
             .map(|(_, value)| *value)
             .chain(closure.iter().copied())
             .collect(),
+        OperationKind::TypeAliasNew {
+            type_params, value, ..
+        } => vec![*type_params, *value],
         OperationKind::ClassNamespaceNew { .. } => Vec::new(),
         OperationKind::AnnotationsEnsure { namespace } => namespace.iter().copied().collect(),
         OperationKind::ClassNamespaceSet {
@@ -1480,6 +1609,9 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
         } => vec![*namespace, *value],
         OperationKind::ClassNamespaceGet { namespace, .. } => vec![*namespace],
         OperationKind::ClassNameGet { namespace, .. } => vec![*namespace],
+        OperationKind::ClassFreeGet {
+            namespace, cell, ..
+        } => vec![*namespace, *cell],
         OperationKind::ClassNamespaceDelete { namespace, .. } => vec![*namespace],
         OperationKind::ClassNew {
             bases, namespace, ..
@@ -1513,6 +1645,10 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
         } => vec![*callable, *arguments],
         OperationKind::CallModuleChunk { .. } => Vec::new(),
         OperationKind::CellNew { initial, .. } => initial.iter().copied().collect(),
+        OperationKind::ReflectionScopeConfigure { namespace, .. } => {
+            namespace.iter().copied().collect()
+        }
+        OperationKind::ReflectionLocalRegister { cell, .. } => vec![*cell],
         OperationKind::CellGet { cell, .. } => vec![*cell],
         OperationKind::CellSet { cell, value } => vec![*cell, *value],
         OperationKind::CellClear { cell } => vec![*cell],
@@ -1567,13 +1703,46 @@ fn verify_terminator(
         }
         Terminator::Yield {
             value,
+            resume_value,
             resume_target,
+            exception_target,
+            delegate,
         } => {
             if program.kind != FunctionKind::Generator {
                 return Err("MIR yield terminator is only valid in generator functions".to_owned());
             }
             verify_value(*value, program.value_count)?;
-            verify_edge(program, block_index, *resume_target, &[])
+            if let Some(delegate) = delegate {
+                verify_value(*delegate, program.value_count)?;
+            }
+            let Some(resume_block) = program.blocks.get(resume_target.0 as usize) else {
+                return Err(format!(
+                    "MIR block {block_index} targets missing resume block {}",
+                    resume_target.0
+                ));
+            };
+            match resume_value {
+                Some(resume_value) => {
+                    verify_value(*resume_value, program.value_count)?;
+                    if resume_block.parameters.as_slice() != [*resume_value] {
+                        return Err(format!(
+                            "MIR yield resume block {} must define exactly resume value %{}",
+                            resume_target.0, resume_value.0
+                        ));
+                    }
+                }
+                None if !resume_block.parameters.is_empty() => {
+                    return Err(format!(
+                        "MIR yield resume block {} unexpectedly requires parameters",
+                        resume_target.0
+                    ));
+                }
+                None => {}
+            }
+            if let Some(exception_target) = exception_target {
+                verify_edge(program, block_index, *exception_target, &[])?;
+            }
+            Ok(())
         }
         Terminator::Unreachable => Err(format!("MIR block {block_index} is unterminated")),
     }
@@ -2055,7 +2224,10 @@ mod tests {
                     ],
                     terminator: Terminator::Yield {
                         value: ValueId(1),
+                        resume_value: None,
                         resume_target: BlockId(1),
+                        exception_target: None,
+                        delegate: None,
                     },
                 },
                 Block {

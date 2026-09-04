@@ -18,8 +18,25 @@ Complete the managed Python exception value model used by all native failures.
 - Root exception/cause/context/traceback cycles during propagation and reclaim
   them after the last reachable handler/frame reference disappears.
 
+## Implemented contract
+
+- Managed exceptions now carry a traced optional instance dictionary in addition to type, live `args`, traceback, cause, context, suppression, and exception-group metadata. Generic attribute dispatch exposes user fields/methods plus `args`, `__dict__`, `__traceback__`, `__cause__`, `__context__`, `__suppress_context__`, and `with_traceback` with Python-shaped mutation validation.
+- Builtin exception classes are valid user-class bases. User exception construction runs the ordinary class/call path and descriptor-bound `__init__`; raising a class normalizes it through that same call path, while raising an existing instance preserves identity.
+- Explicit source raises attach the managed traceback frame before a same-function handler receives the exception; escaping native functions continue to append their frame. Traceback objects expose `tb_lineno` and `tb_next`, with CPython-shaped read-only/validation behavior.
+- Exception dictionaries, causes, contexts, traceback links, and self-cycles participate in the normal tracing graph. Metadata allocation failure does not partially publish an exception dictionary.
+
 ## Completion proof
 
-Runtime tests and public differentials cover builtin and user exception classes,
-normalization failures, metadata mutation boundaries, traceback replacement,
-cycles, forced GC, and low-heap failures.
+- `gate5_slice5_exception_objects_tracebacks_and_normalization_match_cpython_312` matches CPython 3.12.11 under a 96,000-byte heap limit for user exception subclasses and keyword `__init__`, `args`/string rendering, arbitrary instance state, class-vs-instance raising, identity, traceback line chains, `with_traceback`, cause/context/suppression mutation, metadata type errors, invalid raised values, and cyclic exception metadata.
+- `gate5_exception_graphs_survive_low_heap_collection_and_failed_metadata_is_atomic` proves a rooted self-referential exception graph survives repeated forced collections under bounded headroom, dead temporary exception graphs are reclaimed, and a zero-headroom metadata allocation failure leaves the rooted exception valid with no partially installed `__dict__`.
+
+## Acceptance evidence — 2026-09-02
+
+- Oracle: `/opt/homebrew/bin/python3.12 --version` -> `Python 3.12.11`.
+- Public Slice 5 differential passes under a 96,000-byte managed heap limit with exact stdout/stderr/status comparison; the runtime low-heap graph/failure-atomicity test also passes.
+- `spec/abi-v1.md` documents traced exception dictionaries/metadata, class normalization through the generic call path, same-function raise-site traceback attachment, and traceback attribute behavior.
+- Integration boundary: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, `cargo test --doc --workspace`, and `git diff --check` all pass.
+- Full workspace test total: 262 passed, 0 failed, 0 ignored (3 ABI + 8 CLI + 40 compiler unit + 153 public native-pipeline + 58 runtime).
+- Gate 5 is not promoted; compatibility/TODO promotion remains Slice 8-owned and Gate 6 remains the sole active implementation tracker.
+
+## DONE BY CHATGPT

@@ -25,3 +25,11 @@ resume ABI and managed exception state.
 Runtime and public CPython differentials cover all operation states, throw
 normalization, caught/uncaught injection, close outcomes, PEP 479, traceback
 shape, repeated operations, GC, and error replacement ordering.
+
+## Completion evidence — 2026-09-03
+
+- `throw` normalizes exception classes/instances and injects the managed exception at the suspended compiler CFG point; the generator traceback frame is attached before a local handler observes it.
+- `close` injects `GeneratorExit`, supports never-started/completed states and required cleanup, and raises `RuntimeError` when a generator yields while closing.
+- Escaped `StopIteration` converts to `RuntimeError("generator raised StopIteration")` with cause/context while explicit generator return remains normal completion; `gate6_throw_close_and_pep479_match_cpython_312_under_gc_pressure` is green.
+
+## DONE BY CHATGPT

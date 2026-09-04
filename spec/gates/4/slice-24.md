@@ -63,11 +63,11 @@ Only after all checks pass:
   tests, `todo!()`, or `unimplemented!()` placeholders. Illegal assignment,
   augmented-assignment, deletion, and standalone-star forms are semantic errors
   rather than stale milestone capabilities.
-- Runtime-ignored type comments are accepted and differentially proven.
-  Python 3.12 PEP 695 type parameters are explicitly deferred as
-  `RIM-CAP-G7-01` because their Python-visible type-parameter metadata belongs
-  to the reflection/introspection gate; the diagnostic has a source span and
-  emits no artifact.
+- Runtime-ignored type comments are accepted and differentially proven. At
+  Gate 4 closure, Python 3.12 PEP 695 parameters were explicitly owned by the
+  later reflection gate rather than partially implemented here. Gate 7 Slice 7
+  has since implemented unbounded generic declaration parameters; lazy
+  bounds/constraints remain a spanned no-artifact Gate 7 boundary.
 - All 50 `gate4_*.py` fixtures are referenced by public native-pipeline tests.
   Pattern runtime exports are reachable from MIR/codegen, and generator
   expressions execute through the native generator object/resume ABI with

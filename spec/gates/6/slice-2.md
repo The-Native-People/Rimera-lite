@@ -23,3 +23,11 @@ generator function/object path without executing their bodies at call time.
 Public differentials cover classification boundaries, argument failures,
 construction-time versus resume-time side effects/errors, methods, closures,
 never-started collection, and stable diagnostics for illegal `yield` forms.
+
+## Completion evidence — 2026-09-03
+
+- Source `yield`/`yield from` are owned syntax/HIR forms and semantic analysis rejects invalid placement before artifact output.
+- Function-kind discovery recognizes yields in the current function without treating nested function bodies as yields of the owner; ordinary binding constructs a suspended generator without executing its body.
+- `gate6_source_generator_protocol_matches_cpython_312_under_gc_pressure` differentially proves lazy start, first resume, invalid initial send, exhaustion, and close-before-start under a 96 KiB managed heap limit.
+
+## DONE BY CHATGPT

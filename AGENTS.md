@@ -1,5 +1,15 @@
 # Rimera working agreement
 
+## Documentation quality
+
+- User documentation must be explicit about every option, limit, default,
+  accepted value, precedence rule, output location, and observable failure
+  mode it presents. Do not use a short marketing description where a user needs
+  operational meaning; verify claims in the implementation before publishing.
+- Keep user-facing documentation focused on using Rimera. Explain internal
+  compiler gates, ABI details, and contributor workflow only in developer
+  specifications, never as prerequisites for ordinary users.
+
 - Read `TODO.md` before selecting work so completed vertical slices are not
   repeated. Read `spec/architecture.md` before changing architecture, and read
   `spec/compatibility.md` plus `spec/rebuild.md` before implementation work.
@@ -77,8 +87,9 @@
   closure cells; arbitrary integers and strings; lists, tuples, ranges,
   managed dictionaries and sets; native iteration and `for`; recursive,
   chained, and general-starred unpacking; expanded calls; list/set/dict
-  comprehensions; executable generator expressions; and Gate 4's included
-  synchronous expression/statement/pattern forms.
+  comprehensions; Gate 4's included synchronous expression/statement/pattern
+  forms; and complete native synchronous generator lifecycle including source
+  `yield`, `send`, `throw`, `close`, cleanup suspension, and `yield from`.
 - Current proven object-model partial: GC-rooted lazy builtin type identities,
   exact `rimera_type_of`, module-scope classes and instances, native attribute
   read/write/delete, descriptor precedence, supported slots, class cells, both
@@ -99,19 +110,46 @@
   bytearrays, slices, frozensets, and native-exporter memoryviews are
   source-to-runtime values. Builtin value families must extend these paths
   rather than add intrinsics.
-- Not implemented as compatibility claims: source synchronous generators beyond
-  the already-native generator-expression path, context managers,
-  imports/modules/`sys.modules`, broad reflection/introspection, async execution,
-  `eval`/`exec`, weak references/finalizers, stdlib corpora, native stdlib
-  bindings, or PyPI compatibility.
-- Gate 4 is closed. The sole active implementation gate is Gate 6 native
-  synchronous generators, extending the existing generator object/resume ABI
-  with source `yield`, `send`, `throw`, `close`, and `yield from`. Generator
-  expressions are already native and must not be reimplemented. Execute its
-  substantial synchronized slices from `spec/gates/6/README.md`; Gate 5's
-  separate queued closure slices live in `spec/gates/5/README.md`. Other
-  unpromoted compatibility areas remain separate work; do not jump to
-  frameworks, modules, or packages.
+- Gate 7 pulled forward a deliberately narrow native import prerequisite:
+  `import name` and `import name as alias` reach an owned `ImportName` MIR/ABI
+  path for explicitly registered managed module shells. The current registry
+  contains `inspect` and `weakref`; repeated imports preserve managed module
+  identity, each module owns a traced live `__dict__`, and normal module
+  attribute mutation uses that namespace. This is infrastructure only: it does
+  **not** claim the `inspect` or `weakref` stdlib APIs, arbitrary modules,
+  `from ... import ...`, dotted/package imports, Python module-source execution,
+  public `sys.modules`, or a user-visible `__import__` builtin. Future import
+  work must extend this single native registry/module-object path rather than
+  creating a second loader.
+- Gate 7 Slices 1–8 are closed as deliberately pulled-forward reflection
+  prerequisites without promoting Gate 7 as a whole. The proven surface now
+  includes namespace views, identity/type/attribute helpers, managed
+  function/code/cell metadata, managed exception/traceback/frame inspection,
+  generator identity/state/suspension metadata, Python 3.12 generic-declaration
+  type metadata, audited class/type method tables, and Python-level PEP 688
+  buffer providers over the existing Gate 3 memoryview core. Type-parameter and
+  provider-lease graphs are traced, PEP 688 release is exactly-once across
+  derived views/failure/cycles, terminal generator frames detach from their
+  owner, and the startup/release constraints remain mandatory. Gate 7 Slices
+  9–10 remain queued behind the active Gate 5 work.
+- Not implemented as compatibility claims: context managers, the general import
+  and package system/`sys.modules`, broad reflection/introspection beyond proven
+  Gate 7 slices, async execution and async generators, `eval`/`exec`, weak
+  reference/finalizer behavior, stdlib corpora, native stdlib bindings, or PyPI
+  compatibility.
+- Gates 1–4 and Gate 6 are closed. The sole active compatibility slice is
+  **Gate 5 Slice 6**, continuing propagation, chaining, exception groups, and
+  cleanup completion on the existing Gate 5 function/cell/exception model.
+  Gate 5 Slices 1–5 are already complete; execute Slices 6–8 in numeric order
+  from `spec/gates/5/README.md`. Gate 7 Slices 1–8 are closed pulled-forward
+  prerequisites; Gate 7 Slices 9–10 and the Gate 8 context-manager ledger remain
+  queued in their matching `spec/gates/` directories. After Gates 5, 7, and 8
+  close, execute queued Gates 9–17 in numeric order for modules, async, dynamic
+  compilation, lifecycle semantics, language conformance, stdlib,
+  extension/platform ABI, ecosystem proof, and final drop-in release
+  qualification. Do not jump to frameworks, modules, or packages ahead of that
+  order. Only Gate 17 may authorize a drop-in claim, and only for its published
+  target/capability/stdlib/extension-ABI matrix.
 - For implementation requests, begin from the earliest relevant incomplete
   dependency in `spec/compatibility.md`. Repair missing prerequisites and then
   continue the requested vertical slice; do not stop at runtime scaffolding.

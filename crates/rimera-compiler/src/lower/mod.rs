@@ -8,6 +8,9 @@ use crate::{hir, mir};
 // ceiling while preserving statement boundaries and module-global semantics.
 const MODULE_CHUNK_STATEMENTS: usize = 512;
 
+type TypeParameterCells = Vec<(String, Option<mir::ValueId>)>;
+type InstalledTypeParameters = (Vec<mir::ValueId>, TypeParameterCells);
+
 pub fn lower(module: &hir::Module) -> Result<mir::Program, String> {
     let mut program = ProgramLowerer {
         functions: Vec::new(),
@@ -56,6 +59,217 @@ pub fn lower(module: &hir::Module) -> Result<mir::Program, String> {
     Ok(program)
 }
 
+fn statements_contain_yield(statements: &[hir::Statement]) -> bool {
+    statements.iter().any(statement_contains_yield)
+}
+
+fn statement_contains_yield(statement: &hir::Statement) -> bool {
+    match &statement.kind {
+        hir::StatementKind::Assign { targets, value } => {
+            targets.iter().any(target_contains_yield) || expression_contains_yield(value)
+        }
+        hir::StatementKind::AugAssign { target, value, .. } => {
+            target_contains_yield(target) || expression_contains_yield(value)
+        }
+        hir::StatementKind::Delete { targets } => targets.iter().any(target_contains_yield),
+        hir::StatementKind::AnnAssign {
+            target,
+            annotation,
+            value,
+            ..
+        } => {
+            target_contains_yield(target)
+                || expression_contains_yield(annotation)
+                || value.as_ref().is_some_and(expression_contains_yield)
+        }
+        hir::StatementKind::Assert { test, message } => {
+            expression_contains_yield(test)
+                || message.as_ref().is_some_and(expression_contains_yield)
+        }
+        hir::StatementKind::FunctionDef {
+            decorators,
+            parameters,
+            return_annotation,
+            ..
+        } => {
+            decorators.iter().any(expression_contains_yield)
+                || parameters.iter().any(|parameter| {
+                    parameter
+                        .default
+                        .as_ref()
+                        .is_some_and(expression_contains_yield)
+                        || parameter
+                            .annotation
+                            .as_ref()
+                            .is_some_and(expression_contains_yield)
+                })
+                || return_annotation
+                    .as_ref()
+                    .is_some_and(expression_contains_yield)
+        }
+        hir::StatementKind::ClassDef {
+            decorators,
+            bases,
+            metaclass,
+            keywords,
+            ..
+        } => {
+            decorators.iter().any(expression_contains_yield)
+                || bases.iter().any(expression_contains_yield)
+                || metaclass.as_ref().is_some_and(expression_contains_yield)
+                || keywords
+                    .iter()
+                    .any(|(_, value)| expression_contains_yield(value))
+        }
+        hir::StatementKind::TypeAlias { value, .. } => expression_contains_yield(value),
+        hir::StatementKind::Return { value } => {
+            value.as_ref().is_some_and(expression_contains_yield)
+        }
+        hir::StatementKind::Import { .. }
+        | hir::StatementKind::Break
+        | hir::StatementKind::Continue => false,
+        hir::StatementKind::Expression(value) => expression_contains_yield(value),
+        hir::StatementKind::Raise { exception, cause } => {
+            exception.as_ref().is_some_and(expression_contains_yield)
+                || cause.as_ref().is_some_and(expression_contains_yield)
+        }
+        hir::StatementKind::Try {
+            body,
+            handlers,
+            else_body,
+            finally_body,
+            ..
+        } => {
+            statements_contain_yield(body)
+                || handlers.iter().any(|handler| {
+                    handler
+                        .exception_type
+                        .as_ref()
+                        .is_some_and(expression_contains_yield)
+                        || statements_contain_yield(&handler.body)
+                })
+                || statements_contain_yield(else_body)
+                || statements_contain_yield(finally_body)
+        }
+        hir::StatementKind::Print { values } => values.iter().any(expression_contains_yield),
+        hir::StatementKind::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            expression_contains_yield(condition)
+                || statements_contain_yield(then_body)
+                || statements_contain_yield(else_body)
+        }
+        hir::StatementKind::While { condition, body } => {
+            expression_contains_yield(condition) || statements_contain_yield(body)
+        }
+        hir::StatementKind::For {
+            target,
+            iterable,
+            body,
+            else_body,
+        } => {
+            target_contains_yield(target)
+                || expression_contains_yield(iterable)
+                || statements_contain_yield(body)
+                || statements_contain_yield(else_body)
+        }
+        hir::StatementKind::Match { subject, cases } => {
+            expression_contains_yield(subject)
+                || cases.iter().any(|case| {
+                    case.guard.as_ref().is_some_and(expression_contains_yield)
+                        || statements_contain_yield(&case.body)
+                })
+        }
+    }
+}
+
+fn target_contains_yield(target: &hir::Target) -> bool {
+    match &target.kind {
+        hir::TargetKind::Name { .. } => false,
+        hir::TargetKind::Attribute { receiver, .. } => expression_contains_yield(receiver),
+        hir::TargetKind::Item { collection, index } => {
+            expression_contains_yield(collection) || expression_contains_yield(index)
+        }
+        hir::TargetKind::Sequence { elements, .. } => elements.iter().any(target_contains_yield),
+        hir::TargetKind::Starred(target) => target_contains_yield(target),
+    }
+}
+
+fn expression_contains_yield(expression: &hir::Expression) -> bool {
+    match &expression.kind {
+        hir::ExpressionKind::Yield { .. } | hir::ExpressionKind::YieldFrom { .. } => true,
+        hir::ExpressionKind::Slice { start, stop, step } => [start, stop, step]
+            .into_iter()
+            .flatten()
+            .any(|value| expression_contains_yield(value)),
+        hir::ExpressionKind::List(values)
+        | hir::ExpressionKind::Tuple(values)
+        | hir::ExpressionKind::Set(values)
+        | hir::ExpressionKind::JoinedString(values)
+        | hir::ExpressionKind::Boolean { values, .. } => {
+            values.iter().any(expression_contains_yield)
+        }
+        hir::ExpressionKind::Dictionary(entries) => entries.iter().any(|entry| match entry {
+            hir::DictionaryEntry::Pair { key, value } => {
+                expression_contains_yield(key) || expression_contains_yield(value)
+            }
+            hir::DictionaryEntry::Unpack(value) => expression_contains_yield(value),
+        }),
+        hir::ExpressionKind::Subscript { value, index } => {
+            expression_contains_yield(value) || expression_contains_yield(index)
+        }
+        hir::ExpressionKind::Attribute { value, .. }
+        | hir::ExpressionKind::Length { value }
+        | hir::ExpressionKind::Unary { operand: value, .. } => expression_contains_yield(value),
+        hir::ExpressionKind::Range { start, stop, step } => {
+            expression_contains_yield(start)
+                || expression_contains_yield(stop)
+                || expression_contains_yield(step)
+        }
+        hir::ExpressionKind::Lambda { .. } => false,
+        hir::ExpressionKind::Binary { left, right, .. } => {
+            expression_contains_yield(left) || expression_contains_yield(right)
+        }
+        hir::ExpressionKind::Compare { left, comparisons } => {
+            expression_contains_yield(left)
+                || comparisons
+                    .iter()
+                    .any(|(_, right)| expression_contains_yield(right))
+        }
+        hir::ExpressionKind::NamedExpression { value, .. } => expression_contains_yield(value),
+        hir::ExpressionKind::Comprehension { outer_iterable, .. } => {
+            expression_contains_yield(outer_iterable)
+        }
+        hir::ExpressionKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            expression_contains_yield(value)
+                || format_spec
+                    .as_ref()
+                    .is_some_and(|value| expression_contains_yield(value))
+        }
+        hir::ExpressionKind::Call { callable, parts } => {
+            expression_contains_yield(callable)
+                || parts.iter().any(|part| match part {
+                    hir::CallPart::Positional(value)
+                    | hir::CallPart::Starred(value)
+                    | hir::CallPart::Keyword { value, .. }
+                    | hir::CallPart::KeywordUnpack(value) => expression_contains_yield(value),
+                })
+        }
+        hir::ExpressionKind::None
+        | hir::ExpressionKind::Bool(_)
+        | hir::ExpressionKind::Int(_)
+        | hir::ExpressionKind::Float(_)
+        | hir::ExpressionKind::String(_)
+        | hir::ExpressionKind::Bytes(_)
+        | hir::ExpressionKind::Complex { .. }
+        | hir::ExpressionKind::Name { .. } => false,
+    }
+}
+
 struct ProgramLowerer {
     functions: Vec<Option<mir::Function>>,
 }
@@ -65,6 +279,7 @@ impl ProgramLowerer {
         &mut self,
         name: String,
         qualified_name: String,
+        scope_qualified_name: String,
         body: &[hir::ClassMember],
         free: &[String],
     ) -> Result<mir::FunctionId, String> {
@@ -73,6 +288,8 @@ impl ProgramLowerer {
         );
         self.functions.push(None);
         let mut lowerer = Lowerer::new(self);
+        lowerer.qualname_prefix = Some(scope_qualified_name);
+        lowerer.nested_uses_locals = false;
         let namespace = lowerer.value();
         let parameter = mir::Parameter {
             value: namespace,
@@ -91,6 +308,13 @@ impl ProgramLowerer {
             );
             lowerer.cells.insert(name.clone(), cell);
         }
+        lowerer.emit(
+            Span::default(),
+            mir::OperationKind::ReflectionScopeConfigure {
+                namespace: Some(namespace),
+                comprehension: false,
+            },
+        );
         lowerer.class_scopes.push(ClassScope { namespace });
         if class_members_need_annotations(body) {
             lowerer.emit(
@@ -191,8 +415,14 @@ impl ProgramLowerer {
             u32::try_from(self.functions.len()).map_err(|_| "too many MIR functions")?,
         );
         self.functions.push(None);
+        let source_generator =
+            !module_scope && name != "<module>" && statements_contain_yield(statements);
         let mut lowerer = Lowerer::new(self);
         lowerer.module_semantics = name == "<module>";
+        if !module_scope {
+            lowerer.qualname_prefix = Some(qualified_name.clone());
+            lowerer.nested_uses_locals = true;
+        }
         let mut mir_parameters = Vec::with_capacity(parameters.len());
         let mut parameter_values = BTreeMap::new();
         for parameter in parameters {
@@ -205,7 +435,7 @@ impl ProgramLowerer {
                 has_default: parameter.default.is_some(),
             });
         }
-        if !module_scope {
+        if !module_scope && name != "<module>" {
             for (index, name) in free.iter().enumerate() {
                 let cell = lowerer.value();
                 lowerer.emit(
@@ -228,6 +458,35 @@ impl ProgramLowerer {
                 );
                 lowerer.cells.insert(local.clone(), cell);
             }
+            lowerer.emit(
+                Span::default(),
+                mir::OperationKind::ReflectionScopeConfigure {
+                    namespace: None,
+                    comprehension: false,
+                },
+            );
+            let mut registered = Vec::new();
+            for name in parameters
+                .iter()
+                .map(|parameter| &parameter.name)
+                .chain(locals.iter())
+                .chain(free.iter())
+            {
+                if registered.contains(name) {
+                    continue;
+                }
+                let Some(cell) = lowerer.cells.get(name).copied() else {
+                    continue;
+                };
+                lowerer.emit(
+                    Span::default(),
+                    mir::OperationKind::ReflectionLocalRegister {
+                        name: name.clone(),
+                        cell,
+                    },
+                );
+                registered.push(name.clone());
+            }
         }
         if module_scope && statements_need_annotations(statements) {
             lowerer.emit(
@@ -247,6 +506,8 @@ impl ProgramLowerer {
         let function = mir::Function {
             kind: if module_scope {
                 mir::FunctionKind::Module
+            } else if source_generator {
+                mir::FunctionKind::Generator
             } else {
                 mir::FunctionKind::Python
             },
@@ -262,6 +523,7 @@ impl ProgramLowerer {
         Ok(id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_comprehension(
         &mut self,
         kind: hir::ComprehensionKind,
@@ -270,12 +532,16 @@ impl ProgramLowerer {
         clauses: &[hir::ComprehensionClause],
         locals: &[String],
         free: &[String],
+        qualname_prefix: Option<String>,
+        nested_uses_locals: bool,
     ) -> Result<mir::FunctionId, String> {
         let id = mir::FunctionId(
             u32::try_from(self.functions.len()).map_err(|_| "too many MIR functions")?,
         );
         self.functions.push(None);
         let mut lowerer = Lowerer::new(self);
+        lowerer.qualname_prefix = qualname_prefix;
+        lowerer.nested_uses_locals = nested_uses_locals;
         let outer_iterator = lowerer.value();
         let parameter = mir::Parameter {
             value: outer_iterator,
@@ -304,6 +570,60 @@ impl ProgramLowerer {
                 },
             );
             lowerer.cells.insert(local.clone(), cell);
+        }
+        lowerer.emit(
+            Span::default(),
+            mir::OperationKind::ReflectionScopeConfigure {
+                namespace: None,
+                comprehension: kind != hir::ComprehensionKind::Generator,
+            },
+        );
+        if kind == hir::ComprehensionKind::Generator {
+            let iterator_cell = lowerer.value();
+            lowerer.emit(
+                Span::default(),
+                mir::OperationKind::CellNew {
+                    dest: iterator_cell,
+                    initial: Some(outer_iterator),
+                },
+            );
+            lowerer.emit(
+                Span::default(),
+                mir::OperationKind::ReflectionLocalRegister {
+                    name: ".0".to_owned(),
+                    cell: iterator_cell,
+                },
+            );
+        }
+        for local in locals {
+            let cell = lowerer
+                .cells
+                .get(local)
+                .copied()
+                .ok_or_else(|| format!("comprehension local `{local}` has no cell"))?;
+            lowerer.emit(
+                Span::default(),
+                mir::OperationKind::ReflectionLocalRegister {
+                    name: local.clone(),
+                    cell,
+                },
+            );
+        }
+        if kind == hir::ComprehensionKind::Generator {
+            for name in free {
+                let cell = lowerer
+                    .cells
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| format!("generator free variable `{name}` has no cell"))?;
+                lowerer.emit(
+                    Span::default(),
+                    mir::OperationKind::ReflectionLocalRegister {
+                        name: name.clone(),
+                        cell,
+                    },
+                );
+            }
         }
         let result = lowerer.value();
         let (name, initial) = match kind {
@@ -385,6 +705,8 @@ struct Lowerer<'a> {
     loops: Vec<LoopTargets>,
     class_scopes: Vec<ClassScope>,
     module_semantics: bool,
+    qualname_prefix: Option<String>,
+    nested_uses_locals: bool,
 }
 
 #[derive(Clone)]
@@ -403,8 +725,7 @@ enum CleanupAction {
         exception_target: Option<mir::BlockId>,
     },
     ClassHandler {
-        namespace: mir::ValueId,
-        binding: Option<String>,
+        binding: Option<(String, hir::Binding)>,
         exception_target: Option<mir::BlockId>,
     },
 }
@@ -534,6 +855,19 @@ impl<'a> Lowerer<'a> {
             loops: Vec::new(),
             class_scopes: Vec::new(),
             module_semantics: false,
+            qualname_prefix: None,
+            nested_uses_locals: false,
+        }
+    }
+
+    fn child_qualified_name(&self, name: &str) -> String {
+        let Some(prefix) = &self.qualname_prefix else {
+            return name.to_owned();
+        };
+        if self.nested_uses_locals {
+            format!("{prefix}.<locals>.{name}")
+        } else {
+            format!("{prefix}.{name}")
         }
     }
 
@@ -545,6 +879,67 @@ impl<'a> Lowerer<'a> {
             self.statement(statement)?;
         }
         Ok(())
+    }
+
+    fn install_type_parameters(
+        &mut self,
+        parameters: &[hir::TypeParameter],
+    ) -> Result<InstalledTypeParameters, String> {
+        let mut values = Vec::with_capacity(parameters.len());
+        let mut previous = Vec::with_capacity(parameters.len());
+        for parameter in parameters {
+            let value = self.value();
+            self.emit(
+                parameter.span,
+                mir::OperationKind::TypeParameterNew {
+                    dest: value,
+                    name: parameter.name.clone(),
+                    kind: match parameter.kind {
+                        hir::TypeParameterKind::TypeVar => mir::TypeParameterKind::TypeVar,
+                        hir::TypeParameterKind::TypeVarTuple => {
+                            mir::TypeParameterKind::TypeVarTuple
+                        }
+                        hir::TypeParameterKind::ParamSpec => mir::TypeParameterKind::ParamSpec,
+                    },
+                },
+            );
+            let cell = self.value();
+            self.emit(
+                parameter.span,
+                mir::OperationKind::CellNew {
+                    dest: cell,
+                    initial: Some(value),
+                },
+            );
+            previous.push((
+                parameter.name.clone(),
+                self.cells.insert(parameter.name.clone(), cell),
+            ));
+            values.push(value);
+        }
+        Ok((values, previous))
+    }
+
+    fn restore_type_parameters(&mut self, previous: TypeParameterCells) {
+        for (name, cell) in previous.into_iter().rev() {
+            if let Some(cell) = cell {
+                self.cells.insert(name, cell);
+            } else {
+                self.cells.remove(&name);
+            }
+        }
+    }
+
+    fn type_parameter_tuple(&mut self, span: Span, values: Vec<mir::ValueId>) -> mir::ValueId {
+        let tuple = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::Tuple {
+                dest: tuple,
+                values,
+            },
+        );
+        tuple
     }
 
     fn statement(&mut self, statement: &hir::Statement) -> Result<(), String> {
@@ -586,18 +981,39 @@ impl<'a> Lowerer<'a> {
             hir::StatementKind::Assert { test, message } => {
                 self.lower_assert(statement.span, test, message.as_ref())?;
             }
+            hir::StatementKind::Import { aliases } => {
+                for alias in aliases {
+                    let value = self.value();
+                    self.emit(
+                        statement.span,
+                        mir::OperationKind::ImportName {
+                            dest: value,
+                            name: alias.module.clone(),
+                        },
+                    );
+                    self.store_name(statement.span, &alias.bind_name, alias.binding, value)?;
+                }
+            }
             hir::StatementKind::FunctionDef {
                 name,
                 binding,
-                decorators: _,
+                type_params,
+                decorators,
                 parameters,
                 return_annotation,
                 body,
                 locals,
-                cells: _,
+                cells,
                 free,
             } => {
-                let qualified_name = name.clone();
+                let definition_span = decorators
+                    .first()
+                    .map_or(statement.span, |decorator| decorator.span);
+                let decorator_values = decorators
+                    .iter()
+                    .map(|decorator| self.expression(decorator))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let qualified_name = self.child_qualified_name(name);
                 let function = self.program.lower_scope(
                     name.clone(),
                     qualified_name,
@@ -616,6 +1032,8 @@ impl<'a> Lowerer<'a> {
                         ));
                     }
                 }
+                let (type_parameter_values, previous_type_cells) =
+                    self.install_type_parameters(type_params)?;
                 let annotations = self.lower_function_annotations(
                     statement.span,
                     parameters,
@@ -631,12 +1049,15 @@ impl<'a> Lowerer<'a> {
                         .collect::<Result<Vec<_>, _>>()?;
                 let value = self.value();
                 self.emit(
-                    statement.span,
+                    definition_span,
                     mir::OperationKind::MakeFunction {
                         dest: value,
                         function,
                         defaults,
                         closure,
+                        local_names: locals.clone(),
+                        cell_names: cells.clone(),
+                        free_names: free.clone(),
                     },
                 );
                 if let Some(annotations) = annotations {
@@ -649,17 +1070,47 @@ impl<'a> Lowerer<'a> {
                         },
                     );
                 }
-                self.store_name(statement.span, name, *binding, value)?;
+                if !type_params.is_empty() {
+                    let type_params_tuple =
+                        self.type_parameter_tuple(statement.span, type_parameter_values);
+                    self.emit(
+                        statement.span,
+                        mir::OperationKind::AttributeSet {
+                            receiver: value,
+                            name: "__type_params__".to_owned(),
+                            value: type_params_tuple,
+                        },
+                    );
+                }
+                self.restore_type_parameters(previous_type_cells);
+                let mut decorated = value;
+                for callable in decorator_values.into_iter().rev() {
+                    let next = self.value();
+                    self.emit(
+                        statement.span,
+                        mir::OperationKind::Call {
+                            dest: next,
+                            callable,
+                            positional: vec![decorated],
+                            keywords: Vec::new(),
+                        },
+                    );
+                    decorated = next;
+                }
+                self.store_name(statement.span, name, *binding, decorated)?;
             }
             hir::StatementKind::ClassDef {
                 name,
                 binding,
+                type_params,
                 decorators,
                 bases,
                 metaclass,
                 keywords,
                 body,
             } => {
+                let (type_parameter_values, previous_type_cells) =
+                    self.install_type_parameters(type_params)?;
                 let bases = bases
                     .iter()
                     .map(|base| self.expression(base))
@@ -719,13 +1170,49 @@ impl<'a> Lowerer<'a> {
                     );
                     namespace
                 };
+                // CPython seeds these namespace entries before executing the
+                // class suite. User code may subsequently overwrite them.
+                let module_name = self.value();
+                self.emit(
+                    statement.span,
+                    mir::OperationKind::Constant {
+                        dest: module_name,
+                        value: mir::Constant::String("__main__".to_owned()),
+                    },
+                );
+                self.emit(
+                    statement.span,
+                    mir::OperationKind::ClassNamespaceSet {
+                        namespace,
+                        name: "__module__".to_owned(),
+                        value: module_name,
+                    },
+                );
+                let class_qualified_name = self.child_qualified_name(name);
+                let qualified_name_value = self.value();
+                self.emit(
+                    statement.span,
+                    mir::OperationKind::Constant {
+                        dest: qualified_name_value,
+                        value: mir::Constant::String(class_qualified_name.clone()),
+                    },
+                );
+                self.emit(
+                    statement.span,
+                    mir::OperationKind::ClassNamespaceSet {
+                        namespace,
+                        name: "__qualname__".to_owned(),
+                        value: qualified_name_value,
+                    },
+                );
                 // A class suite is a real native function.  Its namespace is
                 // supplied only after `__prepare__`, so every class-local
                 // access is scoped to the mapping selected by the metaclass.
                 let class_free = self.cells.keys().cloned().collect::<Vec<_>>();
                 let class_body = self.program.lower_class_body(
                     format!("<class body {name}>"),
-                    format!("{name}.<class body>"),
+                    format!("{class_qualified_name}.<class body>"),
+                    class_qualified_name,
                     body,
                     &class_free,
                 )?;
@@ -745,6 +1232,9 @@ impl<'a> Lowerer<'a> {
                         function: class_body,
                         defaults: Vec::new(),
                         closure: class_closure,
+                        local_names: Vec::new(),
+                        cell_names: Vec::new(),
+                        free_names: class_free.clone(),
                     },
                 );
                 let class_body_result = self.value();
@@ -757,237 +1247,7 @@ impl<'a> Lowerer<'a> {
                         keywords: Vec::new(),
                     },
                 );
-                self.class_scopes.push(ClassScope { namespace });
                 let has_class_cell = class_members_need_class_cell(body);
-                // The suite above is the executable class body. Keep this
-                // legacy lowering structure inert while its helpers remain
-                // shared by the hidden class-body lowerer.
-                for member in body.iter().take(0) {
-                    match member {
-                        hir::ClassMember::Assign { targets, value } => {
-                            let value = self.expression(value)?;
-                            for target in targets {
-                                self.write_class_target(namespace, target, value)?;
-                            }
-                        }
-                        hir::ClassMember::AugAssign { target, op, value } => {
-                            self.lower_class_augmented_target(
-                                statement.span,
-                                namespace,
-                                target,
-                                *op,
-                                value,
-                            )?;
-                        }
-                        hir::ClassMember::Delete { targets } => {
-                            for target in targets {
-                                self.delete_class_target(namespace, target)?;
-                            }
-                        }
-                        hir::ClassMember::AnnAssign { .. } => {}
-                        hir::ClassMember::Assert { test, message } => {
-                            self.lower_assert(statement.span, test, message.as_ref())?;
-                        }
-                        hir::ClassMember::Raise { exception, cause } => {
-                            if let Some(exception) = exception {
-                                let exception = self.expression(exception)?;
-                                let suppress_context = matches!(
-                                    cause.as_ref().map(|cause| &cause.kind),
-                                    Some(hir::ExpressionKind::None)
-                                );
-                                let cause = cause
-                                    .as_ref()
-                                    .map(|value| self.expression(value))
-                                    .transpose()?;
-                                self.emit(
-                                    statement.span,
-                                    mir::OperationKind::Raise {
-                                        exception,
-                                        cause,
-                                        suppress_context,
-                                    },
-                                );
-                            } else {
-                                self.emit(statement.span, mir::OperationKind::Reraise);
-                            }
-                        }
-                        hir::ClassMember::Try {
-                            body,
-                            handlers,
-                            else_body,
-                            finally_body,
-                            is_star,
-                        } => self.lower_class_try_members(
-                            statement.span,
-                            namespace,
-                            body,
-                            handlers,
-                            else_body,
-                            finally_body,
-                            *is_star,
-                        )?,
-                        hir::ClassMember::ClassDef {
-                            name,
-                            decorators,
-                            bases,
-                            metaclass,
-                            keywords,
-                            body,
-                        } => self.lower_nested_class_member(
-                            statement.span,
-                            namespace,
-                            name,
-                            decorators,
-                            bases,
-                            metaclass,
-                            keywords,
-                            body,
-                        )?,
-                        hir::ClassMember::Break => {
-                            let targets = self
-                                .loops
-                                .last()
-                                .copied()
-                                .ok_or_else(|| "break has no enclosing loop".to_owned())?;
-                            self.emit_cleanups_from(targets.cleanup_depth)?;
-                            self.terminate(mir::Terminator::Jump {
-                                target: targets.break_target,
-                                arguments: vec![],
-                            })?;
-                        }
-                        hir::ClassMember::Continue => {
-                            let targets = self
-                                .loops
-                                .last()
-                                .copied()
-                                .ok_or_else(|| "continue has no enclosing loop".to_owned())?;
-                            self.emit_cleanups_from(targets.cleanup_depth)?;
-                            self.terminate(mir::Terminator::Jump {
-                                target: targets.continue_target,
-                                arguments: vec![],
-                            })?;
-                        }
-                        hir::ClassMember::FunctionDef {
-                            name: method_name,
-                            decorators,
-                            uses_zero_argument_super,
-                            parameters,
-                            return_annotation: _,
-                            body,
-                            locals,
-                            cells: _,
-                            free,
-                        } => {
-                            let mut method_free = free.clone();
-                            if *uses_zero_argument_super {
-                                method_free.push("__class__".to_owned());
-                            }
-                            let function = self.program.lower_scope(
-                                method_name.clone(),
-                                format!("{name}.{method_name}"),
-                                parameters,
-                                locals,
-                                &method_free,
-                                body,
-                                false,
-                            )?;
-                            let mut defaults = Vec::new();
-                            for (index, parameter) in parameters.iter().enumerate() {
-                                if let Some(default) = &parameter.default {
-                                    defaults.push((
-                                        u32::try_from(index)
-                                            .map_err(|_| "too many method parameters")?,
-                                        self.expression(default)?,
-                                    ));
-                                }
-                            }
-                            let closure = method_free
-                                .iter()
-                                .map(|free_name| {
-                                    self.cells.get(free_name).copied().ok_or_else(|| {
-                                        format!("free variable `{free_name}` has no closure cell")
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let method = self.value();
-                            self.emit(
-                                statement.span,
-                                mir::OperationKind::MakeFunction {
-                                    dest: method,
-                                    function,
-                                    defaults,
-                                    closure,
-                                },
-                            );
-                            self.record_class_name(method_name);
-                            let mut decorated = method;
-                            for decorator in decorators.iter().rev() {
-                                let callable =
-                                    self.class_decorator_expression(decorator, namespace)?;
-                                let value = self.value();
-                                self.emit(
-                                    statement.span,
-                                    mir::OperationKind::Call {
-                                        dest: value,
-                                        callable,
-                                        positional: vec![decorated],
-                                        keywords: Vec::new(),
-                                    },
-                                );
-                                decorated = value;
-                            }
-                            self.emit(
-                                statement.span,
-                                mir::OperationKind::ClassNamespaceSet {
-                                    namespace,
-                                    name: method_name.clone(),
-                                    value: decorated,
-                                },
-                            );
-                        }
-                        hir::ClassMember::If {
-                            condition,
-                            then_body,
-                            else_body,
-                        } => self.lower_class_conditional_assignments(
-                            statement.span,
-                            namespace,
-                            condition,
-                            then_body,
-                            else_body,
-                        )?,
-                        hir::ClassMember::While { condition, body } => self
-                            .lower_class_while_assignments(
-                                statement.span,
-                                namespace,
-                                condition,
-                                body,
-                            )?,
-                        hir::ClassMember::For {
-                            target,
-                            iterable,
-                            body,
-                            else_body,
-                        } => self.lower_class_for_members(
-                            statement.span,
-                            namespace,
-                            target,
-                            iterable,
-                            body,
-                            else_body,
-                        )?,
-                        hir::ClassMember::Expression(expression) => {
-                            self.expression(expression)?;
-                        }
-                        hir::ClassMember::Print(values) => {
-                            let values = values
-                                .iter()
-                                .map(|value| self.expression(value))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            self.emit(statement.span, mir::OperationKind::Print { values });
-                        }
-                    }
-                }
                 let value = if let Some((metaclass, name_value, bases_value, _)) = prepared {
                     let value = self.value();
                     self.emit(
@@ -1031,6 +1291,19 @@ impl<'a> Lowerer<'a> {
                         },
                     );
                 }
+                if !type_params.is_empty() {
+                    let type_params_tuple =
+                        self.type_parameter_tuple(statement.span, type_parameter_values);
+                    self.emit(
+                        statement.span,
+                        mir::OperationKind::AttributeSet {
+                            receiver: value,
+                            name: "__type_params__".to_owned(),
+                            value: type_params_tuple,
+                        },
+                    );
+                }
+                self.restore_type_parameters(previous_type_cells);
                 let mut decorated = value;
                 for decorator in decorators.iter().rev() {
                     let callable = self.expression(decorator)?;
@@ -1046,8 +1319,31 @@ impl<'a> Lowerer<'a> {
                     );
                     decorated = next;
                 }
-                self.class_scopes.pop();
                 self.store_name(statement.span, name, *binding, decorated)?;
+            }
+            hir::StatementKind::TypeAlias {
+                name,
+                binding,
+                type_params,
+                value,
+            } => {
+                let (type_parameter_values, previous_type_cells) =
+                    self.install_type_parameters(type_params)?;
+                let alias_value = self.expression(value)?;
+                let type_params_tuple =
+                    self.type_parameter_tuple(statement.span, type_parameter_values);
+                let alias = self.value();
+                self.emit(
+                    statement.span,
+                    mir::OperationKind::TypeAliasNew {
+                        dest: alias,
+                        name: name.clone(),
+                        type_params: type_params_tuple,
+                        value: alias_value,
+                    },
+                );
+                self.restore_type_parameters(previous_type_cells);
+                self.store_name(statement.span, name, *binding, alias)?;
             }
             hir::StatementKind::Return { value } => {
                 let value = value
@@ -1255,17 +1551,34 @@ impl<'a> Lowerer<'a> {
         value: mir::ValueId,
     ) -> Result<(), String> {
         match &target.kind {
-            hir::TargetKind::Name { name, .. } => {
-                self.emit(
+            hir::TargetKind::Name { name, binding } => match binding {
+                hir::Binding::Global => self.emit(
                     target.span,
-                    mir::OperationKind::ClassNamespaceSet {
-                        namespace,
+                    mir::OperationKind::GlobalSet {
                         name: name.clone(),
                         value,
                     },
-                );
-                self.record_class_name(name);
-            }
+                ),
+                hir::Binding::Free | hir::Binding::Cell | hir::Binding::Local => {
+                    let cell = self
+                        .cells
+                        .get(name)
+                        .copied()
+                        .ok_or_else(|| format!("class target `{name}` has no cell"))?;
+                    self.emit(target.span, mir::OperationKind::CellSet { cell, value });
+                }
+                hir::Binding::ClassName | hir::Binding::ClassFree => {
+                    self.emit(
+                        target.span,
+                        mir::OperationKind::ClassNamespaceSet {
+                            namespace,
+                            name: name.clone(),
+                            value,
+                        },
+                    );
+                    self.record_class_name(name);
+                }
+            },
             hir::TargetKind::Attribute { receiver, name } => {
                 let receiver = self.expression(receiver)?;
                 self.emit(
@@ -1376,13 +1689,27 @@ impl<'a> Lowerer<'a> {
         target: &hir::Target,
     ) -> Result<(), String> {
         match &target.kind {
-            hir::TargetKind::Name { name, .. } => self.emit(
-                target.span,
-                mir::OperationKind::ClassNamespaceDelete {
-                    namespace,
-                    name: name.clone(),
-                },
-            ),
+            hir::TargetKind::Name { name, binding } => match binding {
+                hir::Binding::Global => self.emit(
+                    target.span,
+                    mir::OperationKind::GlobalDelete { name: name.clone() },
+                ),
+                hir::Binding::Free | hir::Binding::Cell | hir::Binding::Local => {
+                    let cell = self
+                        .cells
+                        .get(name)
+                        .copied()
+                        .ok_or_else(|| format!("class delete target `{name}` has no cell"))?;
+                    self.emit(target.span, mir::OperationKind::CellClear { cell });
+                }
+                hir::Binding::ClassName | hir::Binding::ClassFree => self.emit(
+                    target.span,
+                    mir::OperationKind::ClassNamespaceDelete {
+                        namespace,
+                        name: name.clone(),
+                    },
+                ),
+            },
             hir::TargetKind::Attribute { receiver, name } => {
                 let receiver = self.expression(receiver)?;
                 self.emit(
@@ -1523,16 +1850,42 @@ impl<'a> Lowerer<'a> {
         value: &hir::Expression,
     ) -> Result<(), String> {
         match &target.kind {
-            hir::TargetKind::Name { name, .. } => {
+            hir::TargetKind::Name { name, binding } => {
                 let current = self.value();
-                self.emit(
-                    target.span,
-                    mir::OperationKind::ClassNamespaceGet {
+                let load = match binding {
+                    hir::Binding::Global => mir::OperationKind::GlobalGet {
+                        dest: current,
+                        name: name.clone(),
+                    },
+                    hir::Binding::Free | hir::Binding::Cell | hir::Binding::Local => {
+                        let cell = self.cells.get(name).copied().ok_or_else(|| {
+                            format!("class augmented target `{name}` has no cell")
+                        })?;
+                        mir::OperationKind::CellGet {
+                            dest: current,
+                            cell,
+                            name: Some(name.clone()),
+                            free: *binding == hir::Binding::Free,
+                        }
+                    }
+                    hir::Binding::ClassName => mir::OperationKind::ClassNameGet {
                         dest: current,
                         namespace,
                         name: name.clone(),
                     },
-                );
+                    hir::Binding::ClassFree => {
+                        let cell = self.cells.get(name).copied().ok_or_else(|| {
+                            format!("class free augmented target `{name}` has no cell")
+                        })?;
+                        mir::OperationKind::ClassFreeGet {
+                            dest: current,
+                            namespace,
+                            cell,
+                            name: name.clone(),
+                        }
+                    }
+                };
+                self.emit(target.span, load);
                 let right = self.expression(value)?;
                 let result = self.value();
                 self.emit(
@@ -1544,14 +1897,7 @@ impl<'a> Lowerer<'a> {
                         right,
                     },
                 );
-                self.emit(
-                    target.span,
-                    mir::OperationKind::ClassNamespaceSet {
-                        namespace,
-                        name: name.clone(),
-                        value: result,
-                    },
-                );
+                self.write_class_target(namespace, target, result)?;
             }
             hir::TargetKind::Attribute { receiver, name } => {
                 let receiver = self.expression(receiver)?;
@@ -1702,6 +2048,22 @@ impl<'a> Lowerer<'a> {
                     .copied()
                     .ok_or_else(|| format!("local `{name}` has no cell"))?;
                 self.emit(span, mir::OperationKind::CellSet { cell, value });
+            }
+            hir::Binding::ClassName | hir::Binding::ClassFree => {
+                let namespace = self
+                    .class_scopes
+                    .last()
+                    .map(|scope| scope.namespace)
+                    .ok_or_else(|| format!("class binding `{name}` escaped class lowering"))?;
+                self.emit(
+                    span,
+                    mir::OperationKind::ClassNamespaceSet {
+                        namespace,
+                        name: name.to_owned(),
+                        value,
+                    },
+                );
+                self.record_class_name(name);
             }
         }
         Ok(())
@@ -1939,16 +2301,63 @@ impl<'a> Lowerer<'a> {
                     finally_body,
                     *is_star,
                 )?,
+                hir::ClassMember::Import { aliases } => {
+                    for alias in aliases {
+                        let value = self.value();
+                        self.emit(
+                            span,
+                            mir::OperationKind::ImportName {
+                                dest: value,
+                                name: alias.module.clone(),
+                            },
+                        );
+                        self.store_name(span, &alias.bind_name, alias.binding, value)?;
+                    }
+                }
                 hir::ClassMember::ClassDef {
                     name,
+                    binding,
+                    type_params,
                     decorators,
                     bases,
                     metaclass,
                     keywords,
                     body,
                 } => self.lower_nested_class_member(
-                    span, namespace, name, decorators, bases, metaclass, keywords, body,
+                    span,
+                    namespace,
+                    name,
+                    *binding,
+                    type_params,
+                    decorators,
+                    bases,
+                    metaclass,
+                    keywords,
+                    body,
                 )?,
+                hir::ClassMember::TypeAlias {
+                    name,
+                    binding,
+                    type_params,
+                    value,
+                } => {
+                    let (type_parameter_values, previous_type_cells) =
+                        self.install_type_parameters(type_params)?;
+                    let alias_value = self.expression(value)?;
+                    let type_params_tuple = self.type_parameter_tuple(span, type_parameter_values);
+                    let alias = self.value();
+                    self.emit(
+                        span,
+                        mir::OperationKind::TypeAliasNew {
+                            dest: alias,
+                            name: name.clone(),
+                            type_params: type_params_tuple,
+                            value: alias_value,
+                        },
+                    );
+                    self.restore_type_parameters(previous_type_cells);
+                    self.store_name(span, name, *binding, alias)?;
+                }
                 hir::ClassMember::Break => {
                     let targets = self
                         .loops
@@ -2001,25 +2410,35 @@ impl<'a> Lowerer<'a> {
                     self.emit(span, mir::OperationKind::Print { values });
                 }
                 hir::ClassMember::FunctionDef {
+                    span: member_span,
                     name,
+                    binding,
+                    type_params,
                     decorators,
                     uses_zero_argument_super,
                     parameters,
                     return_annotation,
                     body,
                     locals,
-                    cells: _,
+                    cells,
                     free,
                 } => {
+                    let definition_span = decorators
+                        .first()
+                        .map_or(*member_span, |decorator| decorator.span);
                     let mut method_free = free.clone();
                     if *uses_zero_argument_super
                         && !method_free.iter().any(|name| name == "__class__")
                     {
                         method_free.push("__class__".to_owned());
                     }
+                    let decorator_values = decorators
+                        .iter()
+                        .map(|decorator| self.class_decorator_expression(decorator, namespace))
+                        .collect::<Result<Vec<_>, _>>()?;
                     let function = self.program.lower_scope(
                         name.clone(),
-                        format!("<class>.{name}"),
+                        self.child_qualified_name(name),
                         parameters,
                         locals,
                         &method_free,
@@ -2035,8 +2454,10 @@ impl<'a> Lowerer<'a> {
                             ));
                         }
                     }
+                    let (type_parameter_values, previous_type_cells) =
+                        self.install_type_parameters(type_params)?;
                     let annotations = self.lower_function_annotations(
-                        span,
+                        *member_span,
                         parameters,
                         return_annotation.as_ref(),
                     )?;
@@ -2050,12 +2471,15 @@ impl<'a> Lowerer<'a> {
                         .collect::<Result<Vec<_>, _>>()?;
                     let method = self.value();
                     self.emit(
-                        span,
+                        definition_span,
                         mir::OperationKind::MakeFunction {
                             dest: method,
                             function,
                             defaults,
                             closure,
+                            local_names: locals.clone(),
+                            cell_names: cells.clone(),
+                            free_names: method_free.clone(),
                         },
                     );
                     if let Some(annotations) = annotations {
@@ -2068,9 +2492,21 @@ impl<'a> Lowerer<'a> {
                             },
                         );
                     }
+                    if !type_params.is_empty() {
+                        let type_params_tuple =
+                            self.type_parameter_tuple(span, type_parameter_values);
+                        self.emit(
+                            span,
+                            mir::OperationKind::AttributeSet {
+                                receiver: method,
+                                name: "__type_params__".to_owned(),
+                                value: type_params_tuple,
+                            },
+                        );
+                    }
+                    self.restore_type_parameters(previous_type_cells);
                     let mut decorated = method;
-                    for decorator in decorators.iter().rev() {
-                        let callable = self.class_decorator_expression(decorator, namespace)?;
+                    for callable in decorator_values.into_iter().rev() {
                         let value = self.value();
                         self.emit(
                             span,
@@ -2083,15 +2519,7 @@ impl<'a> Lowerer<'a> {
                         );
                         decorated = value;
                     }
-                    self.emit(
-                        span,
-                        mir::OperationKind::ClassNamespaceSet {
-                            namespace,
-                            name: name.clone(),
-                            value: decorated,
-                        },
-                    );
-                    self.record_class_name(name);
+                    self.store_name(span, name, *binding, decorated)?;
                 }
             }
         }
@@ -2104,6 +2532,8 @@ impl<'a> Lowerer<'a> {
         span: Span,
         namespace: mir::ValueId,
         name: &str,
+        binding: hir::Binding,
+        type_params: &[hir::TypeParameter],
         decorators: &[hir::Expression],
         bases: &[hir::Expression],
         metaclass: &Option<hir::Expression>,
@@ -2114,7 +2544,8 @@ impl<'a> Lowerer<'a> {
             span,
             kind: hir::StatementKind::ClassDef {
                 name: name.to_owned(),
-                binding: hir::Binding::Global,
+                binding,
+                type_params: type_params.to_vec(),
                 decorators: decorators.to_vec(),
                 bases: bases.to_vec(),
                 metaclass: metaclass.clone(),
@@ -2122,31 +2553,8 @@ impl<'a> Lowerer<'a> {
                 body: body.to_vec(),
             },
         };
-        self.statement(&statement)?;
-        let value = self.value();
-        self.emit(
-            span,
-            mir::OperationKind::GlobalGet {
-                dest: value,
-                name: name.to_owned(),
-            },
-        );
-        self.emit(
-            span,
-            mir::OperationKind::ClassNamespaceSet {
-                namespace,
-                name: name.to_owned(),
-                value,
-            },
-        );
-        self.emit(
-            span,
-            mir::OperationKind::GlobalDelete {
-                name: name.to_owned(),
-            },
-        );
-        self.record_class_name(name);
-        Ok(())
+        let _ = namespace;
+        self.statement(&statement)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2244,35 +2652,20 @@ impl<'a> Lowerer<'a> {
                 self.current = selected;
                 let handled = self.value();
                 self.emit(span, mir::OperationKind::HandlerEnter { dest: handled });
-                if let Some(name) = &handler.name {
-                    self.emit(
-                        span,
-                        mir::OperationKind::ClassNamespaceSet {
-                            namespace,
-                            name: name.clone(),
-                            value: handled,
-                        },
-                    );
-                    self.record_class_name(name);
+                if let Some((name, binding)) = &handler.name {
+                    self.store_name(span, name, *binding, handled)?;
                 }
                 let cleanup_error = self.new_block();
                 self.exception_target = Some(cleanup_error);
                 self.cleanups.push(CleanupAction::ClassHandler {
-                    namespace,
                     binding: handler.name.clone(),
                     exception_target: inner_exception,
                 });
                 self.lower_class_assignment_members(span, namespace, &handler.body)?;
                 self.cleanups.pop();
                 if self.is_open() {
-                    if let Some(name) = &handler.name {
-                        self.emit(
-                            span,
-                            mir::OperationKind::ClassNamespaceDelete {
-                                namespace,
-                                name: name.clone(),
-                            },
-                        );
+                    if let Some((name, binding)) = &handler.name {
+                        self.clear_name(span, name, *binding)?;
                     }
                     self.exception_target = inner_exception;
                     self.emit(span, mir::OperationKind::HandlerLeave);
@@ -2283,14 +2676,8 @@ impl<'a> Lowerer<'a> {
                 }
                 self.current = cleanup_error;
                 self.exception_target = inner_exception;
-                if let Some(name) = &handler.name {
-                    self.emit(
-                        span,
-                        mir::OperationKind::ClassNamespaceDelete {
-                            namespace,
-                            name: name.clone(),
-                        },
-                    );
+                if let Some((name, binding)) = &handler.name {
+                    self.clear_name(span, name, *binding)?;
                 }
                 self.emit(span, mir::OperationKind::HandlerLeave);
                 self.emit(span, mir::OperationKind::Propagate);
@@ -3140,7 +3527,10 @@ impl<'a> Lowerer<'a> {
                     let value = self.expression(element)?;
                     self.terminate(mir::Terminator::Yield {
                         value,
+                        resume_value: None,
                         resume_target: header,
+                        exception_target: self.exception_target,
+                        delegate: None,
                     })?;
                 }
             }
@@ -3640,19 +4030,12 @@ impl<'a> Lowerer<'a> {
                     self.lower_class_assignment_members(Span::default(), *namespace, members)?;
                 }
                 CleanupAction::ClassHandler {
-                    namespace,
                     binding,
                     exception_target,
                 } => {
                     self.exception_target = *exception_target;
-                    if let Some(name) = binding {
-                        self.emit(
-                            Span::default(),
-                            mir::OperationKind::ClassNamespaceDelete {
-                                namespace: *namespace,
-                                name: name.clone(),
-                            },
-                        );
+                    if let Some((name, binding)) = binding {
+                        self.clear_name(Span::default(), name, *binding)?;
                     }
                     self.emit(Span::default(), mir::OperationKind::HandlerLeave);
                 }
@@ -3681,8 +4064,105 @@ impl<'a> Lowerer<'a> {
                     .ok_or_else(|| format!("local `{name}` has no cell"))?;
                 self.emit(span, mir::OperationKind::CellClear { cell });
             }
+            hir::Binding::ClassName | hir::Binding::ClassFree => {
+                let namespace = self
+                    .class_scopes
+                    .last()
+                    .map(|scope| scope.namespace)
+                    .ok_or_else(|| format!("class binding `{name}` escaped class lowering"))?;
+                self.emit(
+                    span,
+                    mir::OperationKind::ClassNamespaceDelete {
+                        namespace,
+                        name: name.to_owned(),
+                    },
+                );
+            }
         }
         Ok(())
+    }
+
+    fn lower_yield_expression(
+        &mut self,
+        span: Span,
+        value: Option<&hir::Expression>,
+    ) -> Result<mir::ValueId, String> {
+        let yielded = if let Some(value) = value {
+            self.expression(value)?
+        } else {
+            let value = self.value();
+            self.emit(
+                span,
+                mir::OperationKind::Constant {
+                    dest: value,
+                    value: mir::Constant::None,
+                },
+            );
+            value
+        };
+        let resume_target = self.new_block();
+        let resume_value = self.value();
+        self.blocks[resume_target.0 as usize]
+            .parameters
+            .push(resume_value);
+        self.terminate(mir::Terminator::Yield {
+            value: yielded,
+            resume_value: Some(resume_value),
+            resume_target,
+            exception_target: self.exception_target,
+            delegate: None,
+        })?;
+        self.current = resume_target;
+        Ok(resume_value)
+    }
+
+    fn lower_yield_from_expression(
+        &mut self,
+        span: Span,
+        value: &hir::Expression,
+    ) -> Result<mir::ValueId, String> {
+        let iterable = self.expression(value)?;
+        let iterator = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::IteratorNew {
+                dest: iterator,
+                value: iterable,
+            },
+        );
+        let yielded = self.value();
+        let result = self.value();
+        let complete = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::YieldFromNext {
+                yielded,
+                result,
+                complete,
+                iterator,
+            },
+        );
+        let join = self.new_block();
+        let join_result = self.value();
+        self.blocks[join.0 as usize].parameters.push(join_result);
+        let suspend = self.new_block();
+        self.terminate(mir::Terminator::Branch {
+            condition: complete,
+            then_target: join,
+            then_arguments: vec![result],
+            else_target: suspend,
+            else_arguments: Vec::new(),
+        })?;
+        self.current = suspend;
+        self.terminate(mir::Terminator::Yield {
+            value: yielded,
+            resume_value: Some(join_result),
+            resume_target: join,
+            exception_target: self.exception_target,
+            delegate: Some(iterator),
+        })?;
+        self.current = join;
+        Ok(join_result)
     }
 
     fn expression(&mut self, expression: &hir::Expression) -> Result<mir::ValueId, String> {
@@ -3828,7 +4308,7 @@ impl<'a> Lowerer<'a> {
                 parameters,
                 body,
                 locals,
-                cells: _,
+                cells,
                 free,
             } => {
                 let return_statement = hir::Statement {
@@ -3839,7 +4319,7 @@ impl<'a> Lowerer<'a> {
                 };
                 let function = self.program.lower_scope(
                     "<lambda>".to_owned(),
-                    "<lambda>".to_owned(),
+                    self.child_qualified_name("<lambda>"),
                     parameters,
                     locals,
                     free,
@@ -3868,22 +4348,45 @@ impl<'a> Lowerer<'a> {
                     function,
                     defaults,
                     closure,
+                    local_names: locals.clone(),
+                    cell_names: cells.clone(),
+                    free_names: free.clone(),
                 }
             }
             hir::ExpressionKind::Name { name, binding } => match binding {
-                hir::Binding::Global => {
-                    let class_namespace = self.class_scopes.last().map(|scope| scope.namespace);
-                    if let Some(namespace) = class_namespace {
-                        mir::OperationKind::ClassNameGet {
-                            dest: self.value(),
-                            namespace,
-                            name: name.clone(),
-                        }
-                    } else {
-                        mir::OperationKind::GlobalGet {
-                            dest: self.value(),
-                            name: name.clone(),
-                        }
+                hir::Binding::Global => mir::OperationKind::GlobalGet {
+                    dest: self.value(),
+                    name: name.clone(),
+                },
+                hir::Binding::ClassName => {
+                    let namespace = self
+                        .class_scopes
+                        .last()
+                        .map(|scope| scope.namespace)
+                        .ok_or_else(|| format!("class name `{name}` escaped class lowering"))?;
+                    mir::OperationKind::ClassNameGet {
+                        dest: self.value(),
+                        namespace,
+                        name: name.clone(),
+                    }
+                }
+                hir::Binding::ClassFree => {
+                    let namespace = self
+                        .class_scopes
+                        .last()
+                        .map(|scope| scope.namespace)
+                        .ok_or_else(|| {
+                            format!("class free name `{name}` escaped class lowering")
+                        })?;
+                    let cell =
+                        self.cells.get(name).copied().ok_or_else(|| {
+                            format!("class free name `{name}` has no closure cell")
+                        })?;
+                    mir::OperationKind::ClassFreeGet {
+                        dest: self.value(),
+                        namespace,
+                        cell,
+                        name: name.clone(),
                     }
                 }
                 hir::Binding::Local | hir::Binding::Cell | hir::Binding::Free => {
@@ -3935,7 +4438,7 @@ impl<'a> Lowerer<'a> {
                 key,
                 clauses,
                 locals,
-                cells: _,
+                cells,
                 free,
             } => {
                 let outer_iterable = self.expression(outer_iterable)?;
@@ -3954,6 +4457,8 @@ impl<'a> Lowerer<'a> {
                     clauses,
                     locals,
                     free,
+                    self.qualname_prefix.clone(),
+                    self.nested_uses_locals,
                 )?;
                 let closure =
                     free.iter()
@@ -3971,6 +4476,9 @@ impl<'a> Lowerer<'a> {
                         function,
                         defaults: Vec::new(),
                         closure,
+                        local_names: locals.clone(),
+                        cell_names: cells.clone(),
+                        free_names: free.clone(),
                     },
                 );
                 mir::OperationKind::Call {
@@ -3979,6 +4487,12 @@ impl<'a> Lowerer<'a> {
                     positional: vec![outer_iterator],
                     keywords: Vec::new(),
                 }
+            }
+            hir::ExpressionKind::Yield { value } => {
+                return self.lower_yield_expression(expression.span, value.as_deref());
+            }
+            hir::ExpressionKind::YieldFrom { value } => {
+                return self.lower_yield_from_expression(expression.span, value);
             }
             hir::ExpressionKind::NamedExpression {
                 name,
@@ -5117,6 +5631,80 @@ print(result)
     }
 
     #[test]
+    fn gate5_function_mir_uses_one_make_function_path_for_metadata_decorators_and_closures() {
+        let path = Path::new("gate5_function_mir.py");
+        let source = r#"
+events = []
+
+def decorate(function):
+    return function
+
+@decorate
+def outer(value: int = 3, *, flag: int = 4) -> int:
+    captured = value
+    def inner():
+        return captured
+    return inner()
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        mir::verify(&program).unwrap();
+
+        let module = &program.functions[program.entry.0 as usize];
+        let outer_id = program
+            .functions
+            .iter()
+            .position(|function| function.name == "outer")
+            .expect("outer function should exist");
+        let mut saw_outer_make = false;
+        let mut saw_annotation_publish = false;
+        let mut saw_decorator_call = false;
+        for block in &module.blocks {
+            for operation in &block.operations {
+                match &operation.kind {
+                    mir::OperationKind::MakeFunction {
+                        function, defaults, ..
+                    } if function.0 as usize == outer_id => {
+                        saw_outer_make = true;
+                        assert_eq!(defaults.len(), 2);
+                    }
+                    mir::OperationKind::AttributeSet { name, .. } if name == "__annotations__" => {
+                        saw_annotation_publish = true;
+                    }
+                    mir::OperationKind::Call { .. } if saw_outer_make => {
+                        saw_decorator_call = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_outer_make);
+        assert!(saw_annotation_publish);
+        assert!(saw_decorator_call);
+
+        let outer = &program.functions[outer_id];
+        let inner_id = program
+            .functions
+            .iter()
+            .position(|function| function.qualified_name == "outer.<locals>.inner")
+            .expect("nested qualified name should be materialized in MIR");
+        assert!(
+            outer
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|operation| {
+                    matches!(
+                        operation.kind,
+                        mir::OperationKind::MakeFunction { function, ref closure, .. }
+                            if function.0 as usize == inner_id && closure.len() == 1
+                    )
+                })
+        );
+    }
+
+    #[test]
     fn gate4_generator_expression_mir_uses_yield_and_persists_only_live_state() {
         let path = Path::new("gate4_generator_mir.py");
         let source = r#"
@@ -5573,5 +6161,129 @@ dicts = {key(item): mapped(item) for item in [1, 2]}
         assert!(roots.contains(&dictionary));
         assert!(roots.contains(&key));
         assert!(roots.contains(&value));
+    }
+
+    #[test]
+    fn gate7_namespace_reflection_mir_declares_authoritative_scope_ownership() {
+        let path = Path::new("gate7_namespace_reflection_mir.py");
+        let source = r#"
+def outer(z, a):
+    q = 1
+    values = [locals()["i"] for i in [1]]
+    generated = (locals()["i"] for i in [2])
+    return q, values, generated
+
+class C:
+    marker = 1
+    here = locals()
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        mir::verify(&program).unwrap();
+
+        let outer = program
+            .functions
+            .iter()
+            .find(|function| function.name == "outer")
+            .expect("outer function");
+        assert!(
+            outer.blocks[outer.entry.0 as usize]
+                .operations
+                .iter()
+                .any(|operation| {
+                    matches!(
+                        operation.kind,
+                        mir::OperationKind::ReflectionScopeConfigure {
+                            namespace: None,
+                            comprehension: false,
+                        }
+                    )
+                })
+        );
+        let registered = outer.blocks[outer.entry.0 as usize]
+            .operations
+            .iter()
+            .filter_map(|operation| match &operation.kind {
+                mir::OperationKind::ReflectionLocalRegister { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(registered, ["z", "a", "q", "values", "generated"]);
+
+        let list_comp = program
+            .functions
+            .iter()
+            .find(|function| function.name == "<listcomp>")
+            .expect("list comprehension");
+        assert!(
+            list_comp.blocks[list_comp.entry.0 as usize]
+                .operations
+                .iter()
+                .any(|operation| {
+                    matches!(
+                        operation.kind,
+                        mir::OperationKind::ReflectionScopeConfigure {
+                            namespace: None,
+                            comprehension: true,
+                        }
+                    )
+                })
+        );
+        assert!(
+            list_comp.blocks[list_comp.entry.0 as usize]
+                .operations
+                .iter()
+                .any(|operation| {
+                    matches!(
+                        &operation.kind,
+                        mir::OperationKind::ReflectionLocalRegister { name, .. } if name == "i"
+                    )
+                })
+        );
+
+        let generator = program
+            .functions
+            .iter()
+            .find(|function| function.name == "<genexpr>")
+            .expect("generator expression");
+        let generator_ops = &generator.blocks[generator.entry.0 as usize].operations;
+        assert!(generator_ops.iter().any(|operation| {
+            matches!(
+                operation.kind,
+                mir::OperationKind::ReflectionScopeConfigure {
+                    namespace: None,
+                    comprehension: false,
+                }
+            )
+        }));
+        let generator_names = generator_ops
+            .iter()
+            .filter_map(|operation| match &operation.kind {
+                mir::OperationKind::ReflectionLocalRegister { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(generator_names, [".0", "i"]);
+
+        let class_body = program
+            .functions
+            .iter()
+            .find(|function| function.kind == mir::FunctionKind::ClassBody)
+            .expect("class body");
+        assert!(
+            class_body.blocks[class_body.entry.0 as usize]
+                .operations
+                .iter()
+                .any(|operation| {
+                    matches!(
+                        operation.kind,
+                        mir::OperationKind::ReflectionScopeConfigure {
+                            namespace: Some(_),
+                            comprehension: false,
+                        }
+                    )
+                })
+        );
     }
 }

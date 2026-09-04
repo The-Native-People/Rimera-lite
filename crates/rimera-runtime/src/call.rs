@@ -3,14 +3,17 @@ use std::io::{self, Write};
 
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive};
-use rimera_abi::{RCallArgumentKind, RNativeFunction, RStatus, RValue};
+use rimera_abi::{
+    RCallArgumentKind, RGeneratorDelegateOutcome, RGeneratorOperation, RGeneratorOutcome,
+    RNativeFunction, RStatus, RValue,
+};
 
 use crate::ParameterKind;
 use crate::RimeraContext;
 use crate::heap::HeapObject;
 use crate::object::{
-    BuiltinFunctionKind, CallArgumentsObject, DictionaryObject, FunctionObject, TYPE_FLAG_BUILTIN,
-    TypeLayout,
+    BuiltinFunctionKind, CallArgumentsObject, CodeObject, DictionaryObject, FunctionObject,
+    TYPE_FLAG_BUILTIN, TypeLayout,
 };
 
 pub(crate) fn invoke(
@@ -66,12 +69,6 @@ pub(crate) fn invoke(
         }
         let base_exception = context.builtin_type("BaseException");
         if base_exception.is_some_and(|base| object.mro.contains(&base)) {
-            if !keywords.is_empty() {
-                return Err(format!(
-                    "{}() does not accept keyword arguments",
-                    object.name
-                ));
-            }
             if matches!(type_name.as_str(), "ExceptionGroup" | "BaseExceptionGroup") {
                 if positional.len() != 2 {
                     return Err(format!("{type_name}() requires a message and exceptions"));
@@ -84,7 +81,25 @@ pub(crate) fn invoke(
                 };
                 return context.new_exception_group(callable, positional[0], &children);
             }
-            return context.new_exception(callable, positional);
+            let instance = context.new_exception(callable, positional)?;
+            return context.with_temporary_roots(&[instance, callable], |context| {
+                if let Some(initializer) = context.special_method(instance, "__init__")? {
+                    let mut roots = positional.to_vec();
+                    roots.extend(keywords.iter().map(|(_, value)| *value));
+                    roots.extend([instance, initializer]);
+                    return context.with_temporary_roots(&roots, |context| {
+                        let result = invoke(context, initializer, positional, keywords)?;
+                        if result != RValue::NONE {
+                            return Err("__init__() should return None".to_owned());
+                        }
+                        Ok(instance)
+                    });
+                }
+                if !keywords.is_empty() {
+                    return Err(format!("{}() does not accept keyword arguments", type_name));
+                }
+                Ok(instance)
+            });
         }
         if flags & crate::object::TYPE_FLAG_INSTANTIABLE != 0 {
             let layout = object.layout;
@@ -155,6 +170,10 @@ pub(crate) fn invoke(
             BuiltinFunctionKind::Repr => invoke_repr(context, positional, keywords),
             BuiltinFunctionKind::Format => invoke_format(context, positional, keywords),
             BuiltinFunctionKind::Reversed => invoke_reversed(context, positional, keywords),
+            BuiltinFunctionKind::Dir => invoke_dir(context, positional, keywords),
+            BuiltinFunctionKind::Vars => invoke_vars(context, positional, keywords),
+            BuiltinFunctionKind::Globals => invoke_globals(context, positional, keywords),
+            BuiltinFunctionKind::Locals => invoke_locals(context, positional, keywords),
             BuiltinFunctionKind::FloatConjugate => {
                 invoke_float_conjugate(context, positional, keywords)
             }
@@ -165,6 +184,9 @@ pub(crate) fn invoke(
                 invoke_float_as_integer_ratio(context, positional, keywords)
             }
             BuiltinFunctionKind::FloatHex => invoke_float_hex(context, positional, keywords),
+            BuiltinFunctionKind::FloatFromHex => {
+                invoke_float_fromhex(context, positional, keywords)
+            }
             BuiltinFunctionKind::ComplexConjugate => {
                 invoke_complex_conjugate(context, positional, keywords)
             }
@@ -225,6 +247,24 @@ pub(crate) fn invoke(
             BuiltinFunctionKind::ListIndex => invoke_list_index(context, positional, keywords),
             BuiltinFunctionKind::ListReverse => invoke_list_reverse(context, positional, keywords),
             BuiltinFunctionKind::ListSort => invoke_list_sort(context, positional, keywords),
+            BuiltinFunctionKind::GeneratorIter => {
+                invoke_generator_iter(context, positional, keywords)
+            }
+            BuiltinFunctionKind::GeneratorNext => {
+                invoke_generator_next(context, positional, keywords)
+            }
+            BuiltinFunctionKind::GeneratorSend => {
+                invoke_generator_send(context, positional, keywords)
+            }
+            BuiltinFunctionKind::GeneratorThrow => {
+                invoke_generator_throw(context, positional, keywords)
+            }
+            BuiltinFunctionKind::GeneratorClose => {
+                invoke_generator_close(context, positional, keywords)
+            }
+            BuiltinFunctionKind::ExceptionWithTraceback => {
+                invoke_exception_with_traceback(context, positional, keywords)
+            }
             BuiltinFunctionKind::BuiltinStorageInit => {
                 invoke_builtin_storage_init(context, positional, keywords)
             }
@@ -324,27 +364,40 @@ pub(crate) fn invoke(
         Some(HeapObject::Function(function)) => function.clone(),
         _ => return Err("object is not callable".to_owned()),
     };
-    let mut roots =
-        Vec::with_capacity(positional.len() + keywords.len() + function.parameters.len() + 1);
-    roots.push(callable);
+    let code = match context.heap.get(function.code) {
+        Some(HeapObject::Code(code)) => code.clone(),
+        _ => return Err("function has an invalid code object".to_owned()),
+    };
+    let mut roots = Vec::with_capacity(positional.len() + keywords.len() + 7);
+    roots.extend([callable, function.code]);
     roots.extend_from_slice(positional);
     roots.extend(keywords.iter().map(|(_, value)| *value));
-    roots.extend(
-        function
-            .parameters
-            .iter()
-            .filter_map(|parameter| parameter.default),
-    );
+    function
+        .closure
+        .into_iter()
+        .for_each(|value| roots.push(value));
+    function
+        .defaults
+        .into_iter()
+        .for_each(|value| roots.push(value));
+    function
+        .keyword_defaults
+        .into_iter()
+        .for_each(|value| roots.push(value));
+    function
+        .annotations
+        .into_iter()
+        .for_each(|value| roots.push(value));
     context.with_temporary_roots(&roots, |context| {
-        let bound = bind(context, &function, positional, keywords)?;
+        let bound = bind(context, &function, &code, positional, keywords)?;
         context.with_temporary_roots(&bound, |context| {
-            if matches!(function.kind, crate::object::FunctionKind::Generator { .. }) {
+            if matches!(code.kind, crate::object::FunctionKind::Generator { .. }) {
                 return context.new_generator(callable, &bound);
             }
             let mut output = RValue::NONE;
-            // SAFETY: function objects are created only from code addresses using
+            // SAFETY: code objects are created only from code addresses using
             // the stable RNativeFunction ABI and remain valid for the executable.
-            let native: RNativeFunction = unsafe { std::mem::transmute(function.code_address) };
+            let native: RNativeFunction = unsafe { std::mem::transmute(code.code_address) };
             // SAFETY: all pointers describe live storage for the duration of the
             // call, and the context pointer uses the ABI's opaque representation.
             context.push_active_call(callable, bound.first().copied());
@@ -523,6 +576,341 @@ pub(crate) fn invoke_prepared(
     context.with_temporary_roots(&roots, |context| {
         invoke(context, callable, &positional, &keywords)
     })
+}
+
+fn take_stop_iteration_value(context: &mut RimeraContext) -> Option<RValue> {
+    let exception = context.raised?;
+    if context.exception_type_name(exception) != Some("StopIteration") {
+        return None;
+    }
+    let value = match context.heap.get(exception) {
+        Some(HeapObject::Exception(exception)) => match context.heap.get(exception.arguments) {
+            Some(HeapObject::Tuple(arguments)) => {
+                arguments.first().copied().unwrap_or(RValue::NONE)
+            }
+            _ => RValue::NONE,
+        },
+        _ => RValue::NONE,
+    };
+    let _ = context.consume_exception_type("StopIteration");
+    Some(value)
+}
+
+pub(crate) fn generator_delegate_start(
+    context: &mut RimeraContext,
+    iterator: RValue,
+) -> Result<(RValue, RGeneratorDelegateOutcome), String> {
+    if matches!(context.heap.get(iterator), Some(HeapObject::Generator(_))) {
+        return match context.resume_generator(iterator, RGeneratorOperation::Next, RValue::NONE)? {
+            crate::context::GeneratorResume {
+                value,
+                outcome: RGeneratorOutcome::Yielded,
+            } => Ok((value, RGeneratorDelegateOutcome::Yielded)),
+            crate::context::GeneratorResume {
+                value,
+                outcome: RGeneratorOutcome::Returned,
+            } => Ok((value, RGeneratorDelegateOutcome::Completed)),
+        };
+    }
+    if matches!(context.heap.get(iterator), Some(HeapObject::Iterator(_))) {
+        return match crate::operations::iterator_next(context, iterator)? {
+            Some(value) => Ok((value, RGeneratorDelegateOutcome::Yielded)),
+            None => Ok((RValue::NONE, RGeneratorDelegateOutcome::Completed)),
+        };
+    }
+    match context.invoke_special_method(iterator, "__next__", &[]) {
+        Ok(Some(value)) => Ok((value, RGeneratorDelegateOutcome::Yielded)),
+        Ok(None) => context.raise_error("TypeError", "object is not an iterator"),
+        Err(error) => {
+            if let Some(value) = take_stop_iteration_value(context) {
+                Ok((value, RGeneratorDelegateOutcome::Completed))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn delegate_method(
+    context: &mut RimeraContext,
+    iterator: RValue,
+    name: &str,
+) -> Result<Option<RValue>, String> {
+    match context.attribute_get(iterator, name) {
+        Ok(method) => Ok(Some(method)),
+        Err(error) if context.raised.is_none() => {
+            if name == "throw" || name == "close" {
+                Ok(None)
+            } else {
+                context.raise_error("AttributeError", error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn generator_delegate_resume(
+    context: &mut RimeraContext,
+    iterator: RValue,
+    operation: RGeneratorOperation,
+    input: RValue,
+) -> Result<(RValue, RGeneratorDelegateOutcome), String> {
+    if matches!(operation, RGeneratorOperation::Next)
+        || (matches!(operation, RGeneratorOperation::Send) && input == RValue::NONE)
+    {
+        return generator_delegate_start(context, iterator);
+    }
+
+    let injected = if matches!(
+        operation,
+        RGeneratorOperation::Throw | RGeneratorOperation::Close
+    ) {
+        let raised = context.raised.take();
+        context.exception = None;
+        raised
+    } else {
+        None
+    };
+
+    let result = match operation {
+        RGeneratorOperation::Send => {
+            let method = delegate_method(context, iterator, "send")?
+                .ok_or_else(|| "delegate has no send method".to_owned())?;
+            context.with_temporary_roots(&[iterator, method, input], |context| {
+                invoke(context, method, &[input], &[])
+            })
+        }
+        RGeneratorOperation::Throw => {
+            let Some(method) = delegate_method(context, iterator, "throw")? else {
+                if let Some(injected) = injected {
+                    context.raise_value(injected, None, false)?;
+                }
+                return Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate));
+            };
+            context.with_temporary_roots(&[iterator, method, input], |context| {
+                invoke(context, method, &[input], &[])
+            })
+        }
+        RGeneratorOperation::Close => {
+            let Some(method) = delegate_method(context, iterator, "close")? else {
+                if let Some(injected) = injected {
+                    context.raise_value(injected, None, false)?;
+                }
+                return Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate));
+            };
+            let close_result = context.with_temporary_roots(&[iterator, method], |context| {
+                invoke(context, method, &[], &[])
+            });
+            match close_result {
+                Ok(_) => {
+                    if let Some(injected) = injected {
+                        context.raise_value(injected, None, false)?;
+                    }
+                    return Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        RGeneratorOperation::Next => unreachable!("next delegation returned early"),
+    };
+
+    match result {
+        Ok(value) => Ok((value, RGeneratorDelegateOutcome::Yielded)),
+        Err(error) => {
+            if let Some(value) = take_stop_iteration_value(context) {
+                Ok((value, RGeneratorDelegateOutcome::Completed))
+            } else if context.raised.is_some() {
+                Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn generator_resume_value(
+    context: &mut RimeraContext,
+    generator: RValue,
+    operation: rimera_abi::RGeneratorOperation,
+    input: RValue,
+) -> Result<RValue, String> {
+    match context.resume_generator(generator, operation, input)? {
+        crate::context::GeneratorResume {
+            value,
+            outcome: rimera_abi::RGeneratorOutcome::Yielded,
+        } => Ok(value),
+        crate::context::GeneratorResume {
+            value,
+            outcome: rimera_abi::RGeneratorOutcome::Returned,
+        } => {
+            context.raise_stop_iteration(value)?;
+            Err("generator exhausted".to_owned())
+        }
+    }
+}
+
+fn invoke_generator_iter(
+    _context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err("generator.__iter__() takes no arguments".to_owned());
+    }
+    Ok(positional[0])
+}
+
+fn invoke_generator_next(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err("generator.__next__() takes no arguments".to_owned());
+    }
+    generator_resume_value(
+        context,
+        positional[0],
+        rimera_abi::RGeneratorOperation::Next,
+        RValue::NONE,
+    )
+}
+
+fn invoke_generator_send(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 2 {
+        return Err("generator.send() takes exactly one argument".to_owned());
+    }
+    generator_resume_value(
+        context,
+        positional[0],
+        rimera_abi::RGeneratorOperation::Send,
+        positional[1],
+    )
+}
+
+fn normalize_generator_throw(
+    context: &mut RimeraContext,
+    arguments: &[RValue],
+) -> Result<RValue, String> {
+    if !(1..=3).contains(&arguments.len()) {
+        return Err("generator.throw() takes 1 to 3 arguments".to_owned());
+    }
+    let spec = arguments[0];
+    let value = arguments.get(1).copied().unwrap_or(RValue::NONE);
+    let traceback = arguments.get(2).copied().unwrap_or(RValue::NONE);
+    let exception = if matches!(context.heap.get(spec), Some(HeapObject::Exception(_))) {
+        if value != RValue::NONE && value != spec {
+            return context.raise_error(
+                "TypeError",
+                "instance exception may not have a separate value",
+            );
+        }
+        spec
+    } else if matches!(context.heap.get(spec), Some(HeapObject::Type(_))) {
+        let base_exception = context
+            .builtin_type("BaseException")
+            .ok_or_else(|| "BaseException type is missing".to_owned())?;
+        if !context.is_subclass(spec, base_exception)? {
+            return context.raise_error(
+                "TypeError",
+                "exceptions must be classes or instances deriving from BaseException",
+            );
+        }
+        if value != RValue::NONE
+            && matches!(context.heap.get(value), Some(HeapObject::Exception(_)))
+            && context.is_instance(value, spec)?
+        {
+            value
+        } else if value == RValue::NONE {
+            invoke(context, spec, &[], &[])?
+        } else {
+            invoke(context, spec, &[value], &[])?
+        }
+    } else {
+        return context.raise_error(
+            "TypeError",
+            "exceptions must be classes or instances deriving from BaseException",
+        );
+    };
+    if traceback != RValue::NONE {
+        context.attribute_set(exception, "__traceback__", traceback)?;
+    }
+    Ok(exception)
+}
+
+fn invoke_generator_throw(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || !(2..=4).contains(&positional.len()) {
+        return Err("generator.throw() takes 1 to 3 arguments".to_owned());
+    }
+    let generator = positional[0];
+    let exception = context.with_temporary_roots(&[generator], |context| {
+        normalize_generator_throw(context, &positional[1..])
+    })?;
+    context.with_temporary_roots(&[generator, exception], |context| {
+        generator_resume_value(
+            context,
+            generator,
+            rimera_abi::RGeneratorOperation::Throw,
+            exception,
+        )
+    })
+}
+
+fn invoke_generator_close(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err("generator.close() takes no arguments".to_owned());
+    }
+    match context.resume_generator(
+        positional[0],
+        rimera_abi::RGeneratorOperation::Close,
+        RValue::NONE,
+    )? {
+        crate::context::GeneratorResume {
+            outcome: rimera_abi::RGeneratorOutcome::Yielded,
+            ..
+        } => context.raise_error("RuntimeError", "generator ignored GeneratorExit"),
+        crate::context::GeneratorResume {
+            outcome: rimera_abi::RGeneratorOutcome::Returned,
+            ..
+        } => Ok(RValue::NONE),
+    }
+}
+
+fn invoke_exception_with_traceback(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 2 {
+        return Err("with_traceback() takes exactly one argument".to_owned());
+    }
+    let receiver = positional[0];
+    let traceback = positional[1];
+    if !matches!(context.heap.get(receiver), Some(HeapObject::Exception(_))) {
+        return Err("with_traceback() receiver is not an exception".to_owned());
+    }
+    if traceback != RValue::NONE
+        && !matches!(context.heap.get(traceback), Some(HeapObject::Traceback(_)))
+    {
+        return context.raise_error("TypeError", "__traceback__ must be a traceback or None");
+    }
+    let Some(HeapObject::Exception(exception)) = context.heap.get_mut(receiver) else {
+        unreachable!("exception receiver was checked");
+    };
+    exception.traceback = (traceback != RValue::NONE).then_some(traceback);
+    Ok(receiver)
 }
 
 fn invoke_abs(
@@ -1023,6 +1411,102 @@ fn invoke_float_hex(
         unreachable!("float receiver was validated above");
     };
     crate::operations::string(context, &python_float_hex(*value))
+}
+
+fn parse_hex_float(text: &str) -> Result<f64, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("invalid hexadecimal floating-point string".to_owned());
+    }
+    let (negative, body) = if let Some(rest) = text.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = text.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, text)
+    };
+    let lower = body.to_ascii_lowercase();
+    let special = match lower.as_str() {
+        "inf" | "infinity" => Some(f64::INFINITY),
+        "nan" => Some(f64::NAN),
+        _ => None,
+    };
+    if let Some(mut value) = special {
+        if negative {
+            value = -value;
+        }
+        return Ok(value);
+    }
+    let body = lower.strip_prefix("0x").unwrap_or(&lower);
+    let (mantissa, exponent) = match body.split_once('p') {
+        Some((mantissa, exponent)) => {
+            if exponent.is_empty() {
+                return Err("invalid hexadecimal floating-point string".to_owned());
+            }
+            let exponent = exponent
+                .parse::<i32>()
+                .map_err(|_| "invalid hexadecimal floating-point string".to_owned())?;
+            (mantissa, exponent)
+        }
+        None => (body, 0),
+    };
+    if mantissa.matches('.').count() > 1 {
+        return Err("invalid hexadecimal floating-point string".to_owned());
+    }
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return Err("invalid hexadecimal floating-point string".to_owned());
+    }
+    let mut value = 0.0_f64;
+    let mut digits = 0_usize;
+    for character in whole.chars().chain(fraction.chars()) {
+        let digit = character
+            .to_digit(16)
+            .ok_or_else(|| "invalid hexadecimal floating-point string".to_owned())?;
+        value = value.mul_add(16.0, f64::from(digit));
+        digits += 1;
+    }
+    if digits == 0 {
+        return Err("invalid hexadecimal floating-point string".to_owned());
+    }
+    let fractional_bits = i32::try_from(fraction.len())
+        .map_err(|_| "hexadecimal floating-point string is too large".to_owned())?
+        .saturating_mul(4);
+    value *= 2.0_f64.powi(exponent.saturating_sub(fractional_bits));
+    if negative {
+        value = -value;
+    }
+    Ok(value)
+}
+
+fn invoke_float_fromhex(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 2 {
+        return Err("float.fromhex() takes exactly one argument".to_owned());
+    }
+    let class = positional[0];
+    let text = match context.heap.get(positional[1]) {
+        Some(HeapObject::String(text)) => text.clone(),
+        _ => return context.raise_error("TypeError", "bad argument type for built-in operation"),
+    };
+    let parsed = match parse_hex_float(&text) {
+        Ok(value) => value,
+        Err(message) => return context.raise_error("ValueError", message),
+    };
+    let value = crate::operations::float(context, parsed)?;
+    let float_type = context
+        .builtin_type("float")
+        .ok_or_else(|| "float type is missing".to_owned())?;
+    if class == float_type {
+        Ok(value)
+    } else {
+        context.with_temporary_roots(&[class, value], |context| {
+            invoke(context, class, &[value], &[])
+        })
+    }
 }
 
 fn builtin_text(context: &RimeraContext, value: RValue, what: &str) -> Result<String, String> {
@@ -1847,6 +2331,100 @@ fn attribute_name(context: &RimeraContext, value: RValue) -> Result<String, Stri
     }
 }
 
+fn string_list(context: &mut RimeraContext, names: &[String]) -> Result<RValue, String> {
+    let mut values = Vec::with_capacity(names.len());
+    for name in names {
+        let value = context
+            .with_temporary_roots(&values, |context| crate::operations::string(context, name))?;
+        values.push(value);
+    }
+    context.with_temporary_roots(&values, |context| crate::operations::list(context, &values))
+}
+
+fn invoke_globals(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !positional.is_empty() || !keywords.is_empty() {
+        return Err("globals() takes no arguments".to_owned());
+    }
+    context.initialize_kernel()?;
+    context
+        .globals()
+        .ok_or_else(|| "module globals are unavailable".to_owned())
+}
+
+fn invoke_locals(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !positional.is_empty() || !keywords.is_empty() {
+        return Err("locals() takes no arguments".to_owned());
+    }
+    context.current_locals()
+}
+
+fn invoke_vars(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() > 1 {
+        return Err(format!(
+            "vars expected at most 1 argument, got {}",
+            positional.len()
+        ));
+    }
+    if positional.is_empty() {
+        return context.current_locals();
+    }
+    match context.attribute_get(positional[0], "__dict__") {
+        Ok(value) => Ok(value),
+        Err(error) if context.raised.is_some() => Err(error),
+        Err(_) => context.raise_error("TypeError", "vars() argument must have __dict__ attribute"),
+    }
+}
+
+fn invoke_dir(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() > 1 {
+        return Err(format!(
+            "dir expected at most 1 argument, got {}",
+            positional.len()
+        ));
+    }
+    if positional.is_empty() {
+        let locals = context.current_locals()?;
+        let mut names = context.namespace_names(locals);
+        names.sort();
+        names.dedup();
+        return string_list(context, &names);
+    }
+    let receiver = positional[0];
+    if let Some(method) = context.special_method(receiver, "__dir__")? {
+        let result = context.with_temporary_roots(&[receiver, method], |context| {
+            invoke(context, method, &[], &[])
+        })?;
+        let values = context.with_temporary_roots(&[receiver, result], |context| {
+            crate::operations::collect_iterable(context, result)
+        })?;
+        let list = context
+            .with_temporary_roots(&values, |context| crate::operations::list(context, &values))?;
+        context.with_temporary_roots(&[receiver, result, list], |context| {
+            invoke_list_sort(context, &[list], &[])
+        })?;
+        return Ok(list);
+    }
+    let mut names = context.default_dir_names(receiver)?;
+    names.sort();
+    string_list(context, &names)
+}
+
 fn invoke_getattr(
     context: &mut RimeraContext,
     positional: &[RValue],
@@ -1861,8 +2439,25 @@ fn invoke_getattr(
     let name = attribute_name(context, positional[1])?;
     match context.attribute_get(positional[0], &name) {
         Ok(value) => Ok(value),
-        Err(error) if positional.len() == 3 && error.contains("has no attribute") => {
+        Err(_)
+            if positional.len() == 3
+                && context.raised.is_some_and(|raised| {
+                    context.exception_type_name(raised) == Some("AttributeError")
+                }) =>
+        {
+            context.consume_exception_type("AttributeError");
             Ok(positional[2])
+        }
+        Err(error)
+            if positional.len() == 3
+                && context.raised.is_none()
+                && error.contains("has no attribute") =>
+        {
+            Ok(positional[2])
+        }
+        Err(error) if context.raised.is_some() => Err(error),
+        Err(error) if error.contains("has no attribute") => {
+            context.raise_error("AttributeError", error)
         }
         Err(error) => Err(error),
     }
@@ -1914,7 +2509,17 @@ fn invoke_hasattr(
     let name = attribute_name(context, positional[1])?;
     match context.attribute_get(positional[0], &name) {
         Ok(_) => Ok(RValue::boolean(true)),
-        Err(error) if error.contains("has no attribute") => Ok(RValue::boolean(false)),
+        Err(_)
+            if context.raised.is_some_and(|raised| {
+                context.exception_type_name(raised) == Some("AttributeError")
+            }) =>
+        {
+            context.consume_exception_type("AttributeError");
+            Ok(RValue::boolean(false))
+        }
+        Err(error) if context.raised.is_none() && error.contains("has no attribute") => {
+            Ok(RValue::boolean(false))
+        }
         Err(error) => Err(error),
     }
 }
@@ -1929,7 +2534,7 @@ fn is_callable_value(context: &mut RimeraContext, value: RValue) -> Result<bool,
                 | HeapObject::BoundMethod(_)
                 | HeapObject::PropertyMethod(_)
         )
-    ) || context.special_method(value, "__call__")?.is_some())
+    ) || context.has_special_method_slot(value, "__call__")?)
 }
 
 fn invoke_callable(
@@ -3813,7 +4418,7 @@ fn invoke_sorted(
 }
 
 fn invoke_id(
-    _context: &mut RimeraContext,
+    context: &mut RimeraContext,
     positional: &[RValue],
     keywords: &[(String, RValue)],
 ) -> Result<RValue, String> {
@@ -3821,12 +4426,11 @@ fn invoke_id(
         return Err("id() takes exactly one argument".to_owned());
     }
     let value = positional[0];
-    let identity = if value.tag == rimera_abi::RTag::Handle as u32 {
-        value.payload as i64
-    } else {
-        ((u64::from(value.tag) << 32) | value.payload) as i64
-    };
-    Ok(RValue::small_int(identity))
+    // Stable identity token for the complete opaque value, not a machine
+    // address. Generation-bearing handles therefore cannot collide with
+    // immediate values that happen to share the same payload bits.
+    let identity = (BigInt::from(value.tag) << 64) | BigInt::from(value.payload);
+    crate::operations::store_integer(context, identity)
 }
 
 fn invoke_ascii(
@@ -3875,6 +4479,32 @@ fn invoke_next(
             "next expected 1 or 2 arguments, got {}",
             positional.len()
         ));
+    }
+    if matches!(
+        context.heap.get(positional[0]),
+        Some(HeapObject::Generator(_))
+    ) {
+        return match context.resume_generator(
+            positional[0],
+            rimera_abi::RGeneratorOperation::Next,
+            RValue::NONE,
+        )? {
+            crate::context::GeneratorResume {
+                value,
+                outcome: rimera_abi::RGeneratorOutcome::Yielded,
+            } => Ok(value),
+            crate::context::GeneratorResume {
+                outcome: rimera_abi::RGeneratorOutcome::Returned,
+                ..
+            } if positional.len() == 2 => Ok(positional[1]),
+            crate::context::GeneratorResume {
+                value,
+                outcome: rimera_abi::RGeneratorOutcome::Returned,
+            } => {
+                context.raise_stop_iteration(value)?;
+                Err("generator exhausted".to_owned())
+            }
+        };
     }
     match crate::operations::iterator_next(context, positional[0])? {
         Some(value) => Ok(value),
@@ -4026,7 +4656,7 @@ fn invoke_isinstance(
         ));
     }
     Ok(RValue::boolean(
-        context.is_instance(positional[0], positional[1])?,
+        context.is_instance_reflective(positional[0], positional[1])?,
     ))
 }
 
@@ -4045,18 +4675,19 @@ fn invoke_issubclass(
         ));
     }
     Ok(RValue::boolean(
-        context.is_subclass(positional[0], positional[1])?,
+        context.is_subclass_reflective(positional[0], positional[1])?,
     ))
 }
 
 fn bind(
     context: &mut RimeraContext,
     function: &FunctionObject,
+    code: &CodeObject,
     positional: &[RValue],
     keywords: &[(String, RValue)],
 ) -> Result<Vec<RValue>, String> {
-    let mut bound = vec![None; function.parameters.len()];
-    let fixed = function
+    let mut bound = vec![None; code.parameters.len()];
+    let fixed = code
         .parameters
         .iter()
         .enumerate()
@@ -4068,11 +4699,11 @@ fn bind(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    let varargs = function
+    let varargs = code
         .parameters
         .iter()
         .position(|parameter| parameter.kind == ParameterKind::VarArgs);
-    let var_keywords = function
+    let var_keywords = code
         .parameters
         .iter()
         .position(|parameter| parameter.kind == ParameterKind::VarKeywords);
@@ -4082,13 +4713,13 @@ fn bind(
     }
     let mut extra_keywords = Vec::new();
     for (name, value) in keywords {
-        let matching = function
+        let matching = code
             .parameters
             .iter()
             .position(|parameter| parameter.name == *name);
         match matching {
             Some(index)
-                if function.parameters[index].kind == ParameterKind::PositionalOnly
+                if code.parameters[index].kind == ParameterKind::PositionalOnly
                     && var_keywords.is_none() =>
             {
                 return Err(format!(
@@ -4098,7 +4729,7 @@ fn bind(
             }
             Some(index)
                 if matches!(
-                    function.parameters[index].kind,
+                    code.parameters[index].kind,
                     ParameterKind::PositionalOrKeyword | ParameterKind::KeywordOnly
                 ) =>
             {
@@ -4120,7 +4751,7 @@ fn bind(
     }
 
     if positional.len() > fixed.len() && varargs.is_none() {
-        let keyword_only = function
+        let keyword_only = code
             .parameters
             .iter()
             .enumerate()
@@ -4173,12 +4804,37 @@ fn bind(
         })?);
     }
 
+    let positional_defaults = function
+        .defaults
+        .and_then(|defaults| match context.heap.get(defaults) {
+            Some(HeapObject::Tuple(values)) => Some(values.to_vec()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let effective_positional_defaults = positional_defaults.len().min(fixed.len());
+    let positional_defaults_start = fixed.len().saturating_sub(effective_positional_defaults);
+    let positional_defaults_value_start = positional_defaults
+        .len()
+        .saturating_sub(effective_positional_defaults);
+    for (position, parameter_index) in fixed.iter().copied().enumerate() {
+        if bound[parameter_index].is_none() && position >= positional_defaults_start {
+            let default_index =
+                positional_defaults_value_start + position - positional_defaults_start;
+            bound[parameter_index] = positional_defaults.get(default_index).copied();
+        }
+    }
+    for (index, parameter) in code.parameters.iter().enumerate() {
+        if bound[index].is_none()
+            && parameter.kind == ParameterKind::KeywordOnly
+            && let Some(defaults) = function.keyword_defaults
+        {
+            bound[index] = context.namespace_value(defaults, &parameter.name);
+        }
+    }
+
     let mut missing_positional = Vec::new();
     let mut missing_keyword_only = Vec::new();
-    for (index, parameter) in function.parameters.iter().enumerate() {
-        if bound[index].is_none() {
-            bound[index] = parameter.default;
-        }
+    for (index, parameter) in code.parameters.iter().enumerate() {
         if bound[index].is_none()
             && !matches!(
                 parameter.kind,

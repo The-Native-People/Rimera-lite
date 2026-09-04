@@ -94,6 +94,15 @@ pub enum RGeneratorOutcome {
     Returned = 1,
 }
 
+/// Result of forwarding one operation through a `yield from` delegate.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RGeneratorDelegateOutcome {
+    Yielded = 0,
+    Completed = 1,
+    Propagate = 2,
+}
+
 /// Native protocol identifier for a unary Python operation.
 ///
 /// The value is part of the compiler/runtime contract: MIR and generated code
@@ -191,6 +200,28 @@ impl TryFrom<u8> for RParameterKind {
     }
 }
 
+/// Python 3.12 PEP 695 parameter family transported by the native metadata ABI.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RTypeParameterKind {
+    TypeVar = 0,
+    TypeVarTuple = 1,
+    ParamSpec = 2,
+}
+
+impl TryFrom<u8> for RTypeParameterKind {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::TypeVar),
+            1 => Ok(Self::TypeVarTuple),
+            2 => Ok(Self::ParamSpec),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Source-ordered call-site argument part transported between MIR/codegen and
 /// the runtime accumulator. Final binding still happens through `rimera_call`'s
 /// authoritative Python binder.
@@ -234,6 +265,34 @@ pub struct RParameterSpec {
     pub has_default: u8,
     pub reserved: [u8; 6],
     pub default: RValue,
+}
+
+/// One UTF-8 identifier transported as part of immutable code metadata.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RNameSpec {
+    pub name: *const u8,
+    pub name_len: usize,
+}
+
+/// Compiler-owned Python-visible metadata for one native code object.
+///
+/// Native code addresses are intentionally not part of this public metadata
+/// record: the runtime receives the executable address separately and keeps it
+/// opaque inside its managed code object.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RCodeMetadataSpec {
+    pub filename: *const u8,
+    pub filename_len: usize,
+    pub first_line: u32,
+    pub reserved: u32,
+    pub local_names: *const RNameSpec,
+    pub local_name_len: usize,
+    pub cell_names: *const RNameSpec,
+    pub cell_name_len: usize,
+    pub free_names: *const RNameSpec,
+    pub free_name_len: usize,
 }
 
 #[repr(C)]
@@ -301,6 +360,8 @@ mod tests {
         assert_eq!(RTag::Handle as u32, 3);
         assert_eq!(size_of::<RCallArguments>(), 32);
         assert_eq!(size_of::<RKeywordArgument>(), 32);
+        assert_eq!(size_of::<RNameSpec>(), 16);
+        assert_eq!(size_of::<RCodeMetadataSpec>(), 72);
     }
 
     #[test]
