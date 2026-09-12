@@ -6,10 +6,6 @@ use rimera_abi::RParameterKind;
 use crate::core::{Diagnostic, DiagnosticSet, Span};
 use crate::{hir, syntax};
 
-fn is_pulled_forward_native_module(name: &str) -> bool {
-    matches!(name, "inspect" | "weakref")
-}
-
 fn hir_type_parameters(parameters: &[syntax::TypeParameter]) -> Vec<hir::TypeParameter> {
     parameters
         .iter()
@@ -26,8 +22,19 @@ fn hir_type_parameters(parameters: &[syntax::TypeParameter]) -> Vec<hir::TypePar
 }
 
 pub fn analyze(path: &Path, module: &syntax::Module) -> Result<hir::Module, DiagnosticSet> {
+    analyze_with_dynamic_compilation(path, module, false)
+}
+
+/// Runs the authoritative semantic analyzer with the Gate 11 dynamic-compiler
+/// capability explicitly selected by the build. The default `analyze` entry
+/// preserves the static-build boundary used by all earlier gates.
+pub fn analyze_with_dynamic_compilation(
+    path: &Path,
+    module: &syntax::Module,
+    allow_dynamic_compilation: bool,
+) -> Result<hir::Module, DiagnosticSet> {
     let raw = RawScope::module(&module.statements);
-    let builtin_print_stable = !raw.mutates_global_name("print", true);
+    let builtin_print_stable = !allow_dynamic_compilation && !raw.mutates_global_name("print", true);
     let dynamic_builtin_stable =
         ["eval", "exec", "compile"].map(|name| !raw.mutates_global_name(name, true));
     let plan = resolve_scope(path, raw, &[])?;
@@ -37,11 +44,13 @@ pub fn analyze(path: &Path, module: &syntax::Module) -> Result<hir::Module, Diag
         definition_type_params: BTreeSet::new(),
         child_index: 0,
         in_function: false,
+        in_async_function: false,
         loop_depth: 0,
         in_except_star: false,
         handler_depth: 0,
         builtin_print_stable,
         dynamic_builtin_stable,
+        allow_dynamic_compilation,
         class_depth: 0,
     };
     Ok(hir::Module {
@@ -64,6 +73,7 @@ struct RawScope {
     nonlocals: BTreeSet<String>,
     global_spans: BTreeMap<String, Span>,
     nonlocal_spans: BTreeMap<String, Span>,
+    contains_yield: bool,
     children: Vec<RawScope>,
 }
 
@@ -113,6 +123,7 @@ impl RawScope {
             nonlocals: BTreeSet::new(),
             global_spans: BTreeMap::new(),
             nonlocal_spans: BTreeMap::new(),
+            contains_yield: false,
             children: Vec::new(),
         }
     }
@@ -177,6 +188,7 @@ impl RawScope {
                     parameters,
                     return_annotation,
                     body,
+                    is_async: _,
                 } => {
                     self.record_assigned(name);
                     for decorator in decorators {
@@ -240,6 +252,13 @@ impl RawScope {
                         self.record_assigned(&alias.bind_name);
                     }
                 }
+                syntax::StatementKind::ImportFrom { aliases, .. } => {
+                    for alias in aliases {
+                        if alias.module != "*" {
+                            self.record_assigned(&alias.bind_name);
+                        }
+                    }
+                }
                 syntax::StatementKind::Break | syntax::StatementKind::Continue => {}
                 syntax::StatementKind::Expression(value) => self.scan_expression(value),
                 syntax::StatementKind::Global(names) => {
@@ -286,6 +305,19 @@ impl RawScope {
                     self.scan_statements(else_body);
                     self.scan_statements(finally_body);
                 }
+                syntax::StatementKind::With {
+                    items,
+                    body,
+                    is_async: _,
+                } => {
+                    for item in items {
+                        self.scan_expression(&item.context);
+                        if let Some(target) = &item.target {
+                            self.scan_target(target);
+                        }
+                    }
+                    self.scan_statements(body);
+                }
                 syntax::StatementKind::Print { values } => {
                     values.iter().for_each(|value| self.scan_expression(value));
                 }
@@ -307,6 +339,7 @@ impl RawScope {
                     iterable,
                     body,
                     else_body,
+                    is_async: _,
                 } => {
                     self.scan_target(target);
                     self.scan_expression(iterable);
@@ -480,6 +513,7 @@ impl RawScope {
                     iterable,
                     body,
                     else_body,
+                    is_async: _,
                 } => {
                     self.scan_target(target);
                     self.scan_expression(iterable);
@@ -505,6 +539,19 @@ impl RawScope {
                     }
                     self.scan_class_statements(else_body);
                     self.scan_class_statements(finally_body);
+                }
+                syntax::StatementKind::With {
+                    items,
+                    body,
+                    is_async: _,
+                } => {
+                    for item in items {
+                        self.scan_expression(&item.context);
+                        if let Some(target) = &item.target {
+                            self.scan_target(target);
+                        }
+                    }
+                    self.scan_class_statements(body);
                 }
                 syntax::StatementKind::Raise { exception, cause } => {
                     if let Some(exception) = exception {
@@ -541,6 +588,7 @@ impl RawScope {
                     parameters,
                     return_annotation,
                     body,
+                    is_async: _,
                 } => {
                     self.record_assigned(name);
                     for decorator in decorators {
@@ -601,6 +649,13 @@ impl RawScope {
                 syntax::StatementKind::Import { aliases } => {
                     for alias in aliases {
                         self.record_assigned(&alias.bind_name);
+                    }
+                }
+                syntax::StatementKind::ImportFrom { aliases, .. } => {
+                    for alias in aliases {
+                        if alias.module != "*" {
+                            self.record_assigned(&alias.bind_name);
+                        }
                     }
                 }
                 syntax::StatementKind::Match { subject, cases } => {
@@ -678,11 +733,13 @@ impl RawScope {
                 self.scan_expression(value);
             }
             syntax::ExpressionKind::Yield { value } => {
+                self.contains_yield = true;
                 if let Some(value) = value {
                     self.scan_expression(value);
                 }
             }
-            syntax::ExpressionKind::YieldFrom { value } => self.scan_expression(value),
+            syntax::ExpressionKind::YieldFrom { value }
+            | syntax::ExpressionKind::Await { value } => self.scan_expression(value),
             syntax::ExpressionKind::Comprehension {
                 element,
                 key,
@@ -907,7 +964,8 @@ impl RawScope {
                     self.scan_expression_in_comprehension(value, walrus, globals);
                 }
             }
-            syntax::ExpressionKind::YieldFrom { value } => {
+            syntax::ExpressionKind::YieldFrom { value }
+            | syntax::ExpressionKind::Await { value } => {
                 self.scan_expression_in_comprehension(value, walrus, globals);
             }
             syntax::ExpressionKind::None
@@ -1024,7 +1082,7 @@ fn collect_comprehension_walrus_names(
                 collect_comprehension_walrus_names(value, names);
             }
         }
-        syntax::ExpressionKind::YieldFrom { value } => {
+        syntax::ExpressionKind::YieldFrom { value } | syntax::ExpressionKind::Await { value } => {
             collect_comprehension_walrus_names(value, names);
         }
         syntax::ExpressionKind::Name(_)
@@ -1308,7 +1366,7 @@ fn validate_comprehension_expression(
                 )?;
             }
         }
-        syntax::ExpressionKind::YieldFrom { value } => {
+        syntax::ExpressionKind::YieldFrom { value } | syntax::ExpressionKind::Await { value } => {
             validate_comprehension_expression(
                 path,
                 value,
@@ -1340,6 +1398,7 @@ struct ScopePlan {
     free: BTreeSet<String>,
     explicit_globals: BTreeSet<String>,
     nonlocals: BTreeSet<String>,
+    contains_yield: bool,
     children: Vec<ScopePlan>,
 }
 
@@ -1457,6 +1516,7 @@ fn resolve_scope(
         free,
         explicit_globals: raw.explicit_globals,
         nonlocals: raw.nonlocals,
+        contains_yield: raw.contains_yield,
         children,
     })
 }
@@ -1467,11 +1527,13 @@ struct Analyzer<'a> {
     definition_type_params: BTreeSet<String>,
     child_index: usize,
     in_function: bool,
+    in_async_function: bool,
     loop_depth: usize,
     in_except_star: bool,
     handler_depth: usize,
     builtin_print_stable: bool,
     dynamic_builtin_stable: [bool; 3],
+    allow_dynamic_compilation: bool,
     class_depth: usize,
 }
 
@@ -1575,6 +1637,7 @@ impl Analyzer<'_> {
                 parameters,
                 return_annotation,
                 body,
+                is_async,
             } => {
                 let decorators = decorators
                     .iter()
@@ -1620,11 +1683,13 @@ impl Analyzer<'_> {
                     definition_type_params: BTreeSet::new(),
                     child_index: 0,
                     in_function: true,
+                    in_async_function: *is_async,
                     loop_depth: 0,
                     in_except_star: false,
                     handler_depth: 0,
                     builtin_print_stable: self.builtin_print_stable,
                     dynamic_builtin_stable: self.dynamic_builtin_stable,
+                    allow_dynamic_compilation: self.allow_dynamic_compilation,
                     class_depth: 0,
                 };
                 let parameters = parameters
@@ -1649,6 +1714,7 @@ impl Analyzer<'_> {
                 hir::StatementKind::FunctionDef {
                     name: name.clone(),
                     binding: self.binding(name),
+                    is_async: *is_async,
                     type_params: hir_type_parameters(type_params),
                     decorators,
                     parameters,
@@ -1704,27 +1770,52 @@ impl Analyzer<'_> {
                     value,
                 }
             }
-            syntax::StatementKind::Import { aliases } => {
-                for alias in aliases {
-                    if !is_pulled_forward_native_module(&alias.module) {
-                        return Err(capability_error(
-                            self.path,
-                            statement.span,
-                            "RIM-CAP-001",
-                            format!(
-                                "module `{}` is not registered in the pulled-forward native import foundation",
-                                alias.module
-                            ),
-                        ));
-                    }
+            syntax::StatementKind::Import { aliases } => hir::StatementKind::Import {
+                aliases: aliases
+                    .iter()
+                    .map(|alias| hir::ImportAlias {
+                        module: alias.module.clone(),
+                        bind_name: alias.bind_name.clone(),
+                        explicit_alias: alias.explicit_alias,
+                        binding: self.binding(&alias.bind_name),
+                    })
+                    .collect(),
+            },
+            syntax::StatementKind::ImportFrom {
+                module,
+                level,
+                aliases,
+            } => {
+                if *level != 0 {
+                    return Err(sema_error_at(
+                        self.path,
+                        statement.span,
+                        "relative imports require package resolution",
+                    ));
                 }
-                hir::StatementKind::Import {
+                let module = module.clone().ok_or_else(|| {
+                    sema_error_at(self.path, statement.span, "from import requires a module")
+                })?;
+                if self.in_function && aliases.iter().any(|alias| alias.module == "*") {
+                    return Err(sema_error_at(
+                        self.path,
+                        statement.span,
+                        "import * only allowed at module level",
+                    ));
+                }
+                hir::StatementKind::ImportFrom {
+                    module,
                     aliases: aliases
                         .iter()
                         .map(|alias| hir::ImportAlias {
                             module: alias.module.clone(),
                             bind_name: alias.bind_name.clone(),
-                            binding: self.binding(&alias.bind_name),
+                            explicit_alias: alias.explicit_alias,
+                            binding: if alias.module == "*" {
+                                hir::Binding::Global
+                            } else {
+                                self.binding(&alias.bind_name)
+                            },
                         })
                         .collect(),
                 }
@@ -1740,6 +1831,13 @@ impl Analyzer<'_> {
                     return Err(sema_error(
                         self.path,
                         "`return` is not allowed in an `except*` handler",
+                    ));
+                }
+                if self.in_async_function && self.plan.contains_yield && value.is_some() {
+                    return Err(sema_error_at(
+                        self.path,
+                        statement.span,
+                        "'return' with value in async generator",
                     ));
                 }
                 hir::StatementKind::Return {
@@ -1856,6 +1954,41 @@ impl Analyzer<'_> {
                     is_star: *is_star,
                 }
             }
+            syntax::StatementKind::With {
+                items,
+                body,
+                is_async,
+            } => {
+                let items = items
+                    .iter()
+                    .map(|item| {
+                        let target = item
+                            .target
+                            .as_ref()
+                            .map(|target| self.target(target))
+                            .transpose()?;
+                        if let Some(target) = &target {
+                            self.validate_assignment_target(target)?;
+                        }
+                        Ok(hir::WithItem {
+                            context: self.expression(&item.context)?,
+                            target,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DiagnosticSet>>()?;
+                if *is_async && !self.in_async_function {
+                    return Err(sema_error_at(
+                        self.path,
+                        statement.span,
+                        "'async with' outside async function",
+                    ));
+                }
+                hir::StatementKind::With {
+                    items,
+                    body: self.statements(body)?,
+                    is_async: *is_async,
+                }
+            }
             syntax::StatementKind::Global(_) | syntax::StatementKind::Nonlocal(_) => {
                 return Ok(None);
             }
@@ -1889,6 +2022,7 @@ impl Analyzer<'_> {
                 iterable,
                 body,
                 else_body,
+                is_async,
             } => {
                 let target = self.target(target)?;
                 self.validate_loop_target(&target)?;
@@ -1896,11 +2030,19 @@ impl Analyzer<'_> {
                 self.loop_depth += 1;
                 let body = self.statements(body);
                 self.loop_depth -= 1;
+                if *is_async && !self.in_async_function {
+                    return Err(sema_error_at(
+                        self.path,
+                        statement.span,
+                        "'async for' outside async function",
+                    ));
+                }
                 hir::StatementKind::For {
                     target,
                     iterable,
                     body: body?,
                     else_body: self.statements(else_body)?,
+                    is_async: *is_async,
                 }
             }
             syntax::StatementKind::Match { subject, cases } => hir::StatementKind::Match {
@@ -1946,11 +2088,13 @@ impl Analyzer<'_> {
             definition_type_params: BTreeSet::new(),
             child_index: 0,
             in_function: false,
+            in_async_function: false,
             loop_depth: 0,
             in_except_star: false,
             handler_depth: 0,
             builtin_print_stable: self.builtin_print_stable,
             dynamic_builtin_stable: self.dynamic_builtin_stable,
+            allow_dynamic_compilation: self.allow_dynamic_compilation,
             class_depth: self.class_depth,
         };
         analyzer.class_members(statements)
@@ -2069,26 +2213,84 @@ impl Analyzer<'_> {
                     finally_body: self.class_members(finally_body)?,
                     is_star: *is_star,
                 },
-                syntax::StatementKind::Import { aliases } => {
-                    for alias in aliases {
-                        if !is_pulled_forward_native_module(&alias.module) {
-                            return Err(capability_error(
+                syntax::StatementKind::With {
+                    items,
+                    body,
+                    is_async,
+                } => {
+                    if *is_async {
+                        return Err(sema_error_at(
+                            self.path,
+                            statement.span,
+                            "'async with' outside async function",
+                        ));
+                    }
+                    let items = items
+                        .iter()
+                        .map(|item| {
+                            let target = item
+                                .target
+                                .as_ref()
+                                .map(|target| self.target(target))
+                                .transpose()?;
+                            if let Some(target) = &target {
+                                self.validate_assignment_target(target)?;
+                            }
+                            Ok(hir::WithItem {
+                                context: self.expression(&item.context)?,
+                                target,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, DiagnosticSet>>()?;
+                    hir::ClassMember::With {
+                        items,
+                        body: self.class_members(body)?,
+                    }
+                }
+                syntax::StatementKind::Import { aliases } => hir::ClassMember::Import {
+                    aliases: aliases
+                        .iter()
+                        .map(|alias| hir::ImportAlias {
+                            module: alias.module.clone(),
+                            bind_name: alias.bind_name.clone(),
+                            explicit_alias: alias.explicit_alias,
+                            binding: self.binding(&alias.bind_name),
+                        })
+                        .collect(),
+                },
+                syntax::StatementKind::ImportFrom {
+                    module,
+                    level,
+                    aliases,
+                } => {
+                    if aliases.iter().any(|alias| alias.module == "*") {
+                        return Err(sema_error_at(
+                            self.path,
+                            statement.span,
+                            "import * only allowed at module level",
+                        ));
+                    }
+                    if *level != 0 {
+                        return Err(sema_error_at(
+                            self.path,
+                            statement.span,
+                            "relative imports require package resolution",
+                        ));
+                    }
+                    hir::ClassMember::ImportFrom {
+                        module: module.clone().ok_or_else(|| {
+                            sema_error_at(
                                 self.path,
                                 statement.span,
-                                "RIM-CAP-001",
-                                format!(
-                                    "module `{}` is not registered in the pulled-forward native import foundation",
-                                    alias.module
-                                ),
-                            ));
-                        }
-                    }
-                    hir::ClassMember::Import {
+                                "from import requires a module",
+                            )
+                        })?,
                         aliases: aliases
                             .iter()
                             .map(|alias| hir::ImportAlias {
                                 module: alias.module.clone(),
                                 bind_name: alias.bind_name.clone(),
+                                explicit_alias: alias.explicit_alias,
                                 binding: self.binding(&alias.bind_name),
                             })
                             .collect(),
@@ -2161,6 +2363,7 @@ impl Analyzer<'_> {
                     parameters,
                     return_annotation,
                     body,
+                    is_async,
                 } => {
                     let defaults = parameters
                         .iter()
@@ -2201,11 +2404,13 @@ impl Analyzer<'_> {
                         definition_type_params: BTreeSet::new(),
                         child_index: 0,
                         in_function: true,
+                        in_async_function: *is_async,
                         loop_depth: 0,
                         in_except_star: false,
                         handler_depth: 0,
                         builtin_print_stable: self.builtin_print_stable,
                         dynamic_builtin_stable: self.dynamic_builtin_stable,
+                        allow_dynamic_compilation: self.allow_dynamic_compilation,
                         class_depth: 0,
                     };
                     let parameters = parameters
@@ -2233,6 +2438,7 @@ impl Analyzer<'_> {
                         span: statement.span,
                         name: name.clone(),
                         binding: self.binding(name),
+                        is_async: *is_async,
                         type_params: hir_type_parameters(type_params),
                         decorators: decorators
                             .iter()
@@ -2271,7 +2477,15 @@ impl Analyzer<'_> {
                     iterable,
                     body,
                     else_body,
+                    is_async,
                 } => {
+                    if *is_async {
+                        return Err(sema_error_at(
+                            self.path,
+                            statement.span,
+                            "'async for' outside async function",
+                        ));
+                    }
                     let target = self.target(target)?;
                     self.validate_loop_target(&target)?;
                     let iterable = self.expression(iterable)?;
@@ -2519,11 +2733,13 @@ impl Analyzer<'_> {
                     definition_type_params: BTreeSet::new(),
                     child_index: 0,
                     in_function: true,
+                    in_async_function: false,
                     loop_depth: 0,
                     in_except_star: false,
                     handler_depth: 0,
                     builtin_print_stable: self.builtin_print_stable,
                     dynamic_builtin_stable: self.dynamic_builtin_stable,
+                    allow_dynamic_compilation: self.allow_dynamic_compilation,
                     class_depth: 0,
                 };
                 let parameters = parameters
@@ -2558,6 +2774,7 @@ impl Analyzer<'_> {
                     .iter()
                     .position(|candidate| *candidate == name)
                     && self.dynamic_builtin_stable[index]
+                    && !self.allow_dynamic_compilation
                     && matches!(binding, hir::Binding::Global)
                 {
                     return Err(capability_error(
@@ -2565,7 +2782,7 @@ impl Analyzer<'_> {
                         expression.span,
                         "RIM-CAP-G7-02",
                         format!(
-                            "dynamic Python compilation via `{name}` is not supported by Gate 7"
+                            "dynamic Python compilation via `{name}` requires the `dynamic_compilation` capability"
                         ),
                     ));
                 }
@@ -2652,7 +2869,27 @@ impl Analyzer<'_> {
                         "`yield from` is only valid inside a function",
                     ));
                 }
+                if self.in_async_function {
+                    return Err(sema_error_at(
+                        self.path,
+                        expression.span,
+                        "'yield from' inside async function",
+                    ));
+                }
                 hir::ExpressionKind::YieldFrom {
+                    value: Box::new(self.expression(value)?),
+                }
+            }
+            syntax::ExpressionKind::Await { value } => {
+                if !self.in_async_function {
+                    let message = if self.in_function {
+                        "'await' outside async function"
+                    } else {
+                        "'await' outside function"
+                    };
+                    return Err(sema_error_at(self.path, expression.span, message));
+                }
+                hir::ExpressionKind::Await {
                     value: Box::new(self.expression(value)?),
                 }
             }
@@ -2668,6 +2905,13 @@ impl Analyzer<'_> {
                         "comprehension has no generator clause",
                     ));
                 };
+                if clauses.iter().any(|clause| clause.is_async) && !self.in_async_function {
+                    return Err(sema_error_at(
+                        self.path,
+                        expression.span,
+                        "asynchronous comprehension outside of an asynchronous function",
+                    ));
+                }
                 let mut iteration_names = BTreeSet::new();
                 for clause in clauses {
                     comprehension_target_names(&clause.target, &mut iteration_names);
@@ -2719,11 +2963,13 @@ impl Analyzer<'_> {
                     definition_type_params: BTreeSet::new(),
                     child_index: 0,
                     in_function: true,
+                    in_async_function: self.in_async_function,
                     loop_depth: 0,
                     in_except_star: false,
                     handler_depth: 0,
                     builtin_print_stable: self.builtin_print_stable,
                     dynamic_builtin_stable: self.dynamic_builtin_stable,
+                    allow_dynamic_compilation: self.allow_dynamic_compilation,
                     class_depth: 0,
                 };
                 let clauses = clauses
@@ -2746,6 +2992,7 @@ impl Analyzer<'_> {
                             target,
                             iterable,
                             filters,
+                            is_async: clause.is_async,
                         })
                     })
                     .collect::<Result<Vec<_>, DiagnosticSet>>()?;
@@ -3136,6 +3383,19 @@ fn statement_contains_zero_argument_super(statement: &syntax::Statement) -> bool
                 || contains_zero_argument_super(else_body)
                 || contains_zero_argument_super(finally_body)
         }
+        syntax::StatementKind::With {
+            items,
+            body,
+            is_async: _,
+        } => {
+            items.iter().any(|item| {
+                expression_contains_zero_argument_super(&item.context)
+                    || item
+                        .target
+                        .as_ref()
+                        .is_some_and(target_contains_zero_argument_super)
+            }) || contains_zero_argument_super(body)
+        }
         syntax::StatementKind::Print { values } => {
             values.iter().any(expression_contains_zero_argument_super)
         }
@@ -3178,6 +3438,7 @@ fn statement_contains_zero_argument_super(statement: &syntax::Statement) -> bool
         syntax::StatementKind::FunctionDef { .. }
         | syntax::StatementKind::ClassDef { .. }
         | syntax::StatementKind::Import { .. }
+        | syntax::StatementKind::ImportFrom { .. }
         | syntax::StatementKind::Return { value: None }
         | syntax::StatementKind::Break
         | syntax::StatementKind::Continue
@@ -3295,7 +3556,7 @@ fn expression_contains_zero_argument_super(expression: &syntax::Expression) -> b
         syntax::ExpressionKind::Yield { value } => value
             .as_deref()
             .is_some_and(expression_contains_zero_argument_super),
-        syntax::ExpressionKind::YieldFrom { value } => {
+        syntax::ExpressionKind::YieldFrom { value } | syntax::ExpressionKind::Await { value } => {
             expression_contains_zero_argument_super(value)
         }
         syntax::ExpressionKind::Comprehension {
@@ -3354,11 +3615,13 @@ mod tests {
             plan: &plan,
             child_index: 0,
             in_function: false,
+            in_async_function: false,
             loop_depth: 0,
             in_except_star: false,
             handler_depth: 0,
             builtin_print_stable,
             dynamic_builtin_stable,
+            allow_dynamic_compilation: false,
             class_depth: 0,
             definition_type_params: BTreeSet::new(),
         };

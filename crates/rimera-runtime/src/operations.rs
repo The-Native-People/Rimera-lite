@@ -9,7 +9,7 @@ use crate::RimeraContext;
 use crate::heap::HeapObject;
 use crate::object::{
     BufferLeaseObject, DictionaryViewKind, DictionaryViewObject, IteratorObject, MemoryViewObject,
-    RangeObject, SetObject, ValueDictionaryObject,
+    RangeObject, SetObject, SuspendedKind, ValueDictionaryObject,
 };
 
 fn instance_storage(context: &RimeraContext, value: RValue) -> Option<RValue> {
@@ -272,6 +272,43 @@ pub fn collect_iterable(context: &mut RimeraContext, value: RValue) -> Result<Ve
             }
             Ok(values)
         })
+    })
+}
+
+/// Creates the sequence iterator used by Python's `IMPORT_STAR` instruction.
+///
+/// CPython deliberately indexes `__all__`; an object that only implements
+/// `__iter__` is therefore not sufficient. Keep that distinction here instead
+/// of routing import semantics through the more permissive iterator protocol.
+pub fn import_names_iterator(context: &mut RimeraContext, value: RValue) -> Result<RValue, String> {
+    context.with_temporary_roots(&[value], |context| {
+        let builtin_sequence = matches!(
+            context.heap.get(value),
+            Some(
+                HeapObject::List(_)
+                    | HeapObject::Tuple(_)
+                    | HeapObject::String(_)
+                    | HeapObject::Bytes(_)
+                    | HeapObject::ByteArray(_)
+                    | HeapObject::MemoryView(_)
+                    | HeapObject::Range(_)
+            )
+        );
+        if builtin_sequence {
+            iterator_new(context, value)
+        } else if context.special_method(value, "__getitem__")?.is_some() {
+            context.allocate(HeapObject::Iterator(IteratorObject::SequenceProtocol {
+                source: value,
+                index: 0,
+            }))
+        } else {
+            let value_type = context.type_of(value)?;
+            let type_name = context.type_name(value_type);
+            context.raise_error(
+                "TypeError",
+                format!("'{type_name}' object does not support indexing"),
+            )
+        }
     })
 }
 
@@ -976,6 +1013,112 @@ pub fn range(
         context.allocate(HeapObject::Range(RangeObject { start, stop, step }))
     })
 }
+pub fn await_iterator(context: &mut RimeraContext, value: RValue) -> Result<RValue, String> {
+    context.with_temporary_roots(&[value], |context| {
+        // Native Rimera coroutines retain the Slice 3 direct-await fast path.
+        // The builtin two-argument anext wrapper is itself the iterator driven
+        // by the existing delegation machinery, so neither case performs a
+        // Python-level __await__ lookup or allocates another adapter object.
+        if matches!(
+            context.heap.get(value),
+            Some(HeapObject::AsyncNextAwaitable(_) | HeapObject::AsyncGeneratorOperation(_))
+        ) || matches!(
+            context.heap.get(value),
+            Some(HeapObject::Generator(generator)) if generator.kind == SuspendedKind::Coroutine
+        ) {
+            return Ok(value);
+        }
+
+        let Some(iterator) = context.invoke_special_method(value, "__await__", &[])? else {
+            let value_type = context.type_of(value)?;
+            let type_name = context.type_name(value_type);
+            return context.raise_error(
+                "TypeError",
+                format!("object {type_name} can't be used in 'await' expression"),
+            );
+        };
+
+        context.with_temporary_roots(&[value, iterator], |context| {
+            let valid = match context.heap.get(iterator) {
+                Some(HeapObject::Iterator(_)) => true,
+                Some(HeapObject::Generator(generator)) => {
+                    generator.kind == SuspendedKind::Generator
+                }
+                _ => context.has_special_method_slot(iterator, "__next__")?,
+            };
+            if valid {
+                return Ok(iterator);
+            }
+            let iterator_type = context.type_of(iterator)?;
+            let type_name = context.type_name(iterator_type);
+            context.raise_error(
+                "TypeError",
+                format!("__await__() returned non-iterator of type '{type_name}'"),
+            )
+        })
+    })
+}
+
+pub fn async_iterator_new(context: &mut RimeraContext, value: RValue) -> Result<RValue, String> {
+    context.with_temporary_roots(&[value], |context| {
+        let Some(iterator) = context.invoke_special_method(value, "__aiter__", &[])? else {
+            let value_type = context.type_of(value)?;
+            let type_name = context.type_name(value_type);
+            return context.raise_error(
+                "TypeError",
+                format!("'async for' requires an object with __aiter__ method, got {type_name}"),
+            );
+        };
+        context.with_temporary_roots(&[value, iterator], |context| {
+            if context.has_special_method_slot(iterator, "__anext__")? {
+                return Ok(iterator);
+            }
+            let iterator_type = context.type_of(iterator)?;
+            let type_name = context.type_name(iterator_type);
+            context.raise_error(
+                "TypeError",
+                format!(
+                    "'async for' received an object from __aiter__ that does not implement __anext__: {type_name}"
+                ),
+            )
+        })
+    })
+}
+
+pub fn async_iterator_next_awaitable(
+    context: &mut RimeraContext,
+    iterator: RValue,
+) -> Result<RValue, String> {
+    context.with_temporary_roots(&[iterator], |context| {
+        let Some(awaitable) = context.invoke_special_method(iterator, "__anext__", &[])? else {
+            let iterator_type = context.type_of(iterator)?;
+            let type_name = context.type_name(iterator_type);
+            return context.raise_error(
+                "TypeError",
+                format!("'async for' requires an iterator with __anext__ method, got {type_name}"),
+            );
+        };
+        context.with_temporary_roots(&[iterator, awaitable], |context| {
+            let valid = matches!(
+                context.heap.get(awaitable),
+                Some(HeapObject::AsyncNextAwaitable(_) | HeapObject::AsyncGeneratorOperation(_))
+            ) || matches!(
+                context.heap.get(awaitable),
+                Some(HeapObject::Generator(generator)) if generator.kind == SuspendedKind::Coroutine
+            ) || context.has_special_method_slot(awaitable, "__await__")?;
+            if valid {
+                return Ok(awaitable);
+            }
+            let awaitable_type = context.type_of(awaitable)?;
+            let type_name = context.type_name(awaitable_type);
+            context.raise_error(
+                "TypeError",
+                format!("'async for' received an invalid object from __anext__: {type_name}"),
+            )
+        })
+    })
+}
+
 pub fn iterator_new(context: &mut RimeraContext, value: RValue) -> Result<RValue, String> {
     context.with_temporary_roots(&[value], |context| {
         if let Some(storage) = instance_storage(context, value) {
@@ -1006,8 +1149,14 @@ pub fn iterator_new(context: &mut RimeraContext, value: RValue) -> Result<RValue
                 index: 0,
                 expected_version: collection_version(context, value),
             },
-            Some(HeapObject::Generator(_)) => return Ok(value),
-            Some(HeapObject::Iterator(_)) => return Ok(value),
+            Some(HeapObject::Generator(generator))
+                if generator.kind == SuspendedKind::Generator =>
+            {
+                return Ok(value);
+            }
+            Some(HeapObject::Iterator(_))
+            | Some(HeapObject::AsyncNextAwaitable(_))
+            | Some(HeapObject::AsyncGeneratorOperation(_)) => return Ok(value),
             Some(_) => {
                 if let Some(iterator) = context.invoke_special_method(value, "__iter__", &[])? {
                     if matches!(
@@ -1039,7 +1188,10 @@ pub fn iterator_next(
     context: &mut RimeraContext,
     iterator: RValue,
 ) -> Result<Option<RValue>, String> {
-    if matches!(context.heap.get(iterator), Some(HeapObject::Generator(_))) {
+    if matches!(
+        context.heap.get(iterator),
+        Some(HeapObject::Generator(generator)) if generator.kind == SuspendedKind::Generator
+    ) {
         return match context.resume_generator(iterator, RGeneratorOperation::Next, RValue::NONE)? {
             crate::context::GeneratorResume {
                 value,
@@ -1049,6 +1201,10 @@ pub fn iterator_next(
                 outcome: RGeneratorOutcome::Returned,
                 ..
             } => Ok(None),
+            crate::context::GeneratorResume {
+                outcome: RGeneratorOutcome::Suspended,
+                ..
+            } => Err("synchronous generator produced an async suspension".to_owned()),
         };
     }
     let Some(object) = context.heap.get_mut(iterator) else {
@@ -2000,10 +2156,27 @@ pub fn item_set(
             dictionary.table.insert_new(hash, (index, value));
             return Ok(());
         }
-        let dictionary_key = string_value(context, index).map(ToOwned::to_owned);
-        if let Some(HeapObject::Dictionary(dictionary)) = context.heap.get_mut(collection) {
-            let key = dictionary_key.ok_or_else(|| "dictionary key must be string".to_owned())?;
+        if matches!(
+            context.heap.get(collection),
+            Some(HeapObject::Dictionary(_))
+        ) {
+            let key = string_value(context, index)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| "dictionary key must be string".to_owned())?;
+            let growth = match context.heap.get(collection) {
+                Some(HeapObject::Dictionary(dictionary)) => {
+                    dictionary.managed_growth_for_insert(&key)
+                }
+                _ => unreachable!("dictionary receiver was checked above"),
+            };
+            context.with_temporary_roots(&[collection, index, value], |context| {
+                context.preflight_managed_growth(growth)
+            })?;
+            let Some(HeapObject::Dictionary(dictionary)) = context.heap.get_mut(collection) else {
+                return Err("dictionary disappeared during item assignment".to_owned());
+            };
             dictionary.insert(key, value);
+            context.heap.refresh_managed_bytes();
             return Ok(());
         }
         if let Some(slice) = slice_value(context, index) {
@@ -2149,6 +2322,7 @@ pub fn item_delete(
             let key = dictionary_key.ok_or_else(|| "dictionary key must be string".to_owned())?;
             let removed = dictionary.remove(&key).is_some();
             if removed {
+                context.heap.refresh_managed_bytes();
                 return Ok(());
             }
             return context.raise_error("KeyError", "dictionary key not found");
@@ -5666,6 +5840,8 @@ pub fn truthy(context: &mut RimeraContext, value: RValue) -> Result<bool, String
                 | HeapObject::Function(_)
                 | HeapObject::Code(_)
                 | HeapObject::Generator(_)
+                | HeapObject::AsyncNextAwaitable(_)
+                | HeapObject::AsyncGeneratorOperation(_)
                 | HeapObject::BuiltinFunction(_)
                 | HeapObject::Cell(_)
                 | HeapObject::Exception(_)
@@ -5949,7 +6125,35 @@ pub fn display(context: &RimeraContext, value: RValue) -> Result<String, String>
                 Ok(format!("<function {}>", object.qualified_name))
             }
             Some(HeapObject::Code(object)) => Ok(format!("<code object {}>", object.name)),
-            Some(HeapObject::Generator(_)) => Ok("<generator object>".to_owned()),
+            Some(HeapObject::Generator(object)) => {
+                let kind = object.kind;
+                let function = object.function;
+                let qualified_name_override = object.qualified_name_override.as_deref();
+                let qualified_name =
+                    qualified_name_override.unwrap_or_else(|| match context.heap.get(function) {
+                        Some(HeapObject::Function(function)) => function.qualified_name.as_str(),
+                        _ => "<invalid>",
+                    });
+                Ok(match kind {
+                    SuspendedKind::Generator => "<generator object>".to_owned(),
+                    SuspendedKind::Coroutine => format!("<coroutine object {qualified_name}>"),
+                    SuspendedKind::AsyncGenerator => {
+                        format!("<async_generator object {qualified_name}>")
+                    }
+                })
+            }
+            Some(HeapObject::AsyncNextAwaitable(_)) => {
+                Ok(format!("<anext_awaitable object at 0x{:x}>", value.payload))
+            }
+            Some(HeapObject::AsyncGeneratorOperation(operation)) => {
+                let name = match operation.kind {
+                    crate::object::AsyncGeneratorOperationKind::Next
+                    | crate::object::AsyncGeneratorOperationKind::Send => "async_generator_asend",
+                    crate::object::AsyncGeneratorOperationKind::Throw
+                    | crate::object::AsyncGeneratorOperationKind::Close => "async_generator_athrow",
+                };
+                Ok(format!("<{name} object at 0x{:x}>", value.payload))
+            }
             Some(HeapObject::BuiltinFunction(object)) => {
                 Ok(format!("<built-in function {}>", object.name))
             }

@@ -1,0 +1,16 @@
+{
+  "title": "Rimera-Lite (Beta)",
+  "description": "Native Python compiler documentation",
+  "pages": [
+    "---Getting started---",
+    "index",
+    "getting-started",
+    "how-rimera-works",
+    "---Build and configure---",
+    "configuration",
+    "embedding-rimera",
+    "---Reference---",
+    "supported-python",
+    "benchmarks"
+  ]
+}

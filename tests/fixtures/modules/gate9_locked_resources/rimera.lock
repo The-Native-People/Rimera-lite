@@ -1,0 +1,18 @@
+version = 1
+targets = ["aarch64-apple-darwin"]
+capabilities = []
+
+[[package]]
+name = "fixture-package"
+version = "1.0.0"
+
+[[package.module]]
+name = "pkg"
+path = "pkg/__init__.py"
+hash = "8a7b9941676a2651"
+
+[[package.resource]]
+module = "pkg"
+name = "message.txt"
+path = "pkg/message.txt"
+hash = "f29e14873b1fdb17"

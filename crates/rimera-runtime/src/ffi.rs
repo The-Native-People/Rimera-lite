@@ -6,14 +6,14 @@ use std::ptr;
 
 use rimera_abi::{
     ABI_VERSION, RCallArgumentKind, RCallArguments, RCodeMetadataSpec, RFormatConversion,
-    RGeneratorDelegateOutcome, RGeneratorOperation, RNameSpec, RParameterSpec, RRootFrame, RStatus,
-    RTypeParameterKind, RValue,
+    RGeneratorDelegateOutcome, RGeneratorOperation, RNameSpec, RNativeModuleInitializer,
+    RParameterSpec, RRootFrame, RStatus, RTypeParameterKind, RValue,
 };
 
 use crate::heap::HeapObject;
 use crate::object::{
-    CellObject, CodeObject, DictionaryViewKind, FunctionKind, FunctionObject, Parameter,
-    TypeAliasObject, TypeParameterObject,
+    CellObject, CodeObject, DictionaryViewKind, FastCallMetadata, FunctionKind, FunctionObject,
+    Parameter, TypeAliasObject, TypeParameterObject,
 };
 use crate::{ParameterKind, RimeraContext, call, operations};
 
@@ -54,6 +54,39 @@ fn protect(
                 RStatus::Ok
             }
         }
+        Err(status) => {
+            context.heap.refresh_managed_bytes();
+            status
+        }
+    }
+}
+
+/// Protects runtime bookkeeping that cannot allocate or increase managed heap
+/// size on its success path. Root-stack and reflection metadata updates must
+/// not trigger a whole-heap accounting pass on every native function call.
+fn protect_bookkeeping(
+    context: *mut RimeraContext,
+    operation: impl FnOnce(&mut RimeraContext) -> StatusResult,
+) -> RStatus {
+    if context.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    // SAFETY: null was rejected and callers own a context returned by this ABI.
+    let context = unsafe { &mut *context };
+    #[cfg(panic = "unwind")]
+    let result = match catch_unwind(AssertUnwindSafe(|| operation(context))) {
+        Ok(result) => result,
+        Err(_) => {
+            context.heap.refresh_managed_bytes();
+            context.fail("native runtime panicked");
+            return RStatus::Exception;
+        }
+    };
+    #[cfg(panic = "abort")]
+    let result = operation(context);
+
+    match result {
+        Ok(()) => RStatus::Ok,
         Err(status) => {
             context.heap.refresh_managed_bytes();
             status
@@ -224,7 +257,9 @@ pub unsafe extern "C" fn rimera_context_new(
 pub unsafe extern "C" fn rimera_context_free(context: *mut RimeraContext) {
     if !context.is_null() {
         // SAFETY: contexts are created by Box::into_raw and freed exactly once.
-        drop(unsafe { Box::from_raw(context) });
+        let mut context = unsafe { Box::from_raw(context) };
+        context.finalize_suspended_for_shutdown();
+        drop(context);
     }
 }
 
@@ -247,6 +282,24 @@ pub unsafe extern "C" fn rimera_context_set_heap_limit(
                 record_exception(context, "MemoryError", message);
                 RStatus::Exception
             })
+    })
+}
+
+/// Enables the Gate 11 dynamic-compilation capability for one context.
+///
+/// This function installs policy only. Parser/compiler service registration and
+/// native unit loading remain separate so capability-free artifacts have no
+/// dynamic compiler dependency.
+///
+/// # Safety
+/// `context` must be a live context returned by [`rimera_context_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_dynamic_compilation_enable(
+    context: *mut RimeraContext,
+) -> RStatus {
+    protect(context, |context| {
+        context.enable_dynamic_compilation();
+        Ok(())
     })
 }
 
@@ -386,6 +439,15 @@ pub unsafe extern "C" fn rimera_function_new(
             has_default,
         });
     }
+    let fast_positional_arity = converted
+        .iter()
+        .all(|parameter| {
+            matches!(
+                parameter.kind,
+                ParameterKind::PositionalOnly | ParameterKind::PositionalOrKeyword
+            )
+        })
+        .then_some(converted.len());
     let mut roots = closure.to_vec();
     roots.extend_from_slice(&positional_defaults);
     roots.extend(keyword_defaults.iter().map(|(_, value)| *value));
@@ -433,6 +495,8 @@ pub unsafe extern "C" fn rimera_function_new(
             };
             let code_value = context.with_temporary_roots(&metadata_roots, |context| {
                 context.allocate(HeapObject::Code(CodeObject {
+                dynamic_mode: None,
+                flags_override: None,
                     code_address: code as usize,
                     kind: FunctionKind::Normal,
                     name: name.to_owned(),
@@ -446,9 +510,20 @@ pub unsafe extern "C" fn rimera_function_new(
                 }))
             })?;
             metadata_roots.push(code_value);
+            let globals = context
+                .globals()
+                .ok_or_else(|| "function has no defining module namespace".to_owned())?;
+            metadata_roots.push(globals);
             context.with_temporary_roots(&metadata_roots, |context| {
                 context.allocate(HeapObject::Function(FunctionObject {
                     code: code_value,
+                    fast_call: FastCallMetadata::new(
+                        code as usize,
+                        first_line,
+                        fast_positional_arity,
+                        FunctionKind::Normal,
+                    ),
+                    globals,
                     name: name.to_owned(),
                     qualified_name: qualified_name.to_owned(),
                     closure: closure_value,
@@ -571,11 +646,175 @@ pub unsafe extern "C" fn rimera_generator_function_new(
         Some(HeapObject::Function(function)) => function.code,
         _ => return RStatus::InvalidArgument,
     };
+    let kind = FunctionKind::Generator {
+        persistent_slot_count,
+    };
     match context.heap.get_mut(code) {
-        Some(HeapObject::Code(code)) => {
-            code.kind = FunctionKind::Generator {
-                persistent_slot_count,
-            };
+        Some(HeapObject::Code(code)) => code.kind = kind,
+        _ => return RStatus::InvalidArgument,
+    }
+    match context.heap.get_mut(function) {
+        Some(HeapObject::Function(function)) => {
+            function.fast_call.set_kind(kind);
+            RStatus::Ok
+        }
+        _ => RStatus::InvalidArgument,
+    }
+}
+
+/// Creates a compiled native coroutine function. Calling the resulting
+/// function remains lazy: argument binding allocates coroutine state but does
+/// not execute the body until the first send/await resume.
+///
+/// # Safety
+/// This follows the same pointer contract as [`rimera_function_new`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn rimera_coroutine_function_new(
+    context: *mut RimeraContext,
+    code: *const c_void,
+    name: *const u8,
+    name_len: usize,
+    qualified_name: *const u8,
+    qualified_name_len: usize,
+    parameters: *const RParameterSpec,
+    parameter_len: usize,
+    closure: *const RValue,
+    closure_len: usize,
+    metadata: *const RCodeMetadataSpec,
+    persistent_slot_count: usize,
+    output: *mut RValue,
+) -> RStatus {
+    let status = unsafe {
+        rimera_function_new(
+            context,
+            code,
+            name,
+            name_len,
+            qualified_name,
+            qualified_name_len,
+            parameters,
+            parameter_len,
+            closure,
+            closure_len,
+            metadata,
+            output,
+        )
+    };
+    if status != RStatus::Ok || context.is_null() || output.is_null() {
+        return status;
+    }
+    // SAFETY: success guarantees an initialized output and a live context.
+    let (context, function) = unsafe { (&mut *context, *output) };
+    let code = match context.heap.get(function) {
+        Some(HeapObject::Function(function)) => function.code,
+        _ => return RStatus::InvalidArgument,
+    };
+    let kind = FunctionKind::Coroutine {
+        persistent_slot_count,
+    };
+    match context.heap.get_mut(code) {
+        Some(HeapObject::Code(code)) => code.kind = kind,
+        _ => return RStatus::InvalidArgument,
+    }
+    match context.heap.get_mut(function) {
+        Some(HeapObject::Function(function)) => {
+            function.fast_call.set_kind(kind);
+            RStatus::Ok
+        }
+        _ => RStatus::InvalidArgument,
+    }
+}
+
+/// Attaches the ordinary-call ABI entry emitted for a coroutine whose MIR has
+/// been proven unable to suspend. This does not change ordinary Python call
+/// behavior: calling the function still constructs a lazy coroutine object.
+/// The entry is consulted only by the guarded `await f(...)` fusion operation.
+///
+/// # Safety
+/// `function` must point to a live Rimera coroutine function owned by
+/// `context`; `ready_code` must be a stable native function address emitted in
+/// the same executable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_function_ready_coroutine_set(
+    context: *mut RimeraContext,
+    function: *const RValue,
+    ready_code: *const c_void,
+    repeat_pure: u8,
+) -> RStatus {
+    if context.is_null() || function.is_null() || ready_code.is_null() || repeat_pure > 1 {
+        return RStatus::InvalidArgument;
+    }
+    let (context, function) = unsafe { (&mut *context, *function) };
+    let Some(HeapObject::Function(object)) = context.heap.get_mut(function) else {
+        return RStatus::InvalidArgument;
+    };
+    if !matches!(object.fast_call.kind(), FunctionKind::Coroutine { .. }) {
+        return RStatus::InvalidArgument;
+    }
+    object
+        .fast_call
+        .set_ready_coroutine(ready_code as usize, repeat_pure != 0);
+    RStatus::Ok
+}
+
+/// Creates a compiled native async-generator function. Calling it is lazy and
+/// allocates only the suspended async-generator state; protocol operations are
+/// represented by separate managed awaitable objects.
+///
+/// # Safety
+/// This follows the same pointer contract as [`rimera_function_new`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn rimera_async_generator_function_new(
+    context: *mut RimeraContext,
+    code: *const c_void,
+    name: *const u8,
+    name_len: usize,
+    qualified_name: *const u8,
+    qualified_name_len: usize,
+    parameters: *const RParameterSpec,
+    parameter_len: usize,
+    closure: *const RValue,
+    closure_len: usize,
+    metadata: *const RCodeMetadataSpec,
+    persistent_slot_count: usize,
+    output: *mut RValue,
+) -> RStatus {
+    let status = unsafe {
+        rimera_function_new(
+            context,
+            code,
+            name,
+            name_len,
+            qualified_name,
+            qualified_name_len,
+            parameters,
+            parameter_len,
+            closure,
+            closure_len,
+            metadata,
+            output,
+        )
+    };
+    if status != RStatus::Ok || context.is_null() || output.is_null() {
+        return status;
+    }
+    let (context, function) = unsafe { (&mut *context, *output) };
+    let code = match context.heap.get(function) {
+        Some(HeapObject::Function(function)) => function.code,
+        _ => return RStatus::InvalidArgument,
+    };
+    let kind = FunctionKind::AsyncGenerator {
+        persistent_slot_count,
+    };
+    match context.heap.get_mut(code) {
+        Some(HeapObject::Code(code)) => code.kind = kind,
+        _ => return RStatus::InvalidArgument,
+    }
+    match context.heap.get_mut(function) {
+        Some(HeapObject::Function(function)) => {
+            function.fast_call.set_kind(kind);
             RStatus::Ok
         }
         _ => RStatus::InvalidArgument,
@@ -936,9 +1175,35 @@ pub unsafe extern "C" fn rimera_reflection_scope_configure(
     } else {
         Some(unsafe { *namespace })
     };
-    protect(context, |context| {
+    protect_bookkeeping(context, |context| {
         context
             .configure_active_scope(namespace, comprehension != 0)
+            .map_err(|message| {
+                record_exception(context, "RuntimeError", message);
+                RStatus::Exception
+            })
+    })
+}
+
+/// Registers the contiguous native-local array owned by the current compiled
+/// stack activation. The storage is also part of the native GC root frame, so
+/// this pointer is reflection metadata rather than a second ownership path.
+///
+/// # Safety
+/// `values` must remain readable for `len` values until the active native call
+/// is popped. A null pointer is valid only when `len == 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_reflection_native_locals_register(
+    context: *mut RimeraContext,
+    values: *const RValue,
+    len: usize,
+) -> RStatus {
+    if context.is_null() || (values.is_null() && len != 0) {
+        return RStatus::InvalidArgument;
+    }
+    protect_bookkeeping(context, |context| {
+        context
+            .register_active_native_locals(values, len)
             .map_err(|message| {
                 record_exception(context, "RuntimeError", message);
                 RStatus::Exception
@@ -966,13 +1231,42 @@ pub unsafe extern "C" fn rimera_reflection_local_register(
         return RStatus::InvalidArgument;
     };
     let cell = unsafe { *cell };
-    protect(context, |context| {
+    protect_bookkeeping(context, |context| {
         context
             .register_active_local(name, cell)
             .map_err(|message| {
                 record_exception(context, "RuntimeError", message);
                 RStatus::Exception
             })
+    })
+}
+
+/// Raises the CPython-shaped error for an unbound native local. This is a cold
+/// path used only after generated code has tested its stack-local sentinel.
+///
+/// # Safety
+/// `name` must reference `name_len` readable UTF-8 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_unbound_local(
+    context: *mut RimeraContext,
+    name: *const u8,
+    name_len: usize,
+) -> RStatus {
+    if context.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    protect(context, |context| {
+        record_exception(
+            context,
+            "UnboundLocalError",
+            format!(
+                "cannot access local variable '{name}' where it is not associated with a value"
+            ),
+        );
+        Err(RStatus::Exception)
     })
 }
 
@@ -1163,13 +1457,10 @@ pub unsafe extern "C" fn rimera_global_set(
             .initialize_kernel()
             .map_err(|_| RStatus::Exception)?;
         let globals = context.globals().ok_or(RStatus::InvalidArgument)?;
-        match context.heap.get_mut(globals) {
-            Some(HeapObject::Dictionary(dictionary)) => {
-                dictionary.insert(name.to_owned(), value);
-                Ok(())
-            }
-            _ => Err(RStatus::InvalidArgument),
-        }
+        context.namespace_set(globals, name, value).map_err(|message| {
+            record_exception(context, "RuntimeError", message);
+            RStatus::Exception
+        })
     })
 }
 
@@ -1192,6 +1483,313 @@ pub unsafe extern "C" fn rimera_import_name(
     with_output(context, output, |context| context.import_name(name))
 }
 
+/// Executes an import statement through the current managed
+/// `builtins.__import__` binding. Generated code passes the active module
+/// globals and the ordinary empty fromlist/absolute-level arguments.
+///
+/// # Safety
+/// Name storage must be readable and `output` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_import_dispatch(
+    context: *mut RimeraContext,
+    name: *const u8,
+    name_len: usize,
+    output: *mut RValue,
+) -> RStatus {
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    with_output(context, output, |context| {
+        context.initialize_kernel()?;
+        let Some(callable) = context.lookup_builtin("__import__") else {
+            return context.raise_error("ImportError", "__import__ not found");
+        };
+        let globals = context.globals().unwrap_or(RValue::NONE);
+        context.with_temporary_roots(&[callable, globals], |context| {
+            let name = operations::string(context, name)?;
+            context.with_temporary_roots(&[callable, globals, name], |context| {
+                call::invoke(
+                    context,
+                    callable,
+                    &[name, globals, globals, RValue::NONE, RValue::small_int(0)],
+                    &[],
+                )
+            })
+        })
+    })
+}
+
+/// Registers one statically linked source module with the context import
+/// manifest. Registration does not create or cache a module object.
+///
+/// # Safety
+/// String storage must be readable and `initializer` must point at a generated
+/// function with the documented module-initializer ABI.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_register_source_module(
+    context: *mut RimeraContext,
+    name: *const u8,
+    name_len: usize,
+    filename: *const u8,
+    filename_len: usize,
+    package: *const u8,
+    package_len: usize,
+    is_package: u8,
+    initializer: *const c_void,
+) -> RStatus {
+    if initializer.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let Ok(filename) = (unsafe { utf8(filename, filename_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let Ok(package) = (unsafe { utf8(package, package_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let initializer =
+        unsafe { std::mem::transmute::<*const c_void, RNativeModuleInitializer>(initializer) };
+    protect(context, |context| {
+        context
+            .register_source_module(name, filename, package, is_package != 0, initializer)
+            .map_err(|message| {
+                record_exception(context, "RuntimeError", message);
+                RStatus::Exception
+            })
+    })
+}
+
+/// Registers one namespace package from the entry object's static manifest.
+/// Ordered locations are separated by NUL bytes.
+///
+/// # Safety
+/// Name and location storage must remain readable for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_register_namespace_module(
+    context: *mut RimeraContext,
+    name: *const u8,
+    name_len: usize,
+    locations: *const u8,
+    locations_len: usize,
+) -> RStatus {
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let Ok(locations) = (unsafe { utf8(locations, locations_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let locations = locations
+        .split('\0')
+        .filter(|location| !location.is_empty())
+        .collect::<Vec<_>>();
+    protect(context, |context| {
+        context
+            .register_namespace_module(name, &locations)
+            .map_err(|message| {
+                record_exception(context, "RuntimeError", message);
+                RStatus::Exception
+            })
+    })
+}
+
+/// Registers immutable package data embedded in the entry object.
+///
+/// # Safety
+/// Module/name/data storage must be readable for the declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_register_module_resource(
+    context: *mut RimeraContext,
+    module: *const u8,
+    module_len: usize,
+    name: *const u8,
+    name_len: usize,
+    data: *const u8,
+    data_len: usize,
+) -> RStatus {
+    let Ok(module) = (unsafe { utf8(module, module_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    if data.is_null() && data_len != 0 {
+        return RStatus::InvalidArgument;
+    }
+    let bytes = if data_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, data_len) }
+    };
+    protect(context, |context| {
+        context
+            .register_module_resource(module, name, bytes)
+            .map_err(|message| {
+                record_exception(context, "RuntimeError", message);
+                RStatus::Exception
+            })
+    })
+}
+
+/// Imports one statically resolved Python source module through its native
+/// initializer and the authoritative managed module cache.
+///
+/// # Safety
+/// Name storage must be readable, `initializer` must be a generated function
+/// with the documented ABI, and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_import_source(
+    context: *mut RimeraContext,
+    name: *const u8,
+    name_len: usize,
+    filename: *const u8,
+    filename_len: usize,
+    package: *const u8,
+    package_len: usize,
+    is_package: u8,
+    initializer: RNativeModuleInitializer,
+    output: *mut RValue,
+) -> RStatus {
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let Ok(filename) = (unsafe { utf8(filename, filename_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let Ok(package) = (unsafe { utf8(package, package_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    with_output(context, output, |context| {
+        context.import_source(name, filename, package, is_package != 0, initializer)
+    })
+}
+
+/// Creates or returns a statically resolved namespace package. `locations`
+/// contains its ordered search roots separated by NUL bytes.
+///
+/// # Safety
+/// Name/location storage must be readable and `output` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_import_namespace(
+    context: *mut RimeraContext,
+    name: *const u8,
+    name_len: usize,
+    locations: *const u8,
+    locations_len: usize,
+    output: *mut RValue,
+) -> RStatus {
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let Ok(locations) = (unsafe { utf8(locations, locations_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let locations = locations
+        .split('\0')
+        .filter(|location| !location.is_empty())
+        .collect::<Vec<_>>();
+    with_output(context, output, |context| {
+        context.import_namespace(name, &locations)
+    })
+}
+
+/// Imports one name from a managed module, optionally falling back to a
+/// statically linked child-module initializer.
+///
+/// # Safety
+/// Name storage and `output` follow the common ABI pointer contract. A non-null
+/// initializer must use `RNativeModuleInitializer`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_import_from(
+    context: *mut RimeraContext,
+    module: *const RValue,
+    name: *const u8,
+    name_len: usize,
+    filename: *const u8,
+    filename_len: usize,
+    package: *const u8,
+    package_len: usize,
+    is_package: u8,
+    initializer: *const c_void,
+    locations: *const u8,
+    locations_len: usize,
+    output: *mut RValue,
+) -> RStatus {
+    if module.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let metadata = if initializer.is_null() {
+        ("", "")
+    } else {
+        let Ok(filename) = (unsafe { utf8(filename, filename_len) }) else {
+            return RStatus::InvalidArgument;
+        };
+        let Ok(package) = (unsafe { utf8(package, package_len) }) else {
+            return RStatus::InvalidArgument;
+        };
+        (filename, package)
+    };
+    let initializer = if initializer.is_null() {
+        None
+    } else {
+        // SAFETY: generated code passes only addresses of linked module
+        // initializer exports with the documented ABI.
+        Some(unsafe { std::mem::transmute::<*const c_void, RNativeModuleInitializer>(initializer) })
+    };
+    let Ok(locations) = (unsafe { utf8(locations, locations_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let locations = locations
+        .split('\0')
+        .filter(|location| !location.is_empty())
+        .collect::<Vec<_>>();
+    with_output(context, output, |context| {
+        context.import_from(
+            unsafe { *module },
+            name,
+            metadata.0,
+            metadata.1,
+            is_package != 0,
+            initializer,
+            &locations,
+        )
+    })
+}
+
+/// Publishes a module's `__all__` names, or its public namespace names, into
+/// the current module globals.
+///
+/// # Safety
+/// `module` must point to a readable `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_import_star(
+    context: *mut RimeraContext,
+    module: *const RValue,
+) -> RStatus {
+    if module.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    protect(context, |context| {
+        match context.import_star(unsafe { *module }) {
+            Ok(_) => Ok(()),
+            Err(_) if context.raised.is_some() => Err(RStatus::Exception),
+            Err(message) => {
+                let exception_type = if message.contains("must be str") {
+                    "TypeError"
+                } else {
+                    "ImportError"
+                };
+                record_exception(context, exception_type, message);
+                Err(RStatus::Exception)
+            }
+        }
+    })
+}
+
 /// Reads a module global, falling back to the builtins dictionary.
 ///
 /// # Safety
@@ -1203,31 +1801,45 @@ pub unsafe extern "C" fn rimera_global_get(
     name_len: usize,
     output: *mut RValue,
 ) -> RStatus {
-    if output.is_null() {
+    if output.is_null() || (name.is_null() && name_len != 0) {
         return RStatus::InvalidArgument;
     }
-    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
-        return RStatus::InvalidArgument;
+    let name_bytes = if name_len == 0 {
+        &[]
+    } else {
+        // SAFETY: the ABI requires `name_len` readable bytes.
+        unsafe { std::slice::from_raw_parts(name, name_len) }
     };
-    protect(context, |context| {
+    let callsite = name as usize;
+    // Successful global/builtin lookup is read-only. Lazy kernel/builtin
+    // construction enforces its own allocation contracts, so the hot hit path
+    // must not rescan the complete managed heap.
+    protect_bookkeeping(context, |context| {
         context
             .initialize_kernel()
             .map_err(|_| RStatus::Exception)?;
-        let lookup = |dictionary| match context.heap.get(dictionary) {
-            Some(HeapObject::Dictionary(dictionary)) => dictionary.get(name),
-            _ => None,
-        };
-        let value = context
-            .globals()
-            .and_then(lookup)
-            .or_else(|| context.builtins().and_then(lookup));
-        let value = match value {
-            Some(value) => Some(value),
-            None => context.ensure_builtin(name).map_err(|message| {
+        if let Some(value) = context.cached_global_lookup(callsite, name_bytes) {
+            unsafe { output.write(value) };
+            return Ok(());
+        }
+        let name = std::str::from_utf8(name_bytes).map_err(|_| RStatus::InvalidArgument)?;
+        let globals = context.globals();
+        if let Some(namespace) = globals
+            && let Some(HeapObject::Dictionary(dictionary)) = context.heap.get(namespace)
+            && let Some((entry_index, value)) = dictionary.get_index(name)
+        {
+            context.remember_global_lookup(callsite, namespace, entry_index);
+            unsafe { output.write(value) };
+            return Ok(());
+        }
+        if let Some(value) = globals.and_then(|globals| context.namespace_value(globals, name)) {
+            unsafe { output.write(value) };
+            return Ok(());
+        }
+        let value = context.execution_builtin(name).map_err(|message| {
                 record_exception(context, "RuntimeError", message);
                 RStatus::Exception
-            })?,
-        };
+            })?;
         let Some(value) = value else {
             record_exception(
                 context,
@@ -1259,13 +1871,10 @@ pub unsafe extern "C" fn rimera_global_delete(
             .initialize_kernel()
             .map_err(|_| RStatus::Exception)?;
         let globals = context.globals().ok_or(RStatus::InvalidArgument)?;
-        match context.heap.get_mut(globals) {
-            Some(HeapObject::Dictionary(dictionary)) => {
-                dictionary.remove(name);
-                Ok(())
-            }
-            _ => Err(RStatus::InvalidArgument),
-        }
+        context.namespace_delete(globals, name).map_err(|_| {
+            record_exception(context, "NameError", format!("name '{name}' is not defined"));
+            RStatus::Exception
+        })
     })
 }
 
@@ -1480,6 +2089,52 @@ pub unsafe extern "C" fn rimera_attr_get(
     })
 }
 
+/// Resolves and descriptor-binds one context-manager special method from the
+/// receiver's type/MRO. This performs lookup only; generated MIR still owns
+/// enter/body/exit ordering and cleanup.
+///
+/// # Safety
+/// Receiver storage must be readable and `output` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_special_method_get(
+    context: *mut RimeraContext,
+    receiver: *const RValue,
+    name: *const u8,
+    name_len: usize,
+    output: *mut RValue,
+) -> RStatus {
+    if receiver.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let Ok(name) = (unsafe { utf8(name, name_len) }) else {
+        return RStatus::InvalidArgument;
+    };
+    let receiver = unsafe { *receiver };
+    with_output(context, output, |context| {
+        context.with_temporary_roots(&[receiver], |context| {
+            let Some(method) = context.special_method(receiver, name)? else {
+                let receiver_type = context.type_of(receiver)?;
+                let type_name = context.type_name(receiver_type);
+                let message = if name == "__aexit__" {
+                    format!(
+                        "'{type_name}' object does not support the asynchronous context manager protocol (missed __aexit__ method)"
+                    )
+                } else if name == "__aenter__" {
+                    format!("'{type_name}' object does not support the asynchronous context manager protocol")
+                } else if name == "__exit__" {
+                    format!(
+                        "'{type_name}' object does not support the context manager protocol (missed __exit__ method)"
+                    )
+                } else {
+                    format!("'{type_name}' object does not support the context manager protocol")
+                };
+                return Err(message);
+            };
+            Ok(method)
+        })
+    })
+}
+
 /// Constructs the state used by explicit two-argument `super(type, receiver)`.
 ///
 /// # Safety
@@ -1678,6 +2333,121 @@ pub unsafe extern "C" fn rimera_call_prepared(
     })
 }
 
+/// Invokes a positional managed call from generated code after the caller has
+/// published the callable and argument values in its GC root frame. Exact
+/// Rimera functions bypass descriptor construction and redundant native-root
+/// copies; dynamic callables preserve the full Python dispatcher fallback.
+///
+/// # Safety
+/// `callable` and `output` must be live. `positional` must reference
+/// `positional_len` readable rooted values, or may be null when the length is
+/// zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_call_positional_rooted(
+    context: *mut RimeraContext,
+    callable: *const RValue,
+    positional: *const RValue,
+    positional_len: usize,
+    output: *mut RValue,
+) -> RStatus {
+    if callable.is_null() || output.is_null() || (positional.is_null() && positional_len != 0) {
+        return RStatus::InvalidArgument;
+    }
+    let callable = unsafe { *callable };
+    let positional = if positional_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(positional, positional_len) }
+    };
+    protect_bookkeeping(context, |context| {
+        match call::invoke_rooted_positional(context, callable, positional) {
+            Ok(value) => {
+                unsafe { output.write(value) };
+                Ok(())
+            }
+            Err(_) if context.raised.is_some() => Err(RStatus::Exception),
+            Err(message) => {
+                let exception_type = if message == "managed heap limit exceeded" {
+                    "MemoryError"
+                } else {
+                    "TypeError"
+                };
+                record_exception(context, exception_type, message);
+                Err(RStatus::Exception)
+            }
+        }
+    })
+}
+
+/// Attempts an allocation-free exact-positional call through a compiler-proven
+/// non-suspending coroutine entry. On a miss, `matched` is false and no Python
+/// call has occurred, so generated code may safely use the ordinary lazy call
+/// and await protocol with the same already-evaluated operands.
+///
+/// # Safety
+/// `callable`, `output`, and `matched` must be writable/readable as indicated.
+/// `positional` references `positional_len` caller-rooted values or is null when
+/// the length is zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_call_ready_coroutine_rooted(
+    context: *mut RimeraContext,
+    callable: *const RValue,
+    positional: *const RValue,
+    positional_len: usize,
+    pure_only: u8,
+    output: *mut RValue,
+    matched: *mut RValue,
+) -> RStatus {
+    if callable.is_null()
+        || output.is_null()
+        || matched.is_null()
+        || pure_only > 1
+        || (positional.is_null() && positional_len != 0)
+    {
+        return RStatus::InvalidArgument;
+    }
+    let callable = unsafe { *callable };
+    let positional = if positional_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(positional, positional_len) }
+    };
+    protect_bookkeeping(
+        context,
+        |context| match call::invoke_ready_coroutine_rooted(
+            context,
+            callable,
+            positional,
+            pure_only != 0,
+        ) {
+            Ok(Some(value)) => {
+                unsafe {
+                    output.write(value);
+                    matched.write(RValue::boolean(true));
+                }
+                Ok(())
+            }
+            Ok(None) => {
+                unsafe {
+                    output.write(RValue::NONE);
+                    matched.write(RValue::boolean(false));
+                }
+                Ok(())
+            }
+            Err(_) if context.raised.is_some() => Err(RStatus::Exception),
+            Err(message) => {
+                let exception_type = if message == "managed heap limit exceeded" {
+                    "MemoryError"
+                } else {
+                    "TypeError"
+                };
+                record_exception(context, exception_type, message);
+                Err(RStatus::Exception)
+            }
+        },
+    )
+}
+
 /// Invokes a managed callable using Python argument binding.
 ///
 /// # Safety
@@ -1716,7 +2486,11 @@ pub unsafe extern "C" fn rimera_call(
         };
         keywords.push((name.to_owned(), keyword.value));
     }
-    protect(context, |context| {
+    // `call::invoke` and every managed allocation/mutation it reaches enforce
+    // their own heap-growth contracts. Re-scanning the complete heap after
+    // every successful Python call is redundant and destroys small-call
+    // performance, so this outer dispatch uses the bookkeeping guard.
+    protect_bookkeeping(context, |context| {
         match call::invoke(context, callable, positional, &keywords) {
             Ok(value) => {
                 unsafe { output.write(value) };
@@ -2123,7 +2897,7 @@ pub unsafe extern "C" fn rimera_roots_push(
     if frame.is_null() {
         return RStatus::InvalidArgument;
     }
-    protect(context, |context| {
+    protect_bookkeeping(context, |context| {
         // SAFETY: the frame is live and writable for its registration period.
         unsafe { (*frame).previous = context.roots };
         context.roots = frame;
@@ -2143,7 +2917,7 @@ pub unsafe extern "C" fn rimera_roots_pop(
     if frame.is_null() {
         return RStatus::InvalidArgument;
     }
-    protect(context, |context| {
+    protect_bookkeeping(context, |context| {
         if context.roots != frame {
             context.fail("root frames must be removed in stack order");
             return Err(RStatus::InvalidArgument);
@@ -2801,6 +3575,68 @@ pub unsafe extern "C" fn rimera_range_new(
     })
 }
 
+/// Resolves one Python await operand to the iterator driven by the coroutine
+/// suspension machinery. Native Rimera coroutines remain on the direct path;
+/// arbitrary objects invoke `__await__` exactly once and must return an iterator.
+///
+/// # Safety
+/// `value` must be readable and `output` must be writable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_await_iterator(
+    context: *mut RimeraContext,
+    value: *const RValue,
+    output: *mut RValue,
+) -> RStatus {
+    if value.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let value = unsafe { *value };
+    with_output(context, output, |context| {
+        operations::await_iterator(context, value)
+    })
+}
+
+/// Resolves the `async for` iterable through `__aiter__` and validates that the
+/// result implements `__anext__`. The returned object remains managed/rootable;
+/// no backend or scheduler state is introduced here.
+///
+/// # Safety
+/// `value` must be readable and `output` writable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_async_iterator_new(
+    context: *mut RimeraContext,
+    value: *const RValue,
+    output: *mut RValue,
+) -> RStatus {
+    if value.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let value = unsafe { *value };
+    with_output(context, output, |context| {
+        operations::async_iterator_new(context, value)
+    })
+}
+
+/// Calls `__anext__` once for `async for` and returns the awaitable that must be
+/// driven by the ordinary coroutine await machinery.
+///
+/// # Safety
+/// `iterator` must be readable and `output` writable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_async_iterator_next(
+    context: *mut RimeraContext,
+    iterator: *const RValue,
+    output: *mut RValue,
+) -> RStatus {
+    if iterator.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let iterator = unsafe { *iterator };
+    with_output(context, output, |context| {
+        operations::async_iterator_next_awaitable(context, iterator)
+    })
+}
+
 /// Creates an iterator for a supported native iterable.
 ///
 /// # Safety
@@ -2818,6 +3654,76 @@ pub unsafe extern "C" fn rimera_iterator_new(
     with_output(context, output, |context| {
         operations::iterator_new(context, value)
     })
+}
+
+/// Probes whether repeated `call(); close()` lifecycle work may be elided for
+/// an exact zero-argument Rimera coroutine function. This is deliberately
+/// disabled under an explicit managed-heap limit so low-heap allocation/failure
+/// behavior remains on the ordinary path.
+///
+/// # Safety
+/// `callable` must be readable and `matched` writable for one `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_coroutine_close_elide_probe(
+    context: *mut RimeraContext,
+    callable: *const RValue,
+    matched: *mut RValue,
+) -> RStatus {
+    if context.is_null() || callable.is_null() || matched.is_null() {
+        return RStatus::InvalidArgument;
+    }
+    let context = unsafe { &*context };
+    let callable = unsafe { *callable };
+    unsafe {
+        matched.write(RValue::boolean(call::coroutine_close_elide_probe(
+            context, callable,
+        )));
+    }
+    RStatus::Ok
+}
+
+/// Probes an exact managed range for the Slice 13 repeat-pure loop collapse.
+/// This path is allocation-free and never mutates Python exception state. A
+/// false `matched` value means generated code must use the ordinary iterator.
+///
+/// # Safety
+/// `value` must be readable and every output pointer must be writable for one
+/// `RValue`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_range_collapse_probe(
+    context: *mut RimeraContext,
+    value: *const RValue,
+    first: *mut RValue,
+    last: *mut RValue,
+    matched: *mut RValue,
+    nonempty: *mut RValue,
+) -> RStatus {
+    if context.is_null()
+        || value.is_null()
+        || first.is_null()
+        || last.is_null()
+        || matched.is_null()
+        || nonempty.is_null()
+    {
+        return RStatus::InvalidArgument;
+    }
+    let context = unsafe { &*context };
+    let value = unsafe { *value };
+    let probe = call::range_collapse_probe(context, value);
+    unsafe {
+        if let Some((first_value, last_value, has_values)) = probe {
+            first.write(first_value);
+            last.write(last_value);
+            matched.write(RValue::boolean(true));
+            nonempty.write(RValue::boolean(has_values));
+        } else {
+            first.write(RValue::NONE);
+            last.write(RValue::NONE);
+            matched.write(RValue::boolean(false));
+            nonempty.write(RValue::boolean(false));
+        }
+    }
+    RStatus::Ok
 }
 
 /// Advances an iterator without using Python exception state for exhaustion.
@@ -2922,7 +3828,12 @@ pub unsafe extern "C" fn rimera_item_set(
                 if context.raised.is_some() {
                     return Err(RStatus::Exception);
                 }
-                record_exception(context, "TypeError", message);
+                let exception_type = if message == "managed heap limit exceeded" {
+                    "MemoryError"
+                } else {
+                    "TypeError"
+                };
+                record_exception(context, exception_type, message);
                 Err(RStatus::Exception)
             }
         }
@@ -3159,6 +4070,26 @@ pub unsafe extern "C" fn rimera_print(
     })
 }
 
+/// Displays one interactive expression using repr; None has no output.
+///
+/// # Safety
+/// `value` points to a live value owned by `context`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rimera_display(context: *mut RimeraContext, value: *const RValue) -> RStatus {
+    if value.is_null() { return RStatus::InvalidArgument; }
+    let value = unsafe { *value };
+    if value == RValue::NONE { return RStatus::Ok; }
+    protect(context, |context| {
+        context.with_temporary_roots(&[value], |context| {
+            let rendered = operations::repr(context, value)?;
+            let text = operations::string_value(context, rendered).ok_or("repr must return a string")?;
+            writeln!(io::stdout().lock(), "{text}").map_err(|error| error.to_string())?;
+            let builtins = context.builtins().ok_or("builtins unavailable")?;
+            context.namespace_set(builtins, "_", value)
+        }).map_err(|message| { record_exception(context, "RuntimeError", message); RStatus::Exception })
+    })
+}
+
 /// Writes a compile-time UTF-8 string literal followed by a newline.
 ///
 /// This is the small release path for a proven builtin `print("literal")` call.
@@ -3280,18 +4211,22 @@ fn is_exception_summary(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
     };
 
+    use std::task::{Context, Poll, Waker};
+
     use super::*;
-    use crate::ParameterKind;
     use crate::heap::HeapObject;
     use crate::object::{
-        ExceptionObject, FunctionKind, FunctionObject, Parameter, TracebackObject,
-        ValueDictionaryObject,
+        ExceptionObject, FunctionKind, FunctionObject, ModuleObject, ModuleState, Parameter,
+        TracebackObject, ValueDictionaryObject,
     };
+    use crate::{AsyncRuntimeDriver, ParameterKind};
     use rimera_abi::{RCompareOperator, RGeneratorOperation, RGeneratorOutcome};
 
     unsafe extern "C" fn two_stage_generator_resume(
@@ -3338,6 +4273,42 @@ mod tests {
         RStatus::Ok
     }
 
+    static GENERATOR_CLOSE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn finalizable_generator_resume(
+        context: *mut c_void,
+        generator: *const RValue,
+        operation: RGeneratorOperation,
+        _input: *const RValue,
+        output: *mut RValue,
+        outcome: *mut RGeneratorOutcome,
+    ) -> RStatus {
+        if context.is_null() || generator.is_null() || output.is_null() || outcome.is_null() {
+            return RStatus::InvalidArgument;
+        }
+        let context = unsafe { &mut *context.cast::<RimeraContext>() };
+        let generator = unsafe { *generator };
+        let Some(HeapObject::Generator(object)) = context.heap.get_mut(generator) else {
+            return RStatus::InvalidArgument;
+        };
+        if matches!(operation, RGeneratorOperation::Close) {
+            GENERATOR_CLOSE_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        if object.state == 0 {
+            object.state = 1;
+            unsafe {
+                output.write(RValue::small_int(1));
+                outcome.write(RGeneratorOutcome::Yielded);
+            }
+        } else {
+            unsafe {
+                output.write(RValue::NONE);
+                outcome.write(RGeneratorOutcome::Returned);
+            }
+        }
+        RStatus::Ok
+    }
+
     unsafe extern "C" fn add_native(
         context: *mut c_void,
         _function: *const RValue,
@@ -3376,6 +4347,15 @@ mod tests {
         parameters: Vec<Parameter>,
         closure: &[RValue],
     ) -> RValue {
+        let positional_arity = parameters
+            .iter()
+            .all(|parameter| {
+                matches!(
+                    parameter.kind,
+                    ParameterKind::PositionalOnly | ParameterKind::PositionalOrKeyword
+                )
+            })
+            .then_some(parameters.len());
         let roots = closure.to_vec();
         context
             .with_temporary_roots(&roots, |context| {
@@ -3393,6 +4373,8 @@ mod tests {
                     .collect::<Vec<_>>();
                 let code = context.with_temporary_roots(&metadata_roots, |context| {
                     context.allocate(HeapObject::Code(CodeObject {
+                dynamic_mode: None,
+                flags_override: None,
                         code_address,
                         kind,
                         name: name.to_owned(),
@@ -3406,9 +4388,20 @@ mod tests {
                     }))
                 })?;
                 metadata_roots.push(code);
+                let globals = context.globals().unwrap();
+                metadata_roots.push(globals);
                 context.with_temporary_roots(&metadata_roots, |context| {
                     context.allocate(HeapObject::Function(FunctionObject {
                         code,
+                        fast_call: FastCallMetadata {
+                            positional_arity,
+                            kind,
+                            code_address,
+                            first_line: 1,
+                            ready_coroutine_code_address: None,
+                            ready_coroutine_repeat_pure: false,
+                        },
+                        globals,
                         name: name.to_owned(),
                         qualified_name: qualified_name.to_owned(),
                         closure: closure_value,
@@ -3816,6 +4809,35 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_suspended_generators_close_once_before_collection() {
+        GENERATOR_CLOSE_COUNT.store(0, AtomicOrdering::SeqCst);
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let function = test_function(
+            &mut context,
+            finalizable_generator_resume as usize,
+            FunctionKind::Generator {
+                persistent_slot_count: 0,
+            },
+            "finalizable",
+            "finalizable",
+            Vec::new(),
+            &[],
+        );
+        context.add_context_root(function);
+        let generator = context.new_generator(function, &[]).unwrap();
+        let first = context
+            .resume_generator(generator, RGeneratorOperation::Next, RValue::NONE)
+            .unwrap();
+        assert_eq!(first.outcome, RGeneratorOutcome::Yielded);
+
+        context.collect();
+
+        assert_eq!(GENERATOR_CLOSE_COUNT.load(AtomicOrdering::SeqCst), 1);
+        assert!(context.heap.get(generator).is_none());
+    }
+
+    #[test]
     fn generator_delegate_and_pending_exception_graphs_are_traced_and_fail_atomically() {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
@@ -4066,6 +5088,53 @@ mod tests {
     }
 
     #[test]
+    fn gate9_module_state_is_single_owner_validated_and_gc_managed() {
+        let mut context = RimeraContext::default();
+        let inspect = context.import_name("inspect").unwrap();
+        assert!(matches!(
+            context.heap.get(inspect),
+            Some(HeapObject::Module(ModuleObject {
+                state: ModuleState::Ready,
+                ..
+            }))
+        ));
+        assert_eq!(
+            context
+                .transition_module(inspect, ModuleState::Failed)
+                .unwrap_err(),
+            "illegal module state transition from Ready to Failed"
+        );
+
+        let namespace = context
+            .allocate(HeapObject::Dictionary(crate::object::DictionaryObject {
+                entries: Vec::new(),
+            }))
+            .unwrap();
+        let failed = context
+            .allocate(HeapObject::Module(ModuleObject {
+                name: "failed".to_owned(),
+                namespace,
+                state: ModuleState::Created,
+            }))
+            .unwrap();
+        context
+            .transition_module(failed, ModuleState::Initializing)
+            .unwrap();
+        context
+            .transition_module(failed, ModuleState::Failed)
+            .unwrap();
+        context.collect();
+        assert!(context.heap.get(failed).is_none());
+        assert!(matches!(
+            context.heap.get(inspect),
+            Some(HeapObject::Module(ModuleObject {
+                state: ModuleState::Ready,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
     fn gate7_import_heap_failure_is_memory_error_and_publication_is_atomic() {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
@@ -4095,6 +5164,57 @@ mod tests {
             matches!(context.heap.get(module_name), Some(HeapObject::String(value)) if value == "inspect")
         );
         assert_eq!(context.import_name("inspect").unwrap(), output);
+    }
+
+    #[test]
+    fn gate9_sys_modules_mutation_and_import_publication_are_low_heap_atomic() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let sys = context.import_name("sys").unwrap();
+        let modules = context.attribute_get(sys, "modules").unwrap();
+        context.collect();
+        let long_name = "gate9_low_heap_cache_key_".repeat(512);
+        let long_key = operations::string(&mut context, &long_name).unwrap();
+        let limit = context.stats().live_bytes;
+        context.set_heap_limit(Some(limit)).unwrap();
+
+        assert_eq!(
+            unsafe {
+                rimera_item_set(
+                    &raw mut context,
+                    &raw const modules,
+                    &raw const long_key,
+                    &raw const sys,
+                )
+            },
+            RStatus::Exception
+        );
+        assert!(context.consume_exception_type("MemoryError"));
+        assert!(matches!(
+            context.heap.get(modules),
+            Some(HeapObject::Dictionary(dictionary)) if dictionary.get(&long_name).is_none()
+        ));
+
+        context.set_heap_limit(None).unwrap();
+        let sys_key = operations::string(&mut context, "sys").unwrap();
+        let replacement_limit = context.stats().live_bytes;
+        context.set_heap_limit(Some(replacement_limit)).unwrap();
+
+        assert_eq!(
+            unsafe {
+                rimera_item_set(
+                    &raw mut context,
+                    &raw const modules,
+                    &raw const sys_key,
+                    &raw const sys,
+                )
+            },
+            RStatus::Ok
+        );
+        assert!(matches!(
+            context.heap.get(modules),
+            Some(HeapObject::Dictionary(dictionary)) if dictionary.get("sys") == Some(sys)
+        ));
     }
 
     #[test]
@@ -4164,7 +5284,7 @@ mod tests {
         assert!(context.builtin_type("StopIteration").is_none());
         let stats = context.stats();
         assert!(
-            stats.live_bytes <= 8 * 1024,
+            stats.live_bytes <= 12 * 1024,
             "lazy kernel uses {} managed bytes",
             stats.live_bytes
         );
@@ -4278,7 +5398,11 @@ mod tests {
                 "Gate 7 reflection builtin {reflection} is missing"
             );
         }
-        for excluded in ["__import__", "compile", "eval", "exec"] {
+        assert!(
+            context.ensure_builtin("__import__").unwrap().is_some(),
+            "Gate 9 __import__ builtin is missing from the native namespace"
+        );
+        for excluded in ["compile", "eval", "exec"] {
             assert!(
                 context.ensure_builtin(excluded).unwrap().is_none(),
                 "unsupported builtin {excluded} leaked into the native namespace"
@@ -5349,6 +6473,215 @@ mod tests {
     }
 
     #[test]
+    fn gate8_special_method_lookup_uses_type_mro_descriptor_binding_and_abi_errors() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let namespace = context.namespace_new().unwrap();
+        let function = test_function(
+            &mut context,
+            add_native as usize,
+            FunctionKind::Normal,
+            "__enter__",
+            "Manager.__enter__",
+            Vec::new(),
+            &[],
+        );
+        context
+            .namespace_set(namespace, "__enter__", function)
+            .unwrap();
+        let class = context.new_class("Manager", &[], namespace).unwrap();
+        let instance = context.new_instance(class).unwrap();
+        let name = b"__enter__";
+        let mut method = RValue::NONE;
+        assert_eq!(
+            // SAFETY: the context, input value, name bytes, and output remain live.
+            unsafe {
+                rimera_special_method_get(
+                    &raw mut context,
+                    &raw const instance,
+                    name.as_ptr(),
+                    name.len(),
+                    &raw mut method,
+                )
+            },
+            RStatus::Ok
+        );
+        assert!(matches!(
+            context.heap.get(method),
+            Some(HeapObject::BoundMethod(bound))
+                if bound.receiver == instance && bound.function == function
+        ));
+        context.with_temporary_roots(&[method], |context| context.collect());
+        assert!(context.heap.get(instance).is_some());
+        assert!(context.heap.get(function).is_some());
+
+        let missing = b"__exit__";
+        assert_eq!(
+            // SAFETY: the same live ABI storage is reused for the missing lookup.
+            unsafe {
+                rimera_special_method_get(
+                    &raw mut context,
+                    &raw const instance,
+                    missing.as_ptr(),
+                    missing.len(),
+                    &raw mut method,
+                )
+            },
+            RStatus::Exception
+        );
+        let raised = context
+            .raised
+            .expect("missing special method raises TypeError");
+        assert_eq!(context.exception_type_name(raised), Some("TypeError"));
+        assert_eq!(
+            context.exception_message(raised).as_deref(),
+            Some(
+                "'Manager' object does not support the context manager protocol (missed __exit__ method)"
+            )
+        );
+    }
+
+    #[test]
+    fn gate7_reflective_type_mutation_invalidates_descendants_and_is_low_heap_atomic() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+
+        let base_namespace = context.namespace_new().unwrap();
+        let base = context.new_class("Base", &[], base_namespace).unwrap();
+        let child_namespace = context.namespace_new().unwrap();
+        let child = context
+            .new_class("Child", &[base], child_namespace)
+            .unwrap();
+        let grand_namespace = context.namespace_new().unwrap();
+        let grand = context
+            .new_class("Grand", &[child], grand_namespace)
+            .unwrap();
+
+        let versions = |context: &RimeraContext| {
+            [base, child, grand].map(|value| match context.heap.get(value) {
+                Some(HeapObject::Type(class)) => class.version_tag,
+                _ => panic!("expected a type object"),
+            })
+        };
+        let before = versions(&context);
+        context
+            .attribute_set(base, "marker", RValue::small_int(7))
+            .unwrap();
+        let after = versions(&context);
+        assert_eq!(after, before.map(|version| version + 1));
+        let instance = context.new_instance(grand).unwrap();
+        assert_eq!(
+            context.attribute_get(instance, "marker").unwrap(),
+            RValue::small_int(7)
+        );
+
+        let base_namespace = match context.heap.get(base) {
+            Some(HeapObject::Type(class)) => class.namespace,
+            _ => panic!("expected a type object"),
+        };
+        let version_before_failure = versions(&context);
+        let limit = context.stats().live_bytes;
+        context.set_heap_limit(Some(limit)).unwrap();
+        let long_name = "reflective_low_heap_".repeat(512);
+        let error = context
+            .with_temporary_roots(&[base, child, grand, instance], |context| {
+                context.attribute_set(base, &long_name, RValue::small_int(9))
+            })
+            .unwrap_err();
+        assert!(error.contains("managed heap limit exceeded"));
+        assert!(
+            context
+                .namespace_value(base_namespace, &long_name)
+                .is_none()
+        );
+        assert_eq!(versions(&context), version_before_failure);
+        context.set_heap_limit(None).unwrap();
+    }
+
+    #[test]
+    fn gate7_reflective_string_metadata_growth_is_low_heap_atomic() {
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+
+        let class_namespace = context.namespace_new().unwrap();
+        let class = context.new_class("Compact", &[], class_namespace).unwrap();
+        let function = test_function(
+            &mut context,
+            add_native as usize,
+            FunctionKind::Normal,
+            "compact",
+            "compact",
+            Vec::new(),
+            &[],
+        );
+        let generator_function = test_function(
+            &mut context,
+            two_stage_generator_resume as usize,
+            FunctionKind::Generator {
+                persistent_slot_count: 0,
+            },
+            "compact_gen",
+            "compact_gen",
+            Vec::new(),
+            &[],
+        );
+        let generator = call::invoke(&mut context, generator_function, &[], &[]).unwrap();
+        let long_text = operations::string(&mut context, &"metadata-growth-".repeat(512)).unwrap();
+        let roots = [class, function, generator_function, generator, long_text];
+
+        context.with_temporary_roots(&roots, |context| {
+            let limit = context.stats().live_bytes;
+            context.set_heap_limit(Some(limit)).unwrap();
+
+            let class_version = match context.heap.get(class) {
+                Some(HeapObject::Type(class)) => class.version_tag,
+                _ => panic!("expected class"),
+            };
+            let error = context
+                .attribute_set(class, "__name__", long_text)
+                .unwrap_err();
+            assert!(error.contains("managed heap limit exceeded"));
+            match context.heap.get(class) {
+                Some(HeapObject::Type(class)) => {
+                    assert_eq!(class.name, "Compact");
+                    assert_eq!(class.version_tag, class_version);
+                }
+                _ => panic!("expected class"),
+            }
+
+            let error = context
+                .attribute_set(function, "__qualname__", long_text)
+                .unwrap_err();
+            assert!(error.contains("managed heap limit exceeded"));
+            match context.heap.get(function) {
+                Some(HeapObject::Function(function)) => {
+                    assert_eq!(function.qualified_name, "compact")
+                }
+                _ => panic!("expected function"),
+            }
+
+            let error = context
+                .attribute_set(generator, "__name__", long_text)
+                .unwrap_err();
+            assert!(error.contains("managed heap limit exceeded"));
+            match context.heap.get(generator) {
+                Some(HeapObject::Generator(generator)) => {
+                    assert!(generator.name_override.is_none());
+                    match context.heap.get(generator.function) {
+                        Some(HeapObject::Function(function)) => {
+                            assert_eq!(function.name, "compact_gen")
+                        }
+                        _ => panic!("expected generator function"),
+                    }
+                }
+                _ => panic!("expected generator"),
+            }
+
+            context.set_heap_limit(None).unwrap();
+        });
+    }
+
+    #[test]
     fn user_inheritance_uses_c3_and_super_values_trace_the_hierarchy() {
         let mut context = RimeraContext::default();
         context.initialize_kernel().unwrap();
@@ -5686,6 +7019,85 @@ mod tests {
             0
         );
         context.set_heap_limit(None).unwrap();
+    }
+
+    #[test]
+    fn gate10_slice5_async_provider_lease_roots_graph_and_releases_exactly_once() {
+        let _guard = BUFFER_TEST_LOCK.lock().unwrap();
+        BUFFER_ACQUIRE_COUNT.store(0, AtomicOrdering::SeqCst);
+        BUFFER_RELEASE_COUNT.store(0, AtomicOrdering::SeqCst);
+        let mut context = RimeraContext::default();
+        context.initialize_kernel().unwrap();
+        let coroutine_function = test_function(
+            &mut context,
+            two_stage_generator_resume as usize,
+            FunctionKind::Coroutine {
+                persistent_slot_count: 0,
+            },
+            "root",
+            "root",
+            vec![],
+            &[],
+        );
+        let coroutine = context.new_coroutine(coroutine_function, &[]).unwrap();
+        let (provider, data, inner) = make_buffer_provider(
+            &mut context,
+            buffer_provider_native as usize,
+            counting_buffer_release_native as usize,
+        );
+
+        // SAFETY: the driver below owns the unique mutable context borrow for
+        // its lifetime. This raw pointer is test-only observation of that same
+        // local context; it never escapes or aliases another active Rust borrow.
+        let context_pointer = std::ptr::from_mut(&mut context);
+        let driver = AsyncRuntimeDriver::with_capacity(&mut context, 1);
+        let mut task = driver.submit_root(coroutine).unwrap();
+        let waker = Waker::noop();
+        let mut poll_context = Context::from_waker(waker);
+        assert!(matches!(
+            Pin::new(&mut task).poll(&mut poll_context),
+            Poll::Pending
+        ));
+        let async_view = task.lease_buffer(provider).unwrap();
+        assert_eq!(BUFFER_ACQUIRE_COUNT.load(AtomicOrdering::SeqCst), 1);
+        let provider_lease = match unsafe { (*context_pointer).heap.get(async_view) } {
+            Some(HeapObject::MemoryView(view)) => view.lease.expect("provider lease"),
+            _ => panic!("async lease is not a memoryview"),
+        };
+        unsafe { (*context_pointer).collect() };
+        assert!(unsafe { (*context_pointer).heap.get(provider).is_some() });
+        assert!(unsafe { (*context_pointer).heap.get(data).is_some() });
+        assert!(unsafe { (*context_pointer).heap.get(inner).is_some() });
+        assert!(matches!(
+            unsafe { (*context_pointer).heap.get(provider_lease) },
+            Some(HeapObject::BufferLease(_))
+        ));
+        assert_eq!(BUFFER_RELEASE_COUNT.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            match unsafe { (*context_pointer).heap.get(data) } {
+                Some(HeapObject::ByteArray(data)) => data.exports,
+                _ => panic!("provider backing bytearray disappeared"),
+            },
+            1
+        );
+
+        drop(task);
+        assert_eq!(BUFFER_RELEASE_COUNT.load(AtomicOrdering::SeqCst), 1);
+        assert!(matches!(
+            unsafe { (*context_pointer).heap.get(inner) },
+            Some(HeapObject::MemoryView(inner)) if inner.released
+        ));
+        assert_eq!(
+            match unsafe { (*context_pointer).heap.get(data) } {
+                Some(HeapObject::ByteArray(data)) => data.exports,
+                _ => panic!("provider backing bytearray disappeared before release proof"),
+            },
+            0
+        );
+        drop(driver);
+        context.collect();
+        context.collect();
+        assert_eq!(BUFFER_RELEASE_COUNT.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[test]

@@ -3,6 +3,28 @@ use core::ptr;
 
 pub const ABI_VERSION: u32 = 1;
 
+/// Python `compile()` grammar mode shared by the compiler/runtime boundary.
+/// Parsing and lowering remain compiler-owned; the ABI carries only stable
+/// mode identity for managed code metadata and later native-loader work.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RDynamicCompileMode {
+    Exec = 0,
+    Eval = 1,
+    Single = 2,
+}
+
+impl RDynamicCompileMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::Eval => "eval",
+            Self::Single => "single",
+        }
+    }
+}
+
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RTag {
@@ -26,6 +48,20 @@ impl RValue {
         flags: 0,
         payload: 0,
     };
+
+    /// Internal native-local sentinel. It is never a Python-visible value: the
+    /// tag remains non-handle so GC root scanning can safely ignore an unbound
+    /// stack slot, while `flags = 1` distinguishes it from Python `None`.
+    pub const UNBOUND: Self = Self {
+        tag: RTag::None as u32,
+        flags: 1,
+        payload: 0,
+    };
+
+    #[must_use]
+    pub const fn is_unbound(self) -> bool {
+        self.tag == RTag::None as u32 && self.flags == 1 && self.payload == 0
+    }
 
     #[must_use]
     pub const fn boolean(value: bool) -> Self {
@@ -76,6 +112,214 @@ pub enum RStatus {
     AbiMismatch = 3,
 }
 
+/// Opaque generational identity for one submitted asynchronous root task.
+///
+/// The async runtime owns the slot/generation table. Python/runtime code may
+/// retain this value for identity and wake/cancel operations, but no layer may
+/// reinterpret it as a pointer.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RAsyncTaskId {
+    pub index: u32,
+    pub generation: u32,
+}
+
+/// Opaque 16-byte payload transported by the async facade without inspecting
+/// Python `RValue`, exception, or frame layouts.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RAsyncOpaqueValue {
+    pub low: u64,
+    pub high: u64,
+}
+
+/// Terminal category produced by a submitted root task.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RAsyncCompletionKind {
+    Returned = 0,
+    Raised = 1,
+    Cancelled = 2,
+    Dropped = 3,
+    DriverError = 4,
+}
+
+/// Executor-facade failures that do not originate from Python execution.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RAsyncDriverError {
+    ReentrantPoll = 1,
+    Shutdown = 2,
+    RuntimeContract = 3,
+}
+
+/// Inline completion record. `payload` is runtime-owned opaque data for
+/// `Returned`/`Raised`; `DriverError` uses `payload.low` for `RAsyncDriverError`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RAsyncCompletion {
+    pub kind: RAsyncCompletionKind,
+    pub reserved: [u8; 7],
+    pub payload: RAsyncOpaqueValue,
+}
+
+impl RAsyncCompletion {
+    #[must_use]
+    pub const fn new(kind: RAsyncCompletionKind, payload: RAsyncOpaqueValue) -> Self {
+        Self {
+            kind,
+            reserved: [0; 7],
+            payload,
+        }
+    }
+
+    #[must_use]
+    pub const fn driver_error(error: RAsyncDriverError) -> Self {
+        Self::new(
+            RAsyncCompletionKind::DriverError,
+            RAsyncOpaqueValue {
+                low: error as u64,
+                high: 0,
+            },
+        )
+    }
+}
+
+/// Result of one backend poll of the narrow runtime resume callback.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RAsyncPollState {
+    Pending = 0,
+    Ready = 1,
+}
+
+/// Result of invoking an opaque task wake handle.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RAsyncWakeStatus {
+    Woken = 0,
+    NoRegisteredWaker = 1,
+    StaleTask = 2,
+    Coalesced = 3,
+}
+
+/// Cancellation lifecycle for one root task. Request, observation, and
+/// acknowledgement are deliberately separate from terminal task completion.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RAsyncCancelState {
+    Clear = 0,
+    Requested = 1,
+    Observed = 2,
+    Acknowledged = 3,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RAsyncCancellation {
+    pub request_id: u64,
+    pub state: RAsyncCancelState,
+    pub reserved: [u8; 7],
+}
+
+impl RAsyncCancellation {
+    pub const CLEAR: Self = Self {
+        request_id: 0,
+        state: RAsyncCancelState::Clear,
+        reserved: [0; 7],
+    };
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RAsyncCancelTransition {
+    Observe = 1,
+    Acknowledge = 2,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RAsyncCancelTransitionStatus {
+    Applied = 0,
+    StaleRequest = 1,
+    StaleTask = 2,
+    InvalidTransition = 3,
+}
+
+/// Monotonic deadline relative to the owning executor-facade epoch. This is a
+/// transport record, never wall-clock time.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RAsyncDeadline {
+    pub nanos_from_epoch: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RAsyncTimerId {
+    pub sequence: u64,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RAsyncTimerState {
+    Registered = 0,
+    Fired = 1,
+    Cancelled = 2,
+}
+
+/// Backend-neutral wake callback. The `data` pointer is owned by the async
+/// facade and remains valid only while the corresponding task/facade is alive.
+pub type RAsyncWakeFn =
+    unsafe extern "C" fn(data: *mut c_void, task: RAsyncTaskId) -> RAsyncWakeStatus;
+
+/// Runtime acknowledgement of cancellation delivery. The facade validates
+/// task generation and request identity before applying the transition.
+pub type RAsyncCancelTransitionFn = unsafe extern "C" fn(
+    data: *mut c_void,
+    task: RAsyncTaskId,
+    request_id: u64,
+    transition: RAsyncCancelTransition,
+) -> RAsyncCancelTransitionStatus;
+
+/// Poll-local wake/cancellation view given to the runtime callback. The runtime
+/// may retain the `(control_data, wake, task)` triple as an opaque wake handle;
+/// it must not inspect `control_data`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RAsyncPollContext {
+    pub task: RAsyncTaskId,
+    pub control_data: *mut c_void,
+    pub wake: RAsyncWakeFn,
+    pub cancel_transition: RAsyncCancelTransitionFn,
+    pub cancellation: RAsyncCancellation,
+}
+
+/// Narrow runtime callback used by one submitted root future. The executor
+/// facade owns polling; the runtime owns Python coroutine/frame semantics and
+/// writes an opaque terminal completion only when returning `Ready`.
+pub type RAsyncResumeFn = unsafe extern "C" fn(
+    runtime: *mut c_void,
+    poll: *const RAsyncPollContext,
+    completion: *mut RAsyncCompletion,
+) -> RAsyncPollState;
+
+/// Exactly-once cleanup callback used when an active root task is dropped or
+/// the local facade is shut down before terminal completion.
+pub type RAsyncDropFn = unsafe extern "C" fn(runtime: *mut c_void, task: RAsyncTaskId);
+
+/// Native entry used to initialize one already-created managed module.
+///
+/// The signature intentionally matches ordinary non-generator compiled
+/// functions so module initializers share the verified Cranelift body path.
+pub type RNativeModuleInitializer = unsafe extern "C" fn(
+    context: *mut c_void,
+    module: *const RValue,
+    arguments: *const RValue,
+    argument_count: usize,
+    output: *mut RValue,
+) -> RStatus;
+
 /// Operation requested when resuming a native generator.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +336,11 @@ pub enum RGeneratorOperation {
 pub enum RGeneratorOutcome {
     Yielded = 0,
     Returned = 1,
+    /// Internal async suspension produced by `await`. Ordinary coroutines
+    /// transport this like a yielded scheduler token; async-generator operation
+    /// wrappers use the distinction so a delegated await never becomes a
+    /// Python-visible generated item.
+    Suspended = 2,
 }
 
 /// Result of forwarding one operation through a `yield from` delegate.
@@ -362,6 +611,46 @@ mod tests {
         assert_eq!(size_of::<RKeywordArgument>(), 32);
         assert_eq!(size_of::<RNameSpec>(), 16);
         assert_eq!(size_of::<RCodeMetadataSpec>(), 72);
+        assert_eq!(size_of::<RAsyncTaskId>(), 8);
+        assert_eq!(align_of::<RAsyncTaskId>(), 4);
+        assert_eq!(core::mem::offset_of!(RAsyncTaskId, index), 0);
+        assert_eq!(core::mem::offset_of!(RAsyncTaskId, generation), 4);
+        assert_eq!(size_of::<RAsyncOpaqueValue>(), 16);
+        assert_eq!(align_of::<RAsyncOpaqueValue>(), 8);
+        assert_eq!(size_of::<RAsyncCompletion>(), 24);
+        assert_eq!(align_of::<RAsyncCompletion>(), 8);
+        assert_eq!(core::mem::offset_of!(RAsyncCompletion, kind), 0);
+        assert_eq!(core::mem::offset_of!(RAsyncCompletion, reserved), 1);
+        assert_eq!(core::mem::offset_of!(RAsyncCompletion, payload), 8);
+        assert_eq!(size_of::<RAsyncCancellation>(), 16);
+        assert_eq!(align_of::<RAsyncCancellation>(), 8);
+        assert_eq!(core::mem::offset_of!(RAsyncCancellation, request_id), 0);
+        assert_eq!(core::mem::offset_of!(RAsyncCancellation, state), 8);
+        assert_eq!(core::mem::offset_of!(RAsyncCancellation, reserved), 9);
+        assert_eq!(size_of::<RAsyncPollContext>(), 48);
+        assert_eq!(align_of::<RAsyncPollContext>(), 8);
+        assert_eq!(core::mem::offset_of!(RAsyncPollContext, task), 0);
+        assert_eq!(core::mem::offset_of!(RAsyncPollContext, control_data), 8);
+        assert_eq!(core::mem::offset_of!(RAsyncPollContext, wake), 16);
+        assert_eq!(
+            core::mem::offset_of!(RAsyncPollContext, cancel_transition),
+            24
+        );
+        assert_eq!(core::mem::offset_of!(RAsyncPollContext, cancellation), 32);
+        assert_eq!(size_of::<RAsyncDeadline>(), 8);
+        assert_eq!(size_of::<RAsyncTimerId>(), 8);
+        assert_eq!(RAsyncCompletionKind::Returned as u8, 0);
+        assert_eq!(RAsyncCompletionKind::DriverError as u8, 4);
+        assert_eq!(RAsyncDriverError::ReentrantPoll as u8, 1);
+        assert_eq!(RAsyncDriverError::RuntimeContract as u8, 3);
+        assert_eq!(RAsyncPollState::Pending as u8, 0);
+        assert_eq!(RAsyncWakeStatus::StaleTask as u8, 2);
+        assert_eq!(RAsyncWakeStatus::Coalesced as u8, 3);
+        assert_eq!(RAsyncCancelState::Clear as u8, 0);
+        assert_eq!(RAsyncCancelState::Acknowledged as u8, 3);
+        assert_eq!(RAsyncCancelTransition::Observe as u8, 1);
+        assert_eq!(RAsyncCancelTransitionStatus::InvalidTransition as u8, 3);
+        assert_eq!(RAsyncTimerState::Cancelled as u8, 2);
     }
 
     #[test]

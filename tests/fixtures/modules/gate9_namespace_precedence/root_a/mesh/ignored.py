@@ -1,0 +1,1 @@
+value = "ignored namespace portion"

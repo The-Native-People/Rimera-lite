@@ -39,6 +39,8 @@ native activations under recursion, reentrancy, and failure.
 - Focused Gate 5 public run: 8 passed, 0 failed, including the Slice 3 binder/activation differential.
 - Integration boundary: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, `cargo test --doc --workspace`, and `git diff --check` all pass.
 - Full workspace test total: 262 passed, 0 failed, 0 ignored (3 ABI + 8 CLI + 40 compiler unit + 153 public native-pipeline + 58 runtime).
-- Gate 5 is not promoted; compatibility/TODO promotion remains Slice 8-owned and Gate 6 remains the sole active implementation tracker.
+- At this Slice 3 boundary promotion remained Slice 8-owned; the later Slice 8
+  audit closed Gate 5. Gates 7, 8, and Gate 9 Slice 1 have also closed; Slice 2 is the
+  current active implementation tracker.
 
 ## DONE BY CHATGPT

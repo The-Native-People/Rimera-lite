@@ -3,5 +3,16 @@ import { baseOptions } from '@/lib/layout.shared';
 import { HomeLayout } from 'fumadocs-ui/layouts/home';
 
 export default function Layout({ children }: { children: ReactNode }) {
-  return <HomeLayout {...baseOptions()}>{children}</HomeLayout>;
+  return (
+    <HomeLayout
+      {...baseOptions()}
+      className="rimera-site"
+      links={[
+        { text: 'Documentation', url: '/docs' },
+        { text: 'Benchmarks', url: '/docs/benchmarks' },
+      ]}
+    >
+      {children}
+    </HomeLayout>
+  );
 }

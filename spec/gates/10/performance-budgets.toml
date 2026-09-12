@@ -1,0 +1,39 @@
+version = 1
+oracle = "CPython 3.12.11"
+reference_target = "aarch64-apple-darwin"
+reference_cpu = "Apple M3"
+reference_profile = "release"
+
+[structural]
+root_wrapper_allocations_per_submitted_task_max = 1
+steady_state_adapter_allocations_per_poll_max = 0
+local_path_requires_send = false
+local_path_requires_arc = false
+local_path_requires_mutex = false
+local_path_requires_cross_thread_atomics = false
+rimera_ready_queues_max = 0
+nested_executor_tasks_per_direct_await_max = 0
+periodic_idle_polls_max = 0
+sync_async_symbols_max = 0
+sync_async_size_delta_bytes_max = 0
+
+[measured.macos_arm64]
+coroutine_creation_p95_ns_max = 750
+direct_await_ready_p95_ns_max = 1000
+ready_task_handoff_p95_ns_max = 100000
+timer_1ms_overshoot_p95_ns_max = 1000000
+cancellation_delivery_p95_ns_max = 100000
+idle_task_total_bytes_max = 4096
+direct_await_throughput_p50_ops_per_second_min = 1000000
+async_release_artifact_size_delta_bytes_max = 524288
+slice13_pure_ready_same_source_speedup_p50_min = 20.0
+slice13_creation_close_same_source_p50_ns_max = 10.0
+
+[measurement_policy]
+samples_min = 7
+warmups_min = 2
+report_required_percentiles = [50, 95, 99]
+regression_blocks_slice = true
+rebaseline_requires_profile = true
+rebaseline_requires_explanation = true
+single_best_run_is_evidence = false

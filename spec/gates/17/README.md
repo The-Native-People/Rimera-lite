@@ -74,3 +74,8 @@ Gate 17 closure permits the wording “Python 3.12 drop-in replacement” only w
 the qualified release's published target, capability, stdlib, and extension-
 ABI scope attached. “Runs every Python program everywhere” is never an honest
 or testable product claim.
+
+The first drop-in manifest must include the Gate 16 Flask, FastAPI, discord.py,
+and Pycord profiles with exact versions, extras, dependency locks, targets, and
+test results. A profile omitted from the signed manifest is not guaranteed,
+even if a smaller example happened to run during development.

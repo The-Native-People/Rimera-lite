@@ -1,0 +1,70 @@
+# rimera.toml
+
+[project]
+name = "media-api"
+version = "1.2.0"
+entry = "src/server.py"
+
+[build.time]
+# fast  = prioritize compilation speed
+# cheap = prioritize smaller/lighter builds
+# auto  = let Rimera choose
+opt = "fast"
+
+[runtime]
+# Bundle the Rimera runtime so the built project can
+# run on machines without Rimera installed.
+enabled = true
+
+[runtime.commands]
+# Development server.
+# Limit the runtime heap to 128 MiB and enable debug information.
+"dev" = "rimera-lite src/server.py --run --heap-limit-bytes 134217728 --debug"
+
+# Production server.
+"start" = "rimera-lite src/server.py --run --heap-limit-bytes 134217728"
+
+# Build a standalone macOS executable.
+"build" = "rimera-lite src/server.py --output dist/media-api/mac/media-api"
+
+# Run tests.
+"test" = "rimera-lite tests/test_server.py --run"
+
+# Clean generated build files.
+"clean" = "rimera-lite scripts/clean.py --run"
+
+
+[prequisites]
+# Format:
+#
+# dependency = "command that exits successfully when available"
+#
+# These are checked before building/running the project.
+
+python = "python3 --version"
+ffmpeg = "ffmpeg -version"
+git = "git --version"
+
+# Auto create and inject these enviromental variables when running.
+[env]
+HOST = "0.0.0.0"
+PORT = "8080"
+UPLOAD_DIR = "./uploads"
+OUTPUT_DIR = "./processed"
+
+
+[build]
+source = "src/server.py"
+output = "dist/media-api"
+include = [
+    "src/",
+    "assets/",
+    "config/"
+]
+exclude = [
+    "__pycache__/",
+    "*.pyc",
+    ".git/",
+    "uploads/",
+    "processed/"
+]

@@ -1,0 +1,34 @@
+---
+title: Embedding Rimera
+description: Embed Rimera in another native application.
+icon: Cable
+---
+
+Rimera can be embedded into a native host when you need to compile and run
+Python without handing control to a shell process. The host owns the build
+request, receives a native artifact, and decides when to launch it.
+
+<Callout type="warn" title="Embedding is an advanced integration">
+  The public end-user workflow is still `rimera-lite app.py`. Use embedding when
+  you are building a native tool that needs to own Rimera's lifecycle.
+</Callout>
+
+## What an embedding host does
+
+<Cards>
+  <Card title="Create a build request" description="Provide the Python entry file, project root, target, profile, output path, and capabilities." />
+  <Card title="Receive progress" description="Render compiler stages in your own UI or forward them to a terminal while the build runs." />
+  <Card title="Launch the artifact" description="After a successful build, run the returned executable path and handle its exit status." />
+</Cards>
+
+## Keep the boundary explicit
+
+An embedded build has the same guarantees as the `rimera-lite` command: unsupported
+behavior fails before an artifact is published, managed heap limits remain
+per-executable, and the generated program does not require a Python interpreter
+at runtime. Hosts should preserve the returned diagnostics and source spans
+instead of replacing them with a generic error.
+
+For ordinary projects, use the command-line interface described in
+[Using rimera-lite](/docs/getting-started). This page is for applications that
+already have a native integration surface and need to own the build lifecycle.

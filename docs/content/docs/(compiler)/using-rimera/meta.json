@@ -1,8 +1,0 @@
-{
-  "title": "Using Rimera",
-  "description": "Build and configure native Rimera programs.",
-  "icon": "Boxes",
-  "collapsible": true,
-  "defaultOpen": true,
-  "pages": ["architecture", "configuration"]
-}

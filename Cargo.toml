@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/rimera-abi",
+    "crates/rimera-async-runtime",
     "crates/rimera-runtime",
     "crates/rimera-compiler",
     "crates/rimera-cli",

@@ -5,9 +5,10 @@ method lookup and generic native calls. It must not lower context managers to a
 runtime shortcut, host-language unwinding, generated C, or a framework-specific
 path.
 
-Gate 8 remains queued until Gates 5–7 close. Its generator-interaction slices
-consume Gate 6 lifecycle semantics, and its exception/inspection behavior
-consumes the final Gate 5 and Gate 7 contracts.
+Gates 5–8 are closed. Gate 8's generator-interaction slices consume Gate 6
+lifecycle semantics, and its exception/inspection behavior consumes the
+completed Gate 5 and Gate 7 contracts. Gate 9 Slice 1 has since closed and
+Gate 9 Slice 2 is now the sole active compatibility slice.
 
 Every slice must reach the complete native path:
 
@@ -22,8 +23,8 @@ Python source -> owned syntax/HIR -> semantic analysis -> verified MIR
 - The slice size targets sustained GPT-5.6 Sol implementation work: each slice
   closes a meaningful context-management family without requiring another
   prompt between compiler, runtime, cleanup, and proof work.
-- Work in numeric order and keep exactly one Gate 8 slice active after the gate
-  is promoted.
+- Work in numeric order and keep exactly one Gate 8 slice active while the gate
+  is in progress.
 - A slice may use coordinated compiler, runtime/ABI, and proof lanes. Give each
   file one active owner and synchronize first on cleanup actions, completion
   payloads, special-method lookup, call ordering, and root ownership.
@@ -45,14 +46,19 @@ Python source -> owned syntax/HIR -> semantic analysis -> verified MIR
 
 ## Progress ledger
 
-- [ ] Slice 1 — ownership, syntax, cleanup contract, and differential matrix
-- [ ] Slice 2 — single-manager lookup, enter, body, and normal exit
-- [ ] Slice 3 — targets, multiple managers, partial entry, and ordering
-- [ ] Slice 4 — return, break, continue, and nested cleanup composition
-- [ ] Slice 5 — exception triples, suppression, replacement, and chaining
-- [ ] Slice 6 — suspension, generator `throw`/`close`, and delegated cleanup
-- [ ] Slice 7 — composition, GC, failure atomicity, and artifact proof
-- [ ] Slice 8 — final audit, documentation, and gate closure
+- [x] Slice 1 — ownership, syntax, cleanup contract, and differential matrix
+- [x] Slice 2 — single-manager lookup, enter, body, and normal exit
+- [x] Slice 3 — targets, multiple managers, partial entry, and ordering
+- [x] Slice 4 — return, break, continue, and nested cleanup composition
+- [x] Slice 5 — exception triples, suppression, replacement, and chaining
+- [x] Slice 6 — suspension, generator `throw`/`close`, and delegated cleanup
+- [x] Slice 7 — composition, GC, failure atomicity, and artifact proof
+- [x] Slice 8 — final audit, documentation, and gate closure
+
+Final Gate 8 proof is green: 3 ABI + 8 CLI + 44 compiler-lib + 190 public
+native-pipeline + 72 runtime tests = **317 passed, 0 failed, 0 ignored**;
+warning-denied workspace clippy, doc tests, formatting, and diff checks pass.
+The release `hello` is 503,544 bytes and its forbidden-symbol scan is clean.
 
 ## Slice order
 
@@ -65,6 +71,6 @@ Python source -> owned syntax/HIR -> semantic analysis -> verified MIR
 7. [Composition, GC, failure atomicity, and artifact proof](slice-7.md)
 8. [Final audit, documentation, and gate closure](slice-8.md)
 
-Gate 8 closes only when synchronous context managers can honestly move to
+Gate 8 is closed and synchronous context managers are
 `Implemented — conformance audit pending`. `async with`, async context-manager
 protocols, `contextlib`, and other stdlib helpers remain later-gate work.

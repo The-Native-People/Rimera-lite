@@ -12,6 +12,7 @@ crate-type = ["rlib", "staticlib"]
 num-bigint.workspace = true
 num-traits.workspace = true
 rimera-abi = { path = "../rimera-abi" }
+rimera-async-runtime = { path = "../rimera-async-runtime" }
 unicode-general-category.workspace = true
 
 [lints]

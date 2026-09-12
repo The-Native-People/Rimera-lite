@@ -1,4 +1,6 @@
 import type { ReactNode } from 'react';
+import '@fontsource-variable/red-hat-mono';
+import '@fontsource-variable/syne';
 import { Provider } from '@/components/provider';
 import '@/styles/globals.css';
 

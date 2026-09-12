@@ -1,0 +1,107 @@
+---
+title: Start here
+description: Start compiling Python with Rimera Lite.
+icon: Compass
+---
+
+import {
+  BadgeCheckIcon,
+  FileCode2Icon,
+  GaugeIcon,
+  SettingsIcon,
+  TerminalIcon,
+} from 'lucide-react';
+
+## Introduction
+
+Rimera Lite <span className="text-fd-muted-foreground text-sm">(rim-era)</span>
+compiles supported Python programs into standalone native executables. Use it
+like a compiler: point `rimera-lite` at a Python entry file, choose an output when
+you need one, and run the result.
+
+<Cards>
+
+<Card icon={<TerminalIcon className="text-cyan-400" />} title="Use rimera-lite" href="/docs/getting-started">
+
+Check commands, compile an entry point, or build and run in one step.
+
+</Card>
+
+<Card icon={<FileCode2Icon className="text-cyan-400" />} title="Build native programs" href="/docs/how-rimera-works">
+
+Turn a supported Python application into a self-contained executable for the configured target.
+
+</Card>
+
+<Card icon={<SettingsIcon className="text-cyan-400" />} title="Configure projects" href="/docs/configuration">
+
+Keep output, profile, debug mode, and memory limits in `pyproject.toml`.
+
+</Card>
+
+<Card icon={<BadgeCheckIcon className="text-cyan-400" />} title="Know what is supported" href="/docs/supported-python">
+
+See the current language coverage and the features that are intentionally not available yet.
+
+</Card>
+
+</Cards>
+
+<Callout title="First command">
+  Start with `rimera-lite --help`. It is the normal user-facing interface for
+  compiling and running Rimera programs.
+</Callout>
+
+### Terms
+
+**`rimera-lite`:** The Rimera Lite command-line program.
+
+**Native executable:** The program produced by Rimera, ready to run without a
+Python installation for the supported application.
+
+**`.rimera/`:** A project-local cache for native build intermediates and debug
+artifacts.
+
+<Callout title="Before you compile">
+  Rimera supports a substantial subset of Python, not every Python package or
+  language feature. Check [Supported Python](/docs/supported-python) before
+  moving an existing project over.
+</Callout>
+
+## Run Rimera
+
+The examples assume the `rimera-lite` binary is available on your `PATH`:
+
+```bash
+rimera-lite --help
+rimera-lite tests/fixtures/basic/core.py --output dist/core
+./dist/core
+```
+
+For a temporary compile-and-run:
+
+```bash
+rimera-lite tests/fixtures/basic/core.py --run
+```
+
+<Cards>
+
+<Card icon={<TerminalIcon className="text-cyan-400" />} title="CLI guide" href="/docs/getting-started">
+
+Build, run, debug, and configure Rimera from the command line.
+
+</Card>
+
+<Card icon={<GaugeIcon className="text-cyan-400" />} title="Benchmarks" href="/docs/benchmarks">
+
+Read benchmark baselines and how to interpret them honestly.
+
+</Card>
+
+</Cards>
+
+## Project principles
+
+- Native code is emitted directly; Rimera does not generate C or run Python bytecode.
+- Unsupported behavior fails with a stable diagnostic before an artifact is written.
+- Supported language behavior stays clearly documented for users.

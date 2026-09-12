@@ -82,14 +82,14 @@
   established, while overall language compatibility remains early. Never
   describe the project as fully compatible based on the supported fixture
   subset.
-- Current proven substantial partials: structured exceptions and tracebacks;
-  native functions and full supported-signature binding; LEGB/global/nonlocal
-  closure cells; arbitrary integers and strings; lists, tuples, ranges,
-  managed dictionaries and sets; native iteration and `for`; recursive,
-  chained, and general-starred unpacking; expanded calls; list/set/dict
-  comprehensions; Gate 4's included synchronous expression/statement/pattern
-  forms; and complete native synchronous generator lifecycle including source
-  `yield`, `send`, `throw`, `close`, cleanup suspension, and `yield from`.
+- Gate 5 functions, supported-signature calling, LEGB/closure cells, and
+  structured exceptions/tracebacks are now `Implemented — conformance audit
+  pending` on their single native binder/scope/exception/cleanup model. Other
+  proven core areas include arbitrary integers/strings, managed collections,
+  native iteration/`for`, recursive/starred unpacking, expanded calls,
+  comprehensions, Gate 4 synchronous forms, and Gate 6 source generators with
+  `yield`, `send`, `throw`, `close`, cleanup suspension, `yield from`, and the
+  Gate 8 exactly-once GC close path for abandoned suspended generators.
 - Current proven object-model partial: GC-rooted lazy builtin type identities,
   exact `rimera_type_of`, module-scope classes and instances, native attribute
   read/write/delete, descriptor precedence, supported slots, class cells, both
@@ -121,35 +121,39 @@
   public `sys.modules`, or a user-visible `__import__` builtin. Future import
   work must extend this single native registry/module-object path rather than
   creating a second loader.
-- Gate 7 Slices 1–8 are closed as deliberately pulled-forward reflection
-  prerequisites without promoting Gate 7 as a whole. The proven surface now
-  includes namespace views, identity/type/attribute helpers, managed
-  function/code/cell metadata, managed exception/traceback/frame inspection,
-  generator identity/state/suspension metadata, Python 3.12 generic-declaration
-  type metadata, audited class/type method tables, and Python-level PEP 688
-  buffer providers over the existing Gate 3 memoryview core. Type-parameter and
-  provider-lease graphs are traced, PEP 688 release is exactly-once across
-  derived views/failure/cycles, terminal generator frames detach from their
-  owner, and the startup/release constraints remain mandatory. Gate 7 Slices
-  9–10 remain queued behind the active Gate 5 work.
-- Not implemented as compatibility claims: context managers, the general import
-  and package system/`sys.modules`, broad reflection/introspection beyond proven
-  Gate 7 slices, async execution and async generators, `eval`/`exec`, weak
+- Gate 7 is closed through all ten reflection slices and is `Implemented —
+  conformance audit pending`. The proven surface includes namespace views,
+  identity/type/attribute helpers, managed function/code/cell and
+  exception/traceback/frame metadata, generator state/suspension metadata,
+  Python 3.12 generic-declaration type metadata, audited class/type method
+  tables, Python-level PEP 688 buffer providers, descendant/metaclass observer
+  invalidation, cross-family GC composition, and low-heap reflective mutation
+  atomicity. The narrow `inspect`/`weakref` module shells remain infrastructure,
+  not stdlib API claims.
+- Gate 8 synchronous context managers are closed and `Implemented — conformance
+  audit pending` through compiler-planned cleanup, exact exceptional exits,
+  generator lifecycle, GC, low-heap, and public native artifact proof.
+- Not implemented as compatibility claims: `eval`/`exec`, weak
   reference/finalizer behavior, stdlib corpora, native stdlib bindings, or PyPI
-  compatibility.
-- Gates 1–4 and Gate 6 are closed. The sole active compatibility slice is
-  **Gate 5 Slice 6**, continuing propagation, chaining, exception groups, and
-  cleanup completion on the existing Gate 5 function/cell/exception model.
-  Gate 5 Slices 1–5 are already complete; execute Slices 6–8 in numeric order
-  from `spec/gates/5/README.md`. Gate 7 Slices 1–8 are closed pulled-forward
-  prerequisites; Gate 7 Slices 9–10 and the Gate 8 context-manager ledger remain
-  queued in their matching `spec/gates/` directories. After Gates 5, 7, and 8
-  close, execute queued Gates 9–17 in numeric order for modules, async, dynamic
-  compilation, lifecycle semantics, language conformance, stdlib,
-  extension/platform ABI, ecosystem proof, and final drop-in release
-  qualification. Do not jump to frameworks, modules, or packages ahead of that
-  order. Only Gate 17 may authorize a drop-in claim, and only for its published
-  target/capability/stdlib/extension-ABI matrix.
+  compatibility. Gate 10 closure also does not claim stdlib `asyncio`, networking,
+  subprocesses, framework integration, or cross-thread async guarantees.
+- Gates 1–10 are closed. Gate 10 proves async syntax/HIR/MIR, lazy native
+  coroutines, direct/generic await, the one-root executor boundary,
+  deterministic timers/wakes/cancellation and buffer lifetime, async iteration,
+  comprehensions, async generators/finalization, suspended `async with` cleanup,
+  static Compio selection, cross-feature GC/cancellation stress, fixed
+  performance budgets, final reproducibility/native-artifact audits, and Slice
+  13's guarded AOT performance qualification in its documented macOS ARM64
+  boundary. Every comparable accepted p50 speed/throughput row beats CPython
+  3.12.11; materialized lifecycle diagnostics remain distinct from AOT-elided
+  same-source workload results. The sole active compatibility slice is
+  **Gate 11 Slice 1**, covering modes, code-object contracts, capabilities, and
+  the dynamic-compilation oracle matrix. Execute Gates 11–17 in
+  numeric order for dynamic compilation, lifecycle semantics, language
+  conformance, stdlib, extension/platform ABI, ecosystem proof, and final
+  drop-in release qualification. Do not jump to frameworks, modules, or
+  packages ahead of that order. Only Gate 17 may authorize a drop-in claim, and
+  only for its published target/capability/stdlib/extension-ABI matrix.
 - For implementation requests, begin from the earliest relevant incomplete
   dependency in `spec/compatibility.md`. Repair missing prerequisites and then
   continue the requested vertical slice; do not stop at runtime scaffolding.

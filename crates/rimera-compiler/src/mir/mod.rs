@@ -27,7 +27,21 @@ pub enum FunctionKind {
     Module,
     Python,
     Generator,
+    Coroutine,
+    AsyncGenerator,
     ClassBody,
+}
+
+/// Semantic reason a native async activation is suspended. Keeping this
+/// explicit in MIR prevents coroutine `await` from being disguised as a
+/// synchronous-generator yield and gives later async slices owned verifier
+/// states for their protocol boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SuspensionKind {
+    Await,
+    AsyncIteration,
+    AsyncGeneratorYield,
+    AsyncCleanup,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +58,9 @@ pub struct Function {
     pub name: String,
     pub qualified_name: String,
     pub parameters: Vec<Parameter>,
+    /// Number of ordinary Python locals lowered to native stack storage.
+    /// Closure cells and suspend-persistent values remain managed objects.
+    pub native_local_count: u32,
     pub entry: BlockId,
     pub blocks: Vec<Block>,
     pub value_count: u32,
@@ -180,6 +197,37 @@ pub enum OperationKind {
         dest: ValueId,
         value: ValueId,
     },
+    /// Allocation-free probe used by Gate 10 Slice 13 before building a
+    /// generic iterator. It matches only an exact managed `range` whose start,
+    /// stop, step and final element fit Rimera's immediate i64 representation.
+    /// `first`/`last` are valid only when `nonempty` is true.
+    RangeCollapseProbe {
+        first: ValueId,
+        last: ValueId,
+        matched: ValueId,
+        nonempty: ValueId,
+        value: ValueId,
+    },
+    /// Side-effect-free guard for eliding repeated creation followed by an
+    /// immediate close of an exact zero-argument Rimera coroutine function.
+    /// A miss performs no call/allocation so lowering can fall back to the
+    /// ordinary loop unchanged.
+    CoroutineCloseElideProbe {
+        matched: ValueId,
+        callable: ValueId,
+    },
+    AwaitIterator {
+        dest: ValueId,
+        value: ValueId,
+    },
+    AsyncIteratorNew {
+        dest: ValueId,
+        value: ValueId,
+    },
+    AsyncIteratorNext {
+        dest: ValueId,
+        iterator: ValueId,
+    },
     IteratorNext {
         item: ValueId,
         has_value: ValueId,
@@ -305,6 +353,15 @@ pub enum OperationKind {
         receiver: ValueId,
         name: String,
     },
+    TypeOf {
+        dest: ValueId,
+        value: ValueId,
+    },
+    SpecialMethodGet {
+        dest: ValueId,
+        receiver: ValueId,
+        name: String,
+    },
     AttributeSet {
         receiver: ValueId,
         name: String,
@@ -319,6 +376,19 @@ pub enum OperationKind {
         callable: ValueId,
         positional: Vec<ValueId>,
         keywords: Vec<(String, ValueId)>,
+    },
+    /// Attempts the allocation-free eager entry for an exact positional call to
+    /// a coroutine whose MIR is proven incapable of suspension. `matched` is a
+    /// Python bool. A false match performs no call, allowing lowering to reuse
+    /// the already-evaluated callable/arguments on the ordinary lazy path.
+    CallAwaitReady {
+        dest: ValueId,
+        matched: ValueId,
+        callable: ValueId,
+        positional: Vec<ValueId>,
+        /// When true, the dynamic function metadata must also carry the strict
+        /// repeat-pure proof used by Slice 13 loop collapse.
+        pure_only: bool,
     },
     CallArgumentsNew {
         dest: ValueId,
@@ -341,6 +411,18 @@ pub enum OperationKind {
     CellNew {
         dest: ValueId,
         initial: Option<ValueId>,
+    },
+    NativeLocalGet {
+        dest: ValueId,
+        index: u32,
+        name: String,
+    },
+    NativeLocalSet {
+        index: u32,
+        value: ValueId,
+    },
+    NativeLocalClear {
+        index: u32,
     },
     ReflectionScopeConfigure {
         namespace: Option<ValueId>,
@@ -370,6 +452,15 @@ pub enum OperationKind {
     ImportName {
         dest: ValueId,
         name: String,
+    },
+    ImportFrom {
+        dest: ValueId,
+        module: ValueId,
+        name: String,
+        submodule: String,
+    },
+    ImportStar {
+        module: ValueId,
     },
     GlobalGet {
         dest: ValueId,
@@ -421,6 +512,7 @@ pub enum OperationKind {
     Print {
         values: Vec<ValueId>,
     },
+    Display { value: ValueId },
     PrintLiteral {
         value: String,
     },
@@ -449,6 +541,9 @@ impl OperationKind {
             | Self::ItemGet { dest, .. }
             | Self::Length { dest, .. }
             | Self::IteratorNew { dest, .. }
+            | Self::AwaitIterator { dest, .. }
+            | Self::AsyncIteratorNew { dest, .. }
+            | Self::AsyncIteratorNext { dest, .. }
             | Self::Range { dest, .. }
             | Self::ValueArrayGet { dest, .. }
             | Self::PatternSequence { values: dest, .. }
@@ -464,13 +559,17 @@ impl OperationKind {
             | Self::ClassFreeGet { dest, .. }
             | Self::ClassNew { dest, .. }
             | Self::AttributeGet { dest, .. }
+            | Self::TypeOf { dest, .. }
+            | Self::SpecialMethodGet { dest, .. }
             | Self::Call { dest, .. }
             | Self::CallArgumentsNew { dest, .. }
             | Self::CallPrepared { dest, .. }
             | Self::CellNew { dest, .. }
+            | Self::NativeLocalGet { dest, .. }
             | Self::CellGet { dest, .. }
             | Self::ClosureGet { dest, .. }
             | Self::ImportName { dest, .. }
+            | Self::ImportFrom { dest, .. }
             | Self::GlobalGet { dest, .. } => Some(*dest),
             Self::ExceptionActive { dest }
             | Self::ExceptionMatches { dest, .. }
@@ -479,8 +578,11 @@ impl OperationKind {
             | Self::HandlerEnter { dest } => Some(*dest),
             Self::ReflectionScopeConfigure { .. }
             | Self::ReflectionLocalRegister { .. }
+            | Self::NativeLocalSet { .. }
+            | Self::NativeLocalClear { .. }
             | Self::CellSet { .. }
             | Self::CellClear { .. }
+            | Self::ImportStar { .. }
             | Self::GlobalSet { .. }
             | Self::GlobalDelete { .. }
             | Self::AnnotationsEnsure { .. }
@@ -499,6 +601,9 @@ impl OperationKind {
             | Self::DictionaryInsert { .. }
             | Self::SetInsert { .. }
             | Self::CallArgumentAdd { .. }
+            | Self::CallAwaitReady { .. }
+            | Self::RangeCollapseProbe { .. }
+            | Self::CoroutineCloseElideProbe { .. }
             | Self::IteratorNext { .. }
             | Self::YieldFromNext { .. }
             | Self::CallModuleChunk { .. }
@@ -506,6 +611,7 @@ impl OperationKind {
             | Self::Reraise
             | Self::Propagate
             | Self::Print { .. }
+            | Self::Display { .. }
             | Self::PrintLiteral { .. }
             | Self::Collect => None,
         }
@@ -522,6 +628,15 @@ impl OperationKind {
                 complete,
                 ..
             } => vec![*yielded, *result, *complete],
+            Self::CallAwaitReady { dest, matched, .. } => vec![*dest, *matched],
+            Self::RangeCollapseProbe {
+                first,
+                last,
+                matched,
+                nonempty,
+                ..
+            } => vec![*first, *last, *matched, *nonempty],
+            Self::CoroutineCloseElideProbe { matched, .. } => vec![*matched],
             Self::PatternSequence {
                 values, matched, ..
             }
@@ -573,6 +688,14 @@ pub enum Terminator {
         exception_target: Option<BlockId>,
         delegate: Option<ValueId>,
     },
+    Suspend {
+        kind: SuspensionKind,
+        value: ValueId,
+        resume_value: Option<ValueId>,
+        resume_target: BlockId,
+        exception_target: Option<BlockId>,
+        delegate: Option<ValueId>,
+    },
     Unreachable,
 }
 
@@ -610,7 +733,13 @@ pub fn safepoint_plan(program: &Function) -> Result<SafepointPlan, String> {
         for (block_index, block) in program.blocks.iter().enumerate().rev() {
             let mut live = successor_live_values(program, block, &live_in);
             live.extend(terminator_inputs(&block.terminator));
-            for operation in block.operations.iter().rev() {
+            for (operation_index, operation) in block.operations.iter().enumerate().rev() {
+                if let Some(target) = program
+                    .exception_edges
+                    .get(&(block_index as u32, operation_index as u32))
+                {
+                    live.extend(live_in[target.0 as usize].iter().copied());
+                }
                 for destination in operation.kind.destinations() {
                     live.remove(&destination);
                 }
@@ -637,13 +766,19 @@ pub fn safepoint_plan(program: &Function) -> Result<SafepointPlan, String> {
         live.extend(terminator_inputs(&block.terminator));
         if matches!(
             block.terminator,
-            Terminator::Branch { .. } | Terminator::Yield { .. }
+            Terminator::Branch { .. } | Terminator::Yield { .. } | Terminator::Suspend { .. }
         ) {
             let roots = live.iter().copied().collect::<Vec<_>>();
             max_roots = max_roots.max(roots.len());
             terminator_roots.insert(block_index, roots);
         }
         for (operation_index, operation) in block.operations.iter().enumerate().rev() {
+            if let Some(target) = program
+                .exception_edges
+                .get(&(block_index as u32, operation_index as u32))
+            {
+                live.extend(live_in[target.0 as usize].iter().copied());
+            }
             for destination in operation.kind.destinations() {
                 live.remove(&destination);
             }
@@ -684,7 +819,7 @@ fn verify_safepoint_plan(program: &Function, plan: &SafepointPlan) -> Result<(),
         let roots = plan.terminator_roots(block_index);
         if matches!(
             block.terminator,
-            Terminator::Branch { .. } | Terminator::Yield { .. }
+            Terminator::Branch { .. } | Terminator::Yield { .. } | Terminator::Suspend { .. }
         ) != roots.is_some()
         {
             return Err(format!(
@@ -746,6 +881,11 @@ fn operation_is_safepoint(operation: &OperationKind) -> bool {
         | OperationKind::ItemGet { .. }
         | OperationKind::Length { .. }
         | OperationKind::IteratorNew { .. }
+        | OperationKind::RangeCollapseProbe { .. }
+        | OperationKind::CoroutineCloseElideProbe { .. }
+        | OperationKind::AwaitIterator { .. }
+        | OperationKind::AsyncIteratorNew { .. }
+        | OperationKind::AsyncIteratorNext { .. }
         | OperationKind::IteratorNext { .. }
         | OperationKind::YieldFromNext { .. }
         | OperationKind::Range { .. }
@@ -768,14 +908,18 @@ fn operation_is_safepoint(operation: &OperationKind) -> bool {
         | OperationKind::ClassNamespaceDelete { .. }
         | OperationKind::ClassNew { .. }
         | OperationKind::AttributeGet { .. }
+        | OperationKind::TypeOf { .. }
+        | OperationKind::SpecialMethodGet { .. }
         | OperationKind::AttributeSet { .. }
         | OperationKind::AttributeDelete { .. }
         | OperationKind::Call { .. }
+        | OperationKind::CallAwaitReady { .. }
         | OperationKind::CallArgumentsNew { .. }
         | OperationKind::CallArgumentAdd { .. }
         | OperationKind::CallPrepared { .. }
         | OperationKind::CallModuleChunk { .. }
         | OperationKind::CellNew { .. }
+        | OperationKind::NativeLocalGet { .. }
         | OperationKind::ReflectionScopeConfigure { .. }
         | OperationKind::ReflectionLocalRegister { .. }
         | OperationKind::CellGet { .. }
@@ -783,6 +927,8 @@ fn operation_is_safepoint(operation: &OperationKind) -> bool {
         | OperationKind::CellSet { .. }
         | OperationKind::CellClear { .. }
         | OperationKind::ImportName { .. }
+        | OperationKind::ImportFrom { .. }
+        | OperationKind::ImportStar { .. }
         | OperationKind::GlobalGet { .. }
         | OperationKind::GlobalSet { .. }
         | OperationKind::GlobalDelete { .. }
@@ -799,9 +945,13 @@ fn operation_is_safepoint(operation: &OperationKind) -> bool {
         | OperationKind::Reraise
         | OperationKind::Propagate
         | OperationKind::Print { .. }
+        | OperationKind::Display { .. }
         | OperationKind::PrintLiteral { .. }
         | OperationKind::Collect => true,
-        OperationKind::Constant { .. } | OperationKind::Copy { .. } => false,
+        OperationKind::NativeLocalSet { .. }
+        | OperationKind::NativeLocalClear { .. }
+        | OperationKind::Constant { .. }
+        | OperationKind::Copy { .. } => false,
     }
 }
 
@@ -821,6 +971,9 @@ fn terminator_inputs(terminator: &Terminator) -> Vec<ValueId> {
         Terminator::ReturnValue { value } => value.iter().copied().collect(),
         Terminator::Yield {
             value, delegate, ..
+        }
+        | Terminator::Suspend {
+            value, delegate, ..
         } => std::iter::once(*value)
             .chain(delegate.iter().copied())
             .collect(),
@@ -836,6 +989,11 @@ fn terminator_successors(terminator: &Terminator) -> Vec<BlockId> {
             ..
         } => vec![*then_target, *else_target],
         Terminator::Yield {
+            resume_target,
+            exception_target,
+            ..
+        }
+        | Terminator::Suspend {
             resume_target,
             exception_target,
             ..
@@ -956,6 +1114,19 @@ pub fn verify_function(program: &Function) -> Result<(), String> {
             }
             for input in operation_inputs(&operation.kind) {
                 verify_value(input, program.value_count)?;
+            }
+            let native_index = match &operation.kind {
+                OperationKind::NativeLocalGet { index, .. }
+                | OperationKind::NativeLocalSet { index, .. }
+                | OperationKind::NativeLocalClear { index } => Some(*index),
+                _ => None,
+            };
+            if native_index.is_some_and(|index| index >= program.native_local_count) {
+                return Err(format!(
+                    "MIR native local index {} exceeds function capacity {}",
+                    native_index.expect("checked above"),
+                    program.native_local_count
+                ));
             }
         }
         verify_terminator(program, block_index, &block.terminator)?;
@@ -1196,6 +1367,29 @@ fn render_operation(operation: &Operation) -> String {
         } => format!("v{} = item_get(v{}, v{})", dest.0, collection.0, index.0),
         OperationKind::Length { dest, value } => format!("v{} = len(v{})", dest.0, value.0),
         OperationKind::IteratorNew { dest, value } => format!("v{} = iter(v{})", dest.0, value.0),
+        OperationKind::RangeCollapseProbe {
+            first,
+            last,
+            matched,
+            nonempty,
+            value,
+        } => format!(
+            "v{}, v{}, v{}, v{} = range_collapse_probe(v{})",
+            first.0, last.0, matched.0, nonempty.0, value.0
+        ),
+        OperationKind::CoroutineCloseElideProbe { matched, callable } => format!(
+            "v{} = coroutine_close_elide_probe(v{})",
+            matched.0, callable.0
+        ),
+        OperationKind::AwaitIterator { dest, value } => {
+            format!("v{} = await_iter(v{})", dest.0, value.0)
+        }
+        OperationKind::AsyncIteratorNew { dest, value } => {
+            format!("v{} = async_iter(v{})", dest.0, value.0)
+        }
+        OperationKind::AsyncIteratorNext { dest, iterator } => {
+            format!("v{} = async_next(v{})", dest.0, iterator.0)
+        }
         OperationKind::IteratorNext {
             item,
             has_value,
@@ -1343,6 +1537,17 @@ fn render_operation(operation: &Operation) -> String {
             receiver,
             name,
         } => format!("v{} = attr_get(v{}, {name:?})", dest.0, receiver.0),
+        OperationKind::TypeOf { dest, value } => {
+            format!("v{} = type_of(v{})", dest.0, value.0)
+        }
+        OperationKind::SpecialMethodGet {
+            dest,
+            receiver,
+            name,
+        } => format!(
+            "v{} = special_method_get(v{}, {name:?})",
+            dest.0, receiver.0
+        ),
         OperationKind::AttributeSet {
             receiver,
             name,
@@ -1359,6 +1564,16 @@ fn render_operation(operation: &Operation) -> String {
         } => format!(
             "v{} = call(v{}, positional={:?}, keywords={:?})",
             dest.0, callable.0, positional, keywords
+        ),
+        OperationKind::CallAwaitReady {
+            dest,
+            matched,
+            callable,
+            positional,
+            pure_only,
+        } => format!(
+            "v{}, v{} = call_await_ready(v{}, positional={:?}, pure_only={})",
+            dest.0, matched.0, callable.0, positional, pure_only
         ),
         OperationKind::CallArgumentsNew { dest, callable } => {
             format!("v{} = call_arguments_new(v{})", dest.0, callable.0)
@@ -1386,6 +1601,15 @@ fn render_operation(operation: &Operation) -> String {
         OperationKind::CellNew { dest, initial } => {
             format!("v{} = cell_new({initial:?})", dest.0)
         }
+        OperationKind::NativeLocalGet { dest, index, name } => {
+            format!("v{} = native_local_get({index}, {name:?})", dest.0)
+        }
+        OperationKind::NativeLocalSet { index, value } => {
+            format!("native_local_set({index}, v{})", value.0)
+        }
+        OperationKind::NativeLocalClear { index } => {
+            format!("native_local_clear({index})")
+        }
         OperationKind::ReflectionScopeConfigure {
             namespace,
             comprehension,
@@ -1412,6 +1636,16 @@ fn render_operation(operation: &Operation) -> String {
         OperationKind::ImportName { dest, name } => {
             format!("v{} = import_name({name:?})", dest.0)
         }
+        OperationKind::ImportFrom {
+            dest,
+            module,
+            name,
+            submodule,
+        } => format!(
+            "v{} = import_from(v{}, {name:?}, fallback={submodule:?})",
+            dest.0, module.0
+        ),
+        OperationKind::ImportStar { module } => format!("import_star(v{})", module.0),
         OperationKind::GlobalGet { dest, name } => {
             format!("v{} = global_get({name:?})", dest.0)
         }
@@ -1458,6 +1692,7 @@ fn render_operation(operation: &Operation) -> String {
         ),
         OperationKind::Reraise => "raise".to_owned(),
         OperationKind::Propagate => "propagate_exception()".to_owned(),
+        OperationKind::Display { value } => format!("display {value:?}"),
         OperationKind::Print { values } => format!(
             "print({})",
             values
@@ -1505,6 +1740,17 @@ fn render_terminator(terminator: &Terminator) -> String {
             "# yield {value:?} -> block{} resume={resume_value:?} exception={exception_target:?} delegate={delegate:?}",
             resume_target.0
         ),
+        Terminator::Suspend {
+            kind,
+            value,
+            resume_value,
+            resume_target,
+            exception_target,
+            delegate,
+        } => format!(
+            "# suspend {kind:?} {value:?} -> block{} resume={resume_value:?} exception={exception_target:?} delegate={delegate:?}",
+            resume_target.0
+        ),
         Terminator::Unreachable => "# unreachable".to_owned(),
     }
 }
@@ -1520,6 +1766,8 @@ fn verify_value(value: ValueId, count: u32) -> Result<(), String> {
 fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
     match operation {
         OperationKind::Constant { .. }
+        | OperationKind::NativeLocalGet { .. }
+        | OperationKind::NativeLocalClear { .. }
         | OperationKind::TypeParameterNew { .. }
         | OperationKind::ImportName { .. }
         | OperationKind::GlobalGet { .. }
@@ -1533,6 +1781,9 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
         | OperationKind::GlobalDelete { .. }
         | OperationKind::PrintLiteral { .. }
         | OperationKind::Collect => Vec::new(),
+        OperationKind::ImportFrom { module, .. } | OperationKind::ImportStar { module } => {
+            vec![*module]
+        }
         OperationKind::Copy { source, .. } => vec![*source],
         OperationKind::Unary { operand, .. } => vec![*operand],
         OperationKind::Binary { left, right, .. }
@@ -1542,6 +1793,7 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
         }
         OperationKind::FormatValue { value, spec, .. } => vec![*value, *spec],
         OperationKind::Print { values } => values.clone(),
+        OperationKind::Display { value } => vec![*value],
         OperationKind::ValueArray { values, .. }
         | OperationKind::Tuple { values, .. }
         | OperationKind::List { values, .. }
@@ -1573,8 +1825,13 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
             collection, index, ..
         } => vec![*collection, *index],
         OperationKind::Length { value, .. } => vec![*value],
-        OperationKind::IteratorNew { value, .. } => vec![*value],
-        OperationKind::IteratorNext { iterator, .. }
+        OperationKind::IteratorNew { value, .. }
+        | OperationKind::RangeCollapseProbe { value, .. }
+        | OperationKind::AwaitIterator { value, .. }
+        | OperationKind::AsyncIteratorNew { value, .. } => vec![*value],
+        OperationKind::CoroutineCloseElideProbe { callable, .. } => vec![*callable],
+        OperationKind::AsyncIteratorNext { iterator, .. }
+        | OperationKind::IteratorNext { iterator, .. }
         | OperationKind::YieldFromNext { iterator, .. } => vec![*iterator],
         OperationKind::Range {
             start, stop, step, ..
@@ -1621,7 +1878,9 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
             .chain(std::iter::once(*namespace))
             .collect(),
         OperationKind::AttributeGet { receiver, .. }
+        | OperationKind::SpecialMethodGet { receiver, .. }
         | OperationKind::AttributeDelete { receiver, .. } => vec![*receiver],
+        OperationKind::TypeOf { value, .. } => vec![*value],
         OperationKind::AttributeSet {
             receiver, value, ..
         } => vec![*receiver, *value],
@@ -1634,6 +1893,13 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
             .chain(positional.iter().copied())
             .chain(keywords.iter().map(|(_, value)| *value))
             .collect(),
+        OperationKind::CallAwaitReady {
+            callable,
+            positional,
+            ..
+        } => std::iter::once(*callable)
+            .chain(positional.iter().copied())
+            .collect(),
         OperationKind::CallArgumentsNew { callable, .. } => vec![*callable],
         OperationKind::CallArgumentAdd {
             arguments, value, ..
@@ -1645,6 +1911,7 @@ fn operation_inputs(operation: &OperationKind) -> Vec<ValueId> {
         } => vec![*callable, *arguments],
         OperationKind::CallModuleChunk { .. } => Vec::new(),
         OperationKind::CellNew { initial, .. } => initial.iter().copied().collect(),
+        OperationKind::NativeLocalSet { value, .. } => vec![*value],
         OperationKind::ReflectionScopeConfigure { namespace, .. } => {
             namespace.iter().copied().collect()
         }
@@ -1708,48 +1975,105 @@ fn verify_terminator(
             exception_target,
             delegate,
         } => {
-            if program.kind != FunctionKind::Generator {
+            if !matches!(
+                program.kind,
+                FunctionKind::Generator | FunctionKind::AsyncGenerator
+            ) {
                 return Err("MIR yield terminator is only valid in generator functions".to_owned());
             }
-            verify_value(*value, program.value_count)?;
-            if let Some(delegate) = delegate {
-                verify_value(*delegate, program.value_count)?;
+            verify_resume_edge(
+                program,
+                block_index,
+                "yield",
+                *value,
+                *resume_value,
+                *resume_target,
+                *exception_target,
+                *delegate,
+            )
+        }
+        Terminator::Suspend {
+            kind,
+            value,
+            resume_value,
+            resume_target,
+            exception_target,
+            delegate,
+        } => {
+            if !matches!(
+                program.kind,
+                FunctionKind::Coroutine | FunctionKind::AsyncGenerator
+            ) {
+                return Err("MIR async suspension is only valid in coroutine functions".to_owned());
             }
-            let Some(resume_block) = program.blocks.get(resume_target.0 as usize) else {
-                return Err(format!(
-                    "MIR block {block_index} targets missing resume block {}",
-                    resume_target.0
-                ));
-            };
-            match resume_value {
-                Some(resume_value) => {
-                    verify_value(*resume_value, program.value_count)?;
-                    if resume_block.parameters.as_slice() != [*resume_value] {
-                        return Err(format!(
-                            "MIR yield resume block {} must define exactly resume value %{}",
-                            resume_target.0, resume_value.0
-                        ));
-                    }
-                }
-                None if !resume_block.parameters.is_empty() => {
-                    return Err(format!(
-                        "MIR yield resume block {} unexpectedly requires parameters",
-                        resume_target.0
-                    ));
-                }
-                None => {}
+            if *kind == SuspensionKind::Await && delegate.is_none() {
+                return Err("MIR await suspension must retain its awaited delegate".to_owned());
             }
-            if let Some(exception_target) = exception_target {
-                verify_edge(program, block_index, *exception_target, &[])?;
-            }
-            Ok(())
+            verify_resume_edge(
+                program,
+                block_index,
+                "suspension",
+                *value,
+                *resume_value,
+                *resume_target,
+                *exception_target,
+                *delegate,
+            )
         }
         Terminator::Unreachable => Err(format!("MIR block {block_index} is unterminated")),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn verify_resume_edge(
+    program: &Function,
+    block_index: usize,
+    label: &str,
+    value: ValueId,
+    resume_value: Option<ValueId>,
+    resume_target: BlockId,
+    exception_target: Option<BlockId>,
+    delegate: Option<ValueId>,
+) -> Result<(), String> {
+    verify_value(value, program.value_count)?;
+    if let Some(delegate) = delegate {
+        verify_value(delegate, program.value_count)?;
+    }
+    let Some(resume_block) = program.blocks.get(resume_target.0 as usize) else {
+        return Err(format!(
+            "MIR block {block_index} targets missing {label} resume block {}",
+            resume_target.0
+        ));
+    };
+    match resume_value {
+        Some(resume_value) => {
+            verify_value(resume_value, program.value_count)?;
+            if resume_block.parameters.as_slice() != [resume_value] {
+                return Err(format!(
+                    "MIR {label} resume block {} must define exactly resume value %{}",
+                    resume_target.0, resume_value.0
+                ));
+            }
+        }
+        None if !resume_block.parameters.is_empty() => {
+            return Err(format!(
+                "MIR {label} resume block {} unexpectedly requires parameters",
+                resume_target.0
+            ));
+        }
+        None => {}
+    }
+    if let Some(exception_target) = exception_target {
+        verify_edge(program, block_index, exception_target, &[])?;
+    }
+    Ok(())
+}
+
 pub fn generator_persistent_values(function: &Function) -> Result<Vec<ValueId>, String> {
-    if function.kind != FunctionKind::Generator {
+    if !matches!(
+        function.kind,
+        FunctionKind::Generator | FunctionKind::Coroutine | FunctionKind::AsyncGenerator
+    ) {
         return Ok(Vec::new());
     }
     verify_function(function)?;
@@ -1759,7 +2083,13 @@ pub fn generator_persistent_values(function: &Function) -> Result<Vec<ValueId>, 
         for (block_index, block) in function.blocks.iter().enumerate().rev() {
             let mut live = successor_live_values(function, block, &live_in);
             live.extend(terminator_inputs(&block.terminator));
-            for operation in block.operations.iter().rev() {
+            for (operation_index, operation) in block.operations.iter().enumerate().rev() {
+                if let Some(target) = function
+                    .exception_edges
+                    .get(&(block_index as u32, operation_index as u32))
+                {
+                    live.extend(live_in[target.0 as usize].iter().copied());
+                }
                 for destination in operation.kind.destinations() {
                     live.remove(&destination);
                 }
@@ -1779,8 +2109,24 @@ pub fn generator_persistent_values(function: &Function) -> Result<Vec<ValueId>, 
     }
     let mut persistent = BTreeSet::new();
     for block in &function.blocks {
-        if let Terminator::Yield { resume_target, .. } = block.terminator {
+        let suspension_edges = match block.terminator {
+            Terminator::Yield {
+                resume_target,
+                exception_target,
+                ..
+            }
+            | Terminator::Suspend {
+                resume_target,
+                exception_target,
+                ..
+            } => Some((resume_target, exception_target)),
+            _ => None,
+        };
+        if let Some((resume_target, exception_target)) = suspension_edges {
             persistent.extend(live_in[resume_target.0 as usize].iter().copied());
+            if let Some(exception_target) = exception_target {
+                persistent.extend(live_in[exception_target.0 as usize].iter().copied());
+            }
         }
     }
     for parameter in &function.parameters {
@@ -1826,6 +2172,7 @@ mod tests {
             name: "test".to_owned(),
             qualified_name: "test".to_owned(),
             parameters: vec![],
+            native_local_count: 0,
             entry: BlockId(0),
             value_count: 1,
             exception_edges: BTreeMap::new(),
@@ -1855,6 +2202,7 @@ mod tests {
             name: "test".to_owned(),
             qualified_name: "test".to_owned(),
             parameters: vec![],
+            native_local_count: 0,
             entry: BlockId(0),
             value_count: 2,
             exception_edges: BTreeMap::new(),
@@ -1890,6 +2238,7 @@ mod tests {
             name: "test".to_owned(),
             qualified_name: "test".to_owned(),
             parameters: vec![],
+            native_local_count: 0,
             entry: BlockId(0),
             value_count: 1,
             exception_edges: BTreeMap::new(),
@@ -1928,6 +2277,7 @@ mod tests {
             name: "test".to_owned(),
             qualified_name: "test".to_owned(),
             parameters: vec![],
+            native_local_count: 0,
             entry: BlockId(0),
             value_count: 0,
             exception_edges: BTreeMap::new(),
@@ -1954,6 +2304,7 @@ mod tests {
             name: "test".to_owned(),
             qualified_name: "test".to_owned(),
             parameters: vec![],
+            native_local_count: 0,
             entry: BlockId(0),
             value_count: 2,
             exception_edges: BTreeMap::new(),
@@ -2032,6 +2383,7 @@ mod tests {
             name: "test".to_owned(),
             qualified_name: "test".to_owned(),
             parameters: vec![],
+            native_local_count: 0,
             entry: BlockId(0),
             value_count: 4,
             exception_edges: BTreeMap::from([((0, 3), BlockId(1))]),
@@ -2067,6 +2419,7 @@ mod tests {
             name: "test".to_owned(),
             qualified_name: "test".to_owned(),
             parameters: vec![],
+            native_local_count: 0,
             entry: BlockId(0),
             value_count: 4,
             exception_edges: BTreeMap::new(),
@@ -2133,6 +2486,7 @@ mod tests {
             name: "test".to_owned(),
             qualified_name: "test".to_owned(),
             parameters: vec![],
+            native_local_count: 0,
             entry: BlockId(0),
             value_count: 4,
             exception_edges: BTreeMap::new(),
@@ -2200,6 +2554,7 @@ mod tests {
             name: "<genexpr>".to_owned(),
             qualified_name: "<genexpr>".to_owned(),
             parameters: vec![parameter],
+            native_local_count: 0,
             entry: BlockId(0),
             value_count: 3,
             exception_edges: BTreeMap::new(),
@@ -2226,7 +2581,7 @@ mod tests {
                         value: ValueId(1),
                         resume_value: None,
                         resume_target: BlockId(1),
-                        exception_target: None,
+                        exception_target: Some(BlockId(2)),
                         delegate: None,
                     },
                 },
@@ -2240,17 +2595,27 @@ mod tests {
                     }],
                     terminator: Terminator::ReturnValue { value: None },
                 },
+                Block {
+                    parameters: vec![],
+                    operations: vec![Operation {
+                        span: Span::default(),
+                        kind: OperationKind::Print {
+                            values: vec![ValueId(2)],
+                        },
+                    }],
+                    terminator: Terminator::ReturnValue { value: None },
+                },
             ],
         };
         verify_function(&program).unwrap();
         let plan = safepoint_plan(&program).unwrap();
         assert_eq!(
             plan.terminator_roots(0),
-            Some([ValueId(0), ValueId(1)].as_slice())
+            Some([ValueId(0), ValueId(1), ValueId(2)].as_slice())
         );
         assert_eq!(
             generator_persistent_values(&program).unwrap(),
-            vec![ValueId(0)]
+            vec![ValueId(0), ValueId(2)]
         );
 
         let mut invalid = program.clone();
@@ -2263,12 +2628,194 @@ mod tests {
     }
 
     #[test]
+    fn suspension_liveness_follows_operation_exception_edges() {
+        let program = Function {
+            kind: FunctionKind::Coroutine,
+            name: "exception_edge_liveness".to_owned(),
+            qualified_name: "exception_edge_liveness".to_owned(),
+            parameters: vec![],
+            native_local_count: 0,
+            entry: BlockId(0),
+            value_count: 2,
+            exception_edges: BTreeMap::from([((1, 0), BlockId(2))]),
+            blocks: vec![
+                Block {
+                    parameters: vec![],
+                    operations: vec![
+                        Operation {
+                            span: Span::default(),
+                            kind: OperationKind::Constant {
+                                dest: ValueId(0),
+                                value: Constant::String("handler-cell".to_owned()),
+                            },
+                        },
+                        Operation {
+                            span: Span::default(),
+                            kind: OperationKind::Constant {
+                                dest: ValueId(1),
+                                value: Constant::String("suspend".to_owned()),
+                            },
+                        },
+                    ],
+                    terminator: Terminator::Suspend {
+                        kind: SuspensionKind::AsyncCleanup,
+                        value: ValueId(1),
+                        resume_value: None,
+                        resume_target: BlockId(1),
+                        exception_target: None,
+                        delegate: None,
+                    },
+                },
+                Block {
+                    parameters: vec![],
+                    operations: vec![Operation {
+                        span: Span::default(),
+                        kind: OperationKind::Propagate,
+                    }],
+                    terminator: Terminator::ReturnValue { value: None },
+                },
+                Block {
+                    parameters: vec![],
+                    operations: vec![Operation {
+                        span: Span::default(),
+                        kind: OperationKind::Print {
+                            values: vec![ValueId(0)],
+                        },
+                    }],
+                    terminator: Terminator::ReturnValue { value: None },
+                },
+            ],
+        };
+
+        verify_function(&program).unwrap();
+        let plan = safepoint_plan(&program).unwrap();
+        assert_eq!(
+            plan.terminator_roots(0),
+            Some([ValueId(0), ValueId(1)].as_slice())
+        );
+        assert_eq!(
+            generator_persistent_values(&program).unwrap(),
+            vec![ValueId(0)]
+        );
+    }
+
+    #[test]
+    fn coroutine_suspension_kinds_are_explicit_verified_and_live() {
+        let make = |kind| Function {
+            kind: FunctionKind::Coroutine,
+            name: "coro".to_owned(),
+            qualified_name: "coro".to_owned(),
+            parameters: vec![],
+            native_local_count: 0,
+            entry: BlockId(0),
+            value_count: 4,
+            exception_edges: BTreeMap::new(),
+            blocks: vec![
+                Block {
+                    parameters: vec![],
+                    operations: vec![
+                        Operation {
+                            span: Span::default(),
+                            kind: OperationKind::Constant {
+                                dest: ValueId(0),
+                                value: Constant::String("yielded".to_owned()),
+                            },
+                        },
+                        Operation {
+                            span: Span::default(),
+                            kind: OperationKind::Constant {
+                                dest: ValueId(1),
+                                value: Constant::String("delegate".to_owned()),
+                            },
+                        },
+                        Operation {
+                            span: Span::default(),
+                            kind: OperationKind::Constant {
+                                dest: ValueId(3),
+                                value: Constant::String("live-on-injection".to_owned()),
+                            },
+                        },
+                    ],
+                    terminator: Terminator::Suspend {
+                        kind,
+                        value: ValueId(0),
+                        resume_value: Some(ValueId(2)),
+                        resume_target: BlockId(1),
+                        exception_target: Some(BlockId(2)),
+                        delegate: Some(ValueId(1)),
+                    },
+                },
+                Block {
+                    parameters: vec![ValueId(2)],
+                    operations: vec![Operation {
+                        span: Span::default(),
+                        kind: OperationKind::Print {
+                            values: vec![ValueId(2)],
+                        },
+                    }],
+                    terminator: Terminator::ReturnValue {
+                        value: Some(ValueId(2)),
+                    },
+                },
+                Block {
+                    parameters: vec![],
+                    operations: vec![Operation {
+                        span: Span::default(),
+                        kind: OperationKind::Print {
+                            values: vec![ValueId(3)],
+                        },
+                    }],
+                    terminator: Terminator::ReturnValue { value: None },
+                },
+            ],
+        };
+
+        for kind in [
+            SuspensionKind::Await,
+            SuspensionKind::AsyncIteration,
+            SuspensionKind::AsyncGeneratorYield,
+            SuspensionKind::AsyncCleanup,
+        ] {
+            let program = make(kind);
+            verify_function(&program).unwrap();
+            let plan = safepoint_plan(&program).unwrap();
+            assert_eq!(
+                plan.terminator_roots(0),
+                Some([ValueId(0), ValueId(1), ValueId(3)].as_slice())
+            );
+            assert_eq!(
+                generator_persistent_values(&program).unwrap(),
+                vec![ValueId(3)]
+            );
+        }
+
+        let mut no_delegate = make(SuspensionKind::Await);
+        if let Terminator::Suspend { delegate, .. } = &mut no_delegate.blocks[0].terminator {
+            *delegate = None;
+        }
+        assert!(
+            verify_function(&no_delegate)
+                .unwrap_err()
+                .contains("await suspension must retain its awaited delegate")
+        );
+
+        let mut wrong_kind = make(SuspensionKind::Await);
+        wrong_kind.kind = FunctionKind::Python;
+        assert!(
+            verify_function(&wrong_kind)
+                .unwrap_err()
+                .contains("only valid in coroutine functions")
+        );
+    }
+
+    #[test]
     fn later_safepoint_can_use_fewer_shadow_roots() {
         let program = Function {
             kind: FunctionKind::Python,
             name: "test".to_owned(),
             qualified_name: "test".to_owned(),
             parameters: vec![],
+            native_local_count: 0,
             entry: BlockId(0),
             value_count: 2,
             exception_edges: BTreeMap::new(),

@@ -24,3 +24,11 @@ them with existing `finally` and loop cleanup.
 Public differentials pin side-effect order and final results for nested normal,
 return, break, and continue paths combined with `finally`, callbacks, forced GC,
 and heap limits.
+
+## Status
+
+Complete. `ContextExit` participates in the existing inner-to-outer cleanup
+stack for return, break, continue, and fallthrough. Public CPython 3.12.11
+differentials cover multiple exits, `try`/`finally`, replacement of a pending
+return, reentrant exit callbacks, compiled class suites, exact-once ordering,
+and constrained-heap execution.

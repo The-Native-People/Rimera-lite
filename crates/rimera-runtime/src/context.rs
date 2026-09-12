@@ -4,17 +4,19 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr;
 
 use rimera_abi::{
-    RGeneratorOperation, RGeneratorOutcome, RNativeGeneratorResume, RRootFrame, RStatus, RTag,
-    RValue,
+    RGeneratorOperation, RGeneratorOutcome, RNativeGeneratorResume, RNativeModuleInitializer,
+    RRootFrame, RStatus, RTag, RValue,
 };
 
-use crate::heap::{Heap, HeapObject, HeapStats, MIN_COLLECTION_THRESHOLD};
+use crate::heap::{Heap, HeapObject, HeapStats, LifecycleAction, MIN_COLLECTION_THRESHOLD};
+use crate::module_registry::{ModuleRegistry, NativeModuleDefinition};
 use crate::object::{
     BoundMethodObject, BuiltinFunctionKind, BuiltinFunctionObject, ClassMethodObject, CodeObject,
-    DictionaryObject, ExceptionObject, FrameObject, FunctionKind, GeneratorObject, InstanceObject,
-    MemberDescriptorObject, ModuleObject, PropertyMethodKind, PropertyMethodObject, PropertyObject,
-    StaticMethodObject, SuperObject, TYPE_FLAG_BUILTIN, TYPE_FLAG_EXCEPTION,
-    TYPE_FLAG_INSTANTIABLE, TracebackObject, TypeLayout, TypeObject,
+    DictionaryObject, ExceptionObject, FastCallMetadata, FrameObject, FunctionKind,
+    GeneratorObject, InstanceObject, MemberDescriptorObject, ModuleObject, ModuleState,
+    PropertyMethodKind, PropertyMethodObject, PropertyObject, StaticMethodObject, SuperObject,
+    SuspendedKind, TYPE_FLAG_BUILTIN, TYPE_FLAG_EXCEPTION, TYPE_FLAG_INSTANTIABLE, TracebackObject,
+    TypeLayout, TypeObject,
 };
 
 const HEAP_LIMIT_MESSAGE: &str = "managed heap limit exceeded";
@@ -69,11 +71,19 @@ const LAZY_BUILTIN_TYPES: &[(&str, &str)] = &[
     ("traceback", "object"),
     ("frame", "object"),
     ("generator", "object"),
+    ("coroutine", "object"),
+    ("async_generator", "object"),
+    ("async_generator_asend", "object"),
+    ("async_generator_athrow", "object"),
+    ("anext_awaitable", "object"),
     ("super", "object"),
     ("TypeVar", "object"),
     ("TypeVarTuple", "object"),
     ("ParamSpec", "object"),
     ("TypeAliasType", "object"),
+    ("SourceFileLoader", "object"),
+    ("NamespaceLoader", "object"),
+    ("ModuleSpec", "object"),
 ];
 
 /// Gate-specific exception classes that do not need to inflate the permanent
@@ -86,6 +96,7 @@ const LAZY_BUILTIN_EXCEPTIONS: &[(&str, &str)] = &[
     ("AssertionError", "Exception"),
     ("GeneratorExit", "BaseException"),
     ("StopIteration", "Exception"),
+    ("StopAsyncIteration", "Exception"),
     ("ImportError", "Exception"),
     ("ModuleNotFoundError", "ImportError"),
 ];
@@ -117,6 +128,9 @@ fn is_public_builtin_type_name(name: &str) -> bool {
             | "ExceptionGroup"
             | "TypeError"
             | "ValueError"
+            | "SyntaxError"
+            | "IndentationError"
+            | "TabError"
             | "RuntimeError"
             | "NameError"
             | "AttributeError"
@@ -130,6 +144,7 @@ fn is_public_builtin_type_name(name: &str) -> bool {
             | "AssertionError"
             | "GeneratorExit"
             | "StopIteration"
+            | "StopAsyncIteration"
             | "ImportError"
             | "ModuleNotFoundError"
     )
@@ -140,7 +155,33 @@ struct KernelRoots {
     types: BTreeMap<&'static str, RValue>,
     globals: RValue,
     builtins: RValue,
+    module_cache: RValue,
     emergency_memory_error: RValue,
+}
+
+const GLOBAL_LOOKUP_CACHE_LEN: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+struct GlobalLookupCacheEntry {
+    callsite: usize,
+    namespace: RValue,
+    entry_index: usize,
+    valid: bool,
+}
+
+impl GlobalLookupCacheEntry {
+    const EMPTY: Self = Self {
+        callsite: 0,
+        namespace: RValue::NONE,
+        entry_index: 0,
+        valid: false,
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeLocals {
+    values: *const RValue,
+    len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +191,7 @@ struct ActiveCall {
     generator: Option<RValue>,
     frame: Option<RValue>,
     local_cells: Vec<(String, RValue)>,
+    native_locals: Option<NativeLocals>,
     locals_snapshot: Option<RValue>,
     namespace: Option<RValue>,
     comprehension: bool,
@@ -165,6 +207,8 @@ pub(crate) struct GeneratorResume {
 }
 
 type BufferLeaseFinalizer = fn(&mut RimeraContext, RValue) -> Result<(), String>;
+type GeneratorFinalizer = fn(&mut RimeraContext, RValue) -> Result<(), String>;
+pub(crate) type AsyncRootRunner = fn(&mut RimeraContext, RValue) -> Result<RValue, String>;
 
 #[derive(Debug)]
 pub struct RimeraContext {
@@ -175,13 +219,21 @@ pub struct RimeraContext {
     pub(crate) exception: Option<String>,
     pub(crate) raised: Option<RValue>,
     pub(crate) handled: Vec<RValue>,
+    ambient_exception_context: Vec<RValue>,
+    global_lookup_cache: [GlobalLookupCacheEntry; GLOBAL_LOOKUP_CACHE_LEN],
     active_calls: Vec<ActiveCall>,
-    modules: BTreeMap<String, RValue>,
+    module_namespaces: Vec<RValue>,
     module_frame: Option<RValue>,
+    module_registry: ModuleRegistry,
     kernel: Option<KernelRoots>,
     next_collection_bytes: usize,
     heap_limit_bytes: Option<usize>,
+    dynamic_compilation_enabled: bool,
+    pub(crate) dynamic: crate::dynamic::DynamicState,
     buffer_lease_finalizer: Option<BufferLeaseFinalizer>,
+    generator_finalizer: Option<GeneratorFinalizer>,
+    async_root_runner: Option<AsyncRootRunner>,
+    async_root_running: bool,
 }
 
 impl Default for RimeraContext {
@@ -194,18 +246,35 @@ impl Default for RimeraContext {
             exception: None,
             raised: None,
             handled: Vec::new(),
+            ambient_exception_context: Vec::new(),
+            global_lookup_cache: [GlobalLookupCacheEntry::EMPTY; GLOBAL_LOOKUP_CACHE_LEN],
             active_calls: Vec::new(),
-            modules: BTreeMap::new(),
+            module_namespaces: Vec::new(),
             module_frame: None,
+            module_registry: ModuleRegistry::default(),
             kernel: None,
             next_collection_bytes: MIN_COLLECTION_THRESHOLD,
             heap_limit_bytes: None,
+            dynamic_compilation_enabled: false,
+            dynamic: crate::dynamic::DynamicState::default(),
             buffer_lease_finalizer: None,
+            generator_finalizer: None,
+            async_root_runner: None,
+            async_root_running: false,
         }
     }
 }
 
 impl RimeraContext {
+    pub(crate) fn enable_dynamic_compilation(&mut self) {
+        self.dynamic_compilation_enabled = true;
+    }
+
+    #[must_use]
+    pub(crate) fn dynamic_compilation_enabled(&self) -> bool {
+        self.dynamic_compilation_enabled
+    }
+
     pub(crate) fn allocate(&mut self, object: HeapObject) -> Result<RValue, String> {
         let size = object.managed_size();
         let projected = self.heap.live_bytes().saturating_add(size);
@@ -218,6 +287,24 @@ impl RimeraContext {
             .heap_limit_bytes
             .is_some_and(|limit| self.heap.live_bytes().saturating_add(size) > limit)
         {
+            let family = match &object {
+                HeapObject::Generator(_) => "generator",
+                HeapObject::AsyncNextAwaitable(_) => "async-next-awaitable",
+                HeapObject::AsyncGeneratorOperation(_) => "async-generator-operation",
+                HeapObject::BoundMethod(_) => "bound-method",
+                HeapObject::Exception(_) => "exception",
+                HeapObject::Frame(_) => "frame",
+                HeapObject::Tuple(_) => "tuple",
+                HeapObject::List(_) => "list",
+                HeapObject::String(_) => "string",
+                _ => "other",
+            };
+            eprintln!(
+                "DBG heap-limit family={family} live={} request={} limit={}",
+                self.heap.live_bytes(),
+                size,
+                self.heap_limit_bytes.unwrap_or(0)
+            );
             return Err(HEAP_LIMIT_MESSAGE.to_owned());
         }
         Ok(self.heap.allocate(object))
@@ -226,20 +313,33 @@ impl RimeraContext {
     pub fn collect(&mut self) {
         loop {
             let roots = self.discover_roots();
-            let finalizers = self.heap.collect(roots);
-            if finalizers.is_empty() {
+            let lifecycle_actions = self.heap.collect(roots);
+            if lifecycle_actions.is_empty() {
                 break;
             }
-            let finalizer = self
-                .buffer_lease_finalizer
-                .expect("buffer lease finalizer must be installed before lease allocation");
-            for lease in finalizers {
+            for action in lifecycle_actions {
                 let saved_raised = self.raised.take();
                 let saved_exception = self.exception.take();
-                let _ = self.with_temporary_roots(&[lease], |context| finalizer(context, lease));
+                match action {
+                    LifecycleAction::FinalizeBufferLease(lease) => {
+                        let finalizer = self.buffer_lease_finalizer.expect(
+                            "buffer lease finalizer must be installed before lease allocation",
+                        );
+                        let _ = self
+                            .with_temporary_roots(&[lease], |context| finalizer(context, lease));
+                    }
+                    LifecycleAction::CloseGenerator(generator) => {
+                        let finalizer = self.generator_finalizer.expect(
+                            "generator finalizer must be installed before generator allocation",
+                        );
+                        let _ = self.with_temporary_roots(&[generator], |context| {
+                            finalizer(context, generator)
+                        });
+                    }
+                }
                 // GC-triggered release callback failures are unraisable here;
-                // they must not replace the exception state of the allocation
-                // or safepoint that caused collection.
+                // generator cleanup failures follow the same rule. Neither may
+                // replace the exception state of the allocating safepoint.
                 self.raised = saved_raised;
                 self.exception = saved_exception;
             }
@@ -251,6 +351,68 @@ impl RimeraContext {
     pub(crate) fn enable_buffer_lease_finalizer(&mut self) {
         if self.buffer_lease_finalizer.is_none() {
             self.buffer_lease_finalizer = Some(Self::finalize_buffer_lease);
+        }
+    }
+
+    fn enable_generator_finalizer(&mut self) {
+        if self.generator_finalizer.is_none() {
+            self.generator_finalizer = Some(Self::finalize_generator);
+        }
+    }
+
+    fn finalize_generator(&mut self, generator: RValue) -> Result<(), String> {
+        let (kind, started, function, qualified_name_override) = match self.heap.get(generator) {
+            Some(HeapObject::Generator(object)) => (
+                object.kind,
+                object.started,
+                object.function,
+                object.qualified_name_override.as_deref(),
+            ),
+            _ => return Err("suspended-object finalizer target is invalid".to_owned()),
+        };
+        if kind == SuspendedKind::Coroutine && !started {
+            let qualified_name =
+                qualified_name_override.unwrap_or_else(|| match self.heap.get(function) {
+                    Some(HeapObject::Function(function)) => function.qualified_name.as_str(),
+                    _ => "<invalid coroutine>",
+                });
+            eprintln!("RuntimeWarning: coroutine '{qualified_name}' was never awaited");
+        }
+        let Some(HeapObject::Generator(object)) = self.heap.get_mut(generator) else {
+            return Err("suspended-object finalizer target is invalid".to_owned());
+        };
+        object.finalizer_ran = true;
+        self.resume_generator(generator, RGeneratorOperation::Close, RValue::NONE)
+            .map(|_| ())
+    }
+
+    /// Run lifecycle cleanup for live suspended objects before destroying the
+    /// entire runtime context. Tracing GC normally discovers unreachable
+    /// coroutines at allocation safepoints; a final expression can create an
+    /// unawaited coroutine without another allocation, so context teardown is
+    /// the final deterministic lifecycle boundary.
+    pub(crate) fn finalize_suspended_for_shutdown(&mut self) {
+        let pending = self
+            .heap
+            .live_values()
+            .into_iter()
+            .filter(|value| {
+                matches!(
+                    self.heap.get(*value),
+                    Some(HeapObject::Generator(object))
+                        if !object.running
+                            && !object.closed
+                            && !object.completed
+                            && !object.finalizer_ran
+                )
+            })
+            .collect::<Vec<_>>();
+        for suspended in pending {
+            let saved_raised = self.raised;
+            let saved_exception = self.exception.clone();
+            let _ = self.finalize_generator(suspended);
+            self.raised = saved_raised;
+            self.exception = saved_exception;
         }
     }
 
@@ -323,7 +485,8 @@ impl RimeraContext {
         roots.extend_from_slice(&self.context_roots);
         roots.extend(self.raised);
         roots.extend(self.handled.iter().copied());
-        roots.extend(self.modules.values().copied());
+        roots.extend(self.ambient_exception_context.iter().copied());
+        roots.extend(self.module_namespaces.iter().copied());
         roots.extend(self.module_frame);
         for active in &self.active_calls {
             roots.push(active.function);
@@ -386,6 +549,30 @@ impl RimeraContext {
         }
     }
 
+    pub(crate) fn install_async_root_runner(&mut self, runner: AsyncRootRunner) {
+        self.async_root_runner = Some(runner);
+    }
+
+    pub(crate) fn run_async_root(&mut self, coroutine: RValue) -> Result<RValue, String> {
+        if self.async_root_running {
+            return self.raise_error("RuntimeError", "async_runtime.run() cannot be nested");
+        }
+        let Some(runner) = self.async_root_runner else {
+            return self.raise_error(
+                "RuntimeError",
+                "async runtime backend is not linked into this executable",
+            );
+        };
+        self.async_root_running = true;
+        let result = runner(self, coroutine);
+        self.async_root_running = false;
+        result
+    }
+
+    pub(crate) fn heap_limit_is_unbounded(&self) -> bool {
+        self.heap_limit_bytes.is_none()
+    }
+
     pub(crate) fn set_heap_limit(&mut self, bytes: Option<usize>) -> Result<(), String> {
         if bytes.is_some_and(|limit| self.heap.live_bytes() > limit) {
             self.collect();
@@ -398,6 +585,9 @@ impl RimeraContext {
     }
 
     pub(crate) fn enforce_heap_limit(&mut self) -> Result<(), String> {
+        if self.heap_limit_bytes.is_none() {
+            return Ok(());
+        }
         self.heap.refresh_managed_bytes();
         if self
             .heap_limit_bytes
@@ -409,6 +599,31 @@ impl RimeraContext {
             .heap_limit_bytes
             .is_some_and(|limit| self.heap.live_bytes() > limit)
         {
+            return Err(HEAP_LIMIT_MESSAGE.to_owned());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn preflight_managed_growth(&mut self, additional: usize) -> Result<(), String> {
+        if additional == 0 {
+            return Ok(());
+        }
+        self.heap.refresh_managed_bytes();
+        let projected = self.heap.live_bytes().saturating_add(additional);
+        if self.heap_limit_bytes.is_some_and(|limit| projected > limit) {
+            self.collect();
+            self.heap.refresh_managed_bytes();
+        }
+        if self
+            .heap_limit_bytes
+            .is_some_and(|limit| self.heap.live_bytes().saturating_add(additional) > limit)
+        {
+            eprintln!(
+                "DBG heap-growth live={} additional={} limit={}",
+                self.heap.live_bytes(),
+                additional,
+                self.heap_limit_bytes.unwrap_or(0)
+            );
             return Err(HEAP_LIMIT_MESSAGE.to_owned());
         }
         Ok(())
@@ -430,6 +645,7 @@ impl RimeraContext {
             generator: None,
             frame: None,
             local_cells: Vec::new(),
+            native_locals: None,
             locals_snapshot: None,
             namespace: None,
             comprehension: false,
@@ -459,6 +675,7 @@ impl RimeraContext {
                 _ => None,
             },
             local_cells,
+            native_locals: None,
             locals_snapshot,
             namespace: None,
             comprehension: false,
@@ -500,6 +717,22 @@ impl RimeraContext {
             .ok_or_else(|| "reflection scope has no active native activation".to_owned())?;
         active.namespace = namespace;
         active.comprehension = comprehension;
+        Ok(())
+    }
+
+    pub(crate) fn register_active_native_locals(
+        &mut self,
+        values: *const RValue,
+        len: usize,
+    ) -> Result<(), String> {
+        if len != 0 && values.is_null() {
+            return Err("native local registration requires live storage".to_owned());
+        }
+        let active = self
+            .active_calls
+            .last_mut()
+            .ok_or_else(|| "native locals have no active native activation".to_owned())?;
+        active.native_locals = (len != 0).then_some(NativeLocals { values, len });
         Ok(())
     }
 
@@ -588,6 +821,33 @@ impl RimeraContext {
             match value {
                 Some(value) => self.direct_namespace_set(snapshot, &name, value),
                 None => self.direct_namespace_delete(snapshot, &name),
+            }
+        }
+        if let Some(native) = self.active_calls[index].native_locals {
+            let function = self.active_calls[index].function;
+            let native_names = match self.heap.get(function) {
+                Some(HeapObject::Function(function)) => match self.heap.get(function.code) {
+                    Some(HeapObject::Code(code)) => code
+                        .local_names
+                        .iter()
+                        .filter(|name| !code.cell_names.iter().any(|cell| cell == *name))
+                        .take(native.len)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            for (slot, name) in native_names.into_iter().enumerate() {
+                // SAFETY: compiled code registers this stack array only for the
+                // lifetime of the matching active call and clears the call
+                // before returning from the native activation.
+                let value = unsafe { *native.values.add(slot) };
+                if value.is_unbound() {
+                    self.direct_namespace_delete(snapshot, &name);
+                } else {
+                    self.direct_namespace_set(snapshot, &name, value);
+                }
             }
         }
         Ok(snapshot)
@@ -734,6 +994,8 @@ impl RimeraContext {
             .ok_or_else(|| "module globals are unavailable".to_owned())?;
         let code = self.with_temporary_roots(&[globals], |context| {
             context.allocate(HeapObject::Code(CodeObject {
+                dynamic_mode: None,
+                flags_override: None,
                 code_address: 0,
                 kind: FunctionKind::Normal,
                 name: "<module>".to_owned(),
@@ -906,6 +1168,9 @@ impl RimeraContext {
             ("ExceptionGroup", "Exception"),
             ("TypeError", "Exception"),
             ("ValueError", "Exception"),
+            ("SyntaxError", "Exception"),
+            ("IndentationError", "SyntaxError"),
+            ("TabError", "IndentationError"),
             ("RuntimeError", "Exception"),
             ("NameError", "Exception"),
             ("AttributeError", "Exception"),
@@ -947,10 +1212,15 @@ impl RimeraContext {
         let builtins = self.allocate_kernel_object(HeapObject::Dictionary(DictionaryObject {
             entries: Vec::new(),
         }))?;
+        let module_cache =
+            self.allocate_kernel_object(HeapObject::Dictionary(DictionaryObject {
+                entries: Vec::new(),
+            }))?;
         self.kernel = Some(KernelRoots {
             types,
             globals,
             builtins,
+            module_cache,
             emergency_memory_error: RValue::NONE,
         });
         self.ensure_builtin_type("NotImplementedType")?;
@@ -966,6 +1236,9 @@ impl RimeraContext {
             .as_mut()
             .expect("kernel was initialized above")
             .emergency_memory_error = emergency_memory_error;
+        self.initialize_sys_module()?;
+        self.initialize_builtins_module()?;
+        self.ensure_builtin("__import__")?;
         Ok(())
     }
 
@@ -1020,9 +1293,21 @@ impl RimeraContext {
             mro: mro.into_boxed_slice(),
             namespace: RValue::NONE,
             slot_names: Box::new([]),
-            has_dictionary: false,
+            has_dictionary: matches!(
+                type_name,
+                "SourceFileLoader" | "NamespaceLoader" | "ModuleSpec"
+            ),
             has_weakref: false,
-            flags: TYPE_FLAG_BUILTIN | if is_exception { TYPE_FLAG_EXCEPTION } else { 0 },
+            flags: TYPE_FLAG_BUILTIN
+                | if is_exception { TYPE_FLAG_EXCEPTION } else { 0 }
+                | if matches!(
+                    type_name,
+                    "SourceFileLoader" | "NamespaceLoader" | "ModuleSpec"
+                ) {
+                    TYPE_FLAG_INSTANTIABLE
+                } else {
+                    0
+                },
             version_tag: 0,
             layout: match type_name {
                 "list" => TypeLayout::List,
@@ -1088,6 +1373,11 @@ impl RimeraContext {
             "issubclass" => BuiltinFunctionKind::IsSubclass,
             "iter" => BuiltinFunctionKind::Iter,
             "next" => BuiltinFunctionKind::Next,
+            "aiter" => BuiltinFunctionKind::AIter,
+            "anext" => BuiltinFunctionKind::ANext,
+            "compile" if self.dynamic_compilation_enabled() => BuiltinFunctionKind::Compile,
+            "eval" if self.dynamic_compilation_enabled() => BuiltinFunctionKind::Eval,
+            "exec" if self.dynamic_compilation_enabled() => BuiltinFunctionKind::Exec,
             "property" => BuiltinFunctionKind::Property,
             "staticmethod" => BuiltinFunctionKind::StaticMethod,
             "classmethod" => BuiltinFunctionKind::ClassMethod,
@@ -1121,6 +1411,7 @@ impl RimeraContext {
             "vars" => BuiltinFunctionKind::Vars,
             "globals" => BuiltinFunctionKind::Globals,
             "locals" => BuiltinFunctionKind::Locals,
+            "__import__" => BuiltinFunctionKind::Import,
             _ => return Ok(None),
         };
         let value =
@@ -1132,7 +1423,7 @@ impl RimeraContext {
         Ok(Some(value))
     }
 
-    fn lookup_builtin(&self, name: &str) -> Option<RValue> {
+    pub(crate) fn lookup_builtin(&self, name: &str) -> Option<RValue> {
         let builtins = self.builtins()?;
         match self.heap.get(builtins) {
             Some(HeapObject::Dictionary(dictionary)) => dictionary.get(name),
@@ -1192,7 +1483,18 @@ impl RimeraContext {
                 Some(HeapObject::Iterator(_)) => "iterator",
                 Some(HeapObject::Function(_)) => "function",
                 Some(HeapObject::Code(_)) => "code",
-                Some(HeapObject::Generator(_)) => "generator",
+                Some(HeapObject::Generator(generator)) => match generator.kind {
+                    SuspendedKind::Generator => "generator",
+                    SuspendedKind::Coroutine => "coroutine",
+                    SuspendedKind::AsyncGenerator => "async_generator",
+                },
+                Some(HeapObject::AsyncNextAwaitable(_)) => "anext_awaitable",
+                Some(HeapObject::AsyncGeneratorOperation(operation)) => match operation.kind {
+                    crate::object::AsyncGeneratorOperationKind::Next
+                    | crate::object::AsyncGeneratorOperationKind::Send => "async_generator_asend",
+                    crate::object::AsyncGeneratorOperationKind::Throw
+                    | crate::object::AsyncGeneratorOperationKind::Close => "async_generator_athrow",
+                },
                 Some(HeapObject::BoundMethod(_)) => "function",
                 Some(HeapObject::CallArguments(_) | HeapObject::BufferLease(_)) => "object",
                 Some(HeapObject::Property(_))
@@ -1957,89 +2259,271 @@ impl RimeraContext {
         function: RValue,
         bound: &[RValue],
     ) -> Result<RValue, String> {
-        let (code, name, qualified_name) = match self.heap.get(function) {
-            Some(HeapObject::Function(function)) => (
-                function.code,
-                function.name.clone(),
-                function.qualified_name.clone(),
-            ),
-            _ => return Err("function is not a generator".to_owned()),
-        };
-        let (resume_address, persistent_slot_count, first_line, parameter_names) =
-            match self.heap.get(code) {
-                Some(HeapObject::Code(code)) => match code.kind {
+        self.new_suspended(function, bound, SuspendedKind::Generator)
+    }
+
+    pub(crate) fn new_coroutine(
+        &mut self,
+        function: RValue,
+        bound: &[RValue],
+    ) -> Result<RValue, String> {
+        self.new_suspended(function, bound, SuspendedKind::Coroutine)
+    }
+
+    pub(crate) fn new_async_generator(
+        &mut self,
+        function: RValue,
+        bound: &[RValue],
+    ) -> Result<RValue, String> {
+        self.new_suspended(function, bound, SuspendedKind::AsyncGenerator)
+    }
+
+    pub(crate) fn new_generator_rooted(
+        &mut self,
+        function: RValue,
+        bound: &[RValue],
+    ) -> Result<RValue, String> {
+        self.new_suspended_rooted(function, bound, SuspendedKind::Generator)
+    }
+
+    /// Exact-call fast lane for a coroutine whose FunctionObject metadata was
+    /// already read by the caller dispatcher. The callable/arguments are rooted
+    /// by the generated caller, so avoid a second heap lookup on every creation.
+    pub(crate) fn new_coroutine_known_rooted(
+        &mut self,
+        function: RValue,
+        bound: &[RValue],
+        resume_address: usize,
+        persistent_slot_count: usize,
+        first_line: u32,
+    ) -> Result<RValue, String> {
+        self.new_suspended_known_rooted(
+            function,
+            bound,
+            SuspendedKind::Coroutine,
+            resume_address,
+            persistent_slot_count,
+            first_line,
+        )
+    }
+
+    pub(crate) fn new_async_generator_rooted(
+        &mut self,
+        function: RValue,
+        bound: &[RValue],
+    ) -> Result<RValue, String> {
+        self.new_suspended_rooted(function, bound, SuspendedKind::AsyncGenerator)
+    }
+
+    fn new_suspended(
+        &mut self,
+        function: RValue,
+        bound: &[RValue],
+        kind: SuspendedKind,
+    ) -> Result<RValue, String> {
+        let mut roots = Vec::with_capacity(bound.len() + 1);
+        roots.push(function);
+        roots.extend_from_slice(bound);
+        self.with_temporary_roots(&roots, |context| {
+            context.new_suspended_rooted(function, bound, kind)
+        })
+    }
+
+    fn new_suspended_rooted(
+        &mut self,
+        function: RValue,
+        bound: &[RValue],
+        kind: SuspendedKind,
+    ) -> Result<RValue, String> {
+        let (resume_address, persistent_slot_count, first_line) = match self.heap.get(function) {
+            Some(HeapObject::Function(function)) => match (function.fast_call.kind(), kind) {
+                (
                     FunctionKind::Generator {
                         persistent_slot_count,
-                    } => (
-                        code.code_address,
+                    },
+                    SuspendedKind::Generator,
+                )
+                | (
+                    FunctionKind::Coroutine {
                         persistent_slot_count,
-                        code.first_line,
-                        code.parameters
-                            .iter()
-                            .map(|parameter| parameter.name.clone())
-                            .collect::<Vec<_>>(),
-                    ),
-                    FunctionKind::Normal => return Err("function is not a generator".to_owned()),
-                },
-                _ => return Err("function has an invalid code object".to_owned()),
-            };
-        let globals = self
-            .globals()
-            .ok_or_else(|| "module globals are unavailable".to_owned())?;
+                    },
+                    SuspendedKind::Coroutine,
+                )
+                | (
+                    FunctionKind::AsyncGenerator {
+                        persistent_slot_count,
+                    },
+                    SuspendedKind::AsyncGenerator,
+                ) => (
+                    function.fast_call.code_address,
+                    persistent_slot_count,
+                    function.fast_call.first_line,
+                ),
+                _ => {
+                    return Err(match kind {
+                        SuspendedKind::Generator => "function is not a generator".to_owned(),
+                        SuspendedKind::Coroutine => {
+                            "function is not a coroutine function".to_owned()
+                        }
+                        SuspendedKind::AsyncGenerator => {
+                            "function is not an async generator function".to_owned()
+                        }
+                    });
+                }
+            },
+            _ => return Err("function is not a suspended function".to_owned()),
+        };
+        self.new_suspended_known_rooted(
+            function,
+            bound,
+            kind,
+            resume_address,
+            persistent_slot_count,
+            first_line,
+        )
+    }
+
+    fn new_suspended_known_rooted(
+        &mut self,
+        function: RValue,
+        bound: &[RValue],
+        kind: SuspendedKind,
+        resume_address: usize,
+        persistent_slot_count: usize,
+        first_line: u32,
+    ) -> Result<RValue, String> {
+        self.enable_generator_finalizer();
         let mut slots = vec![None; persistent_slot_count.max(bound.len())];
         for (slot, value) in slots.iter_mut().zip(bound.iter().copied()) {
             *slot = Some(value);
         }
-        let mut roots = bound.to_vec();
-        roots.extend([function, code, globals]);
+        let suspended_object = HeapObject::Generator(GeneratorObject {
+            kind,
+            function,
+            name_override: None,
+            qualified_name_override: None,
+            resume_address,
+            state: 0,
+            current_line: first_line,
+            slots: slots.into_boxed_slice(),
+            local_cells: Vec::new(),
+            locals_snapshot: None,
+            frame: None,
+            delegate: None,
+            handled: Box::new([]),
+            raised: None,
+            started: false,
+            running: false,
+            async_operation_active: false,
+            closed: false,
+            completed: false,
+            finalizer_ran: false,
+            return_value: None,
+        });
+        let suspended = if self.heap_limit_bytes.is_none() {
+            // Coroutine/generator creation is a hot path. With no managed heap
+            // ceiling to enforce, avoid rescanning the full heap for a fresh
+            // suspended object whose initial managed size is already known.
+            // Threshold collection refreshes exact accounting before GC.
+            let size = suspended_object.managed_size();
+            if self.heap.cached_live_bytes().saturating_add(size) > self.next_collection_bytes {
+                self.collect();
+            }
+            self.heap.allocate_cached(suspended_object)
+        } else {
+            self.allocate(suspended_object)?
+        };
+        // Preserve the existing eager generator reflection contract. Native
+        // coroutines take the lean path and only pay for a dict/frame when
+        // Python actually observes `cr_frame`, `locals()`, traceback state,
+        // or another reflection boundary.
+        if kind == SuspendedKind::Generator {
+            self.with_temporary_roots(&[suspended], |context| {
+                context.ensure_suspended_frame(suspended)?;
+                Ok(suspended)
+            })
+        } else {
+            Ok(suspended)
+        }
+    }
+
+    fn ensure_suspended_frame(&mut self, suspended: RValue) -> Result<RValue, String> {
+        let (existing, function, current_line, local_cells, locals_snapshot, slots, terminal) =
+            match self.heap.get(suspended) {
+                Some(HeapObject::Generator(object)) => (
+                    object.frame,
+                    object.function,
+                    object.current_line,
+                    object.local_cells.clone(),
+                    object.locals_snapshot,
+                    object.slots.to_vec(),
+                    object.completed || object.closed,
+                ),
+                _ => return Err("object is not a suspended native activation".to_owned()),
+            };
+        if let Some(frame) = existing {
+            return Ok(frame);
+        }
+        if terminal {
+            return Ok(RValue::NONE);
+        }
+        let (code, globals) = match self.heap.get(function) {
+            Some(HeapObject::Function(function)) => (function.code, function.globals),
+            _ => return Err("suspended function is invalid".to_owned()),
+        };
+        let parameter_names = match self.heap.get(code) {
+            Some(HeapObject::Code(code)) => code
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect::<Vec<_>>(),
+            _ => return Err("suspended function has an invalid code object".to_owned()),
+        };
+        let mut roots = vec![suspended, function, code, globals];
+        roots.extend(slots.iter().flatten().copied());
+        roots.extend(local_cells.iter().map(|(_, cell)| *cell));
+        roots.extend(locals_snapshot);
         self.with_temporary_roots(&roots, |context| {
-            let locals = context.allocate(HeapObject::Dictionary(DictionaryObject {
-                entries: Vec::new(),
-            }))?;
-            context.with_temporary_roots(&[locals], |context| {
-                for (name, value) in parameter_names.iter().zip(bound.iter().copied()) {
+            let locals = if let Some(locals) = locals_snapshot {
+                locals
+            } else {
+                context.allocate(HeapObject::Dictionary(DictionaryObject {
+                    entries: Vec::new(),
+                }))?
+            };
+            if locals_snapshot.is_none() {
+                for (name, value) in parameter_names
+                    .iter()
+                    .zip(slots.iter().take(parameter_names.len()).copied().flatten())
+                {
                     context.direct_namespace_set(locals, name, value);
                 }
-                context.enforce_heap_limit()?;
-                let generator =
-                    context.allocate(HeapObject::Generator(Box::new(GeneratorObject {
-                        function,
-                        name,
-                        qualified_name,
-                        resume_address,
-                        state: 0,
-                        slots: slots.into_boxed_slice(),
-                        local_cells: Vec::new(),
-                        locals_snapshot: Some(locals),
-                        frame: None,
-                        delegate: None,
-                        handled: Box::new([]),
-                        raised: None,
-                        started: false,
-                        running: false,
-                        closed: false,
-                        completed: false,
-                        return_value: None,
-                    })))?;
-                context.with_temporary_roots(&[generator, locals], |context| {
-                    let frame = context.allocate(HeapObject::Frame(Box::new(FrameObject {
-                        code,
-                        globals,
-                        locals,
-                        back: None,
-                        line: first_line,
-                        generator: Some(generator),
-                    })))?;
-                    let Some(HeapObject::Generator(object)) = context.heap.get_mut(generator)
-                    else {
-                        return Err(
-                            "new generator disappeared while publishing its frame".to_owned()
-                        );
-                    };
-                    object.frame = Some(frame);
-                    Ok(generator)
-                })
-            })
+            }
+            for (name, cell) in &local_cells {
+                let value = match context.heap.get(*cell) {
+                    Some(HeapObject::Cell(cell)) => cell.value,
+                    _ => None,
+                };
+                match value {
+                    Some(value) => context.direct_namespace_set(locals, name, value),
+                    None => context.direct_namespace_delete(locals, name),
+                }
+            }
+            context.enforce_heap_limit()?;
+            let frame = context.allocate(HeapObject::Frame(Box::new(FrameObject {
+                code,
+                globals,
+                locals,
+                back: None,
+                line: current_line,
+                generator: Some(suspended),
+            })))?;
+            let Some(HeapObject::Generator(object)) = context.heap.get_mut(suspended) else {
+                return Err("suspended activation disappeared while publishing frame".to_owned());
+            };
+            object.locals_snapshot = Some(locals);
+            object.frame = Some(frame);
+            Ok(frame)
         })
     }
 
@@ -2048,8 +2532,11 @@ impl RimeraContext {
         generator: RValue,
         line: u32,
     ) -> Result<(), String> {
-        let frame = match self.heap.get(generator) {
-            Some(HeapObject::Generator(generator)) => generator.frame,
+        let frame = match self.heap.get_mut(generator) {
+            Some(HeapObject::Generator(generator)) => {
+                generator.current_line = line;
+                generator.frame
+            }
             _ => return Err("object is not a generator".to_owned()),
         };
         if let Some(frame) = frame {
@@ -2085,8 +2572,35 @@ impl RimeraContext {
         operation: RGeneratorOperation,
         input: RValue,
     ) -> Result<GeneratorResume, String> {
+        // Fresh close is the coroutine-creation benchmark's lifecycle path and
+        // Python-visible `coro.close()` is required to be cheap. An unstarted
+        // suspended object with no materialized frame has no body/cleanup to
+        // execute, so close it in-place before resolving function globals or
+        // constructing activation/exception bookkeeping. Materialized frames
+        // and every started/terminal/error case retain the full path below.
+        if matches!(operation, RGeneratorOperation::Close)
+            && let Some(HeapObject::Generator(object)) = self.heap.get_mut(generator)
+            && !object.started
+            && !object.running
+            && !object.closed
+            && !object.completed
+            && object.frame.is_none()
+        {
+            object.closed = true;
+            object.completed = true;
+            object.slots.fill(None);
+            object.local_cells.clear();
+            object.locals_snapshot = None;
+            return Ok(GeneratorResume {
+                value: RValue::NONE,
+                outcome: RGeneratorOutcome::Returned,
+            });
+        }
+
         let (
+            suspended_kind,
             function,
+            globals,
             resume_address,
             started,
             running,
@@ -2095,22 +2609,45 @@ impl RimeraContext {
             saved_handled,
             saved_raised,
         ) = match self.heap.get(generator) {
-            Some(HeapObject::Generator(generator)) => (
-                generator.function,
-                generator.resume_address,
-                generator.started,
-                generator.running,
-                generator.closed,
-                generator.completed,
-                generator.handled.to_vec(),
-                generator.raised,
-            ),
+            Some(HeapObject::Generator(generator)) => {
+                let globals = match self.heap.get(generator.function) {
+                    Some(HeapObject::Function(function)) => function.globals,
+                    _ => return Err("generator function is invalid".to_owned()),
+                };
+                (
+                    generator.kind,
+                    generator.function,
+                    globals,
+                    generator.resume_address,
+                    generator.started,
+                    generator.running,
+                    generator.closed,
+                    generator.completed,
+                    generator.handled.to_vec(),
+                    generator.raised,
+                )
+            }
             _ => return Err("object is not a generator".to_owned()),
         };
         if running {
-            return self.raise_error("ValueError", "generator already executing");
+            return self.raise_error(
+                "ValueError",
+                match suspended_kind {
+                    SuspendedKind::Generator => "generator already executing",
+                    SuspendedKind::Coroutine => "coroutine already executing",
+                    SuspendedKind::AsyncGenerator => "async generator already executing",
+                },
+            );
         }
         if completed || closed {
+            if suspended_kind == SuspendedKind::Coroutine
+                && matches!(
+                    operation,
+                    RGeneratorOperation::Next | RGeneratorOperation::Send
+                )
+            {
+                return self.raise_error("RuntimeError", "cannot reuse already awaited coroutine");
+            }
             if matches!(operation, RGeneratorOperation::Throw) {
                 self.raise_value(input, None, false)?;
                 return Err("generator raised an exception".to_owned());
@@ -2123,7 +2660,17 @@ impl RimeraContext {
         if !started && matches!(operation, RGeneratorOperation::Send) && input != RValue::NONE {
             return self.raise_error(
                 "TypeError",
-                "can't send non-None value to a just-started generator",
+                match suspended_kind {
+                    SuspendedKind::Generator => {
+                        "can't send non-None value to a just-started generator"
+                    }
+                    SuspendedKind::Coroutine => {
+                        "can't send non-None value to a just-started coroutine"
+                    }
+                    SuspendedKind::AsyncGenerator => {
+                        "can't send non-None value to a just-started async generator"
+                    }
+                },
             );
         }
         if !started && matches!(operation, RGeneratorOperation::Close) {
@@ -2152,6 +2699,12 @@ impl RimeraContext {
             return Err("generator raised an exception".to_owned());
         }
 
+        // CPython's currently handled/pending exception remains the implicit
+        // chaining context while execution enters a nested coroutine/generator.
+        // The suspended object owns its own handled stack, so keep the caller's
+        // exception only as ambient chaining state rather than making bare
+        // `raise` inside the callee see the caller's handler.
+        let caller_exception_context = self.handled.last().copied().or(self.raised);
         let previous_raised = std::mem::replace(&mut self.raised, saved_raised);
         let previous_exception = self.exception.take();
         self.exception = self
@@ -2174,7 +2727,12 @@ impl RimeraContext {
         }
 
         let previous_handled = std::mem::replace(&mut self.handled, saved_handled);
+        let ambient_checkpoint = self.ambient_exception_context.len();
+        if let Some(exception) = caller_exception_context {
+            self.ambient_exception_context.push(exception);
+        }
         let Some(HeapObject::Generator(object)) = self.heap.get_mut(generator) else {
+            self.ambient_exception_context.truncate(ambient_checkpoint);
             self.handled = previous_handled;
             self.raised = previous_raised;
             self.exception = previous_exception;
@@ -2188,6 +2746,10 @@ impl RimeraContext {
         // constructor, which validates the stable generator-resume signature.
         let resume: RNativeGeneratorResume = unsafe { std::mem::transmute(resume_address) };
         self.push_active_generator_call(function, generator)?;
+        let switched_globals = self.globals() != Some(globals);
+        if switched_globals {
+            self.push_module_namespace(globals);
+        }
         let status = unsafe {
             resume(
                 std::ptr::from_mut(self).cast(),
@@ -2199,8 +2761,24 @@ impl RimeraContext {
             )
         };
         let active_index = self.active_calls.len().saturating_sub(1);
-        self.refresh_locals_at(active_index)?;
+        // Reflection storage is lazily materialized for native coroutines. If
+        // nobody observed locals/frame state during this activation, keep the
+        // resume path free of dictionary allocation and synchronization work.
+        let refresh_result = if self
+            .active_calls
+            .get(active_index)
+            .is_some_and(|active| active.locals_snapshot.is_some() || active.frame.is_some())
+        {
+            self.refresh_locals_at(active_index).map(Some)
+        } else {
+            Ok(None)
+        };
+        if switched_globals {
+            self.pop_module_namespace(globals);
+        }
         self.pop_active_call();
+        self.ambient_exception_context.truncate(ambient_checkpoint);
+        refresh_result?;
         let saved_after = std::mem::replace(&mut self.handled, previous_handled);
 
         let mut effective_status = status;
@@ -2240,9 +2818,12 @@ impl RimeraContext {
             object.running = false;
             object.handled = saved_after.into_boxed_slice();
             object.raised = (effective_status == RStatus::Ok
-                && outcome == RGeneratorOutcome::Yielded)
-                .then_some(suspended_raised)
-                .flatten();
+                && matches!(
+                    outcome,
+                    RGeneratorOutcome::Yielded | RGeneratorOutcome::Suspended
+                ))
+            .then_some(suspended_raised)
+            .flatten();
             if effective_status == RStatus::Ok && outcome == RGeneratorOutcome::Returned {
                 object.completed = true;
                 object.closed |= matches!(operation, RGeneratorOperation::Close);
@@ -2314,8 +2895,20 @@ impl RimeraContext {
         name: &str,
         value: RValue,
     ) -> Result<(), String> {
-        if let Some(HeapObject::Dictionary(dictionary)) = self.heap.get_mut(namespace) {
+        if let Some(HeapObject::Dictionary(dictionary)) = self.heap.get(namespace) {
+            let growth = dictionary.managed_growth_for_insert(name);
+            let mut roots = dictionary
+                .entries
+                .iter()
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>();
+            roots.extend([namespace, value]);
+            self.with_temporary_roots(&roots, |context| context.preflight_managed_growth(growth))?;
+            let Some(HeapObject::Dictionary(dictionary)) = self.heap.get_mut(namespace) else {
+                return Err("class namespace is not a dictionary".to_owned());
+            };
             dictionary.insert(name.to_owned(), value);
+            self.heap.refresh_managed_bytes();
             return Ok(());
         }
         let existing = match self.heap.get(namespace) {
@@ -2350,13 +2943,7 @@ impl RimeraContext {
         }
         self.with_temporary_roots(&[namespace, value], |context| {
             let key = crate::operations::string(context, name)?;
-            let hash = crate::operations::hash_i64(context, key)?;
-            let Some(HeapObject::ValueDictionary(dictionary)) = context.heap.get_mut(namespace)
-            else {
-                return Err("class namespace is not a dictionary".to_owned());
-            };
-            dictionary.table.insert_new(hash, (key, value));
-            Ok(())
+            crate::operations::item_set(context, namespace, key, value)
         })
     }
 
@@ -2432,12 +3019,27 @@ impl RimeraContext {
                 Err(error) => return Err(error),
             }
         }
-        let lookup =
-            |context: &RimeraContext, dictionary| context.namespace_value(dictionary, name);
-        lookup(self, self.globals().unwrap_or(RValue::NONE))
-            .or_else(|| lookup(self, self.builtins().unwrap_or(RValue::NONE)))
-            .or_else(|| self.ensure_builtin(name).ok().flatten())
-            .ok_or_else(|| format!("name '{name}' is not defined"))
+        if let Some(value) = self.globals().and_then(|globals| self.namespace_value(globals, name)) {
+            return Ok(value);
+        }
+        match self.execution_builtin(name)? {
+            Some(value) => Ok(value),
+            None => self.raise_error("NameError", &format!("name '{name}' is not defined")),
+        }
+    }
+
+    pub(crate) fn execution_builtin(&mut self, name: &str) -> Result<Option<RValue>, String> {
+        if let Some(namespace) = self.globals().and_then(|globals| self.namespace_value(globals, "__builtins__")) {
+            let namespace = match self.heap.get(namespace) {
+                Some(HeapObject::Module(module)) => module.namespace,
+                _ => namespace,
+            };
+            if Some(namespace) != self.builtins() {
+                return Ok(self.namespace_value(namespace, name));
+            }
+        }
+        if let Some(value) = self.lookup_builtin(name) { return Ok(Some(value)); }
+        self.ensure_builtin(name)
     }
 
     /// Resolves a class-body free name. Python still consults the prepared
@@ -2497,6 +3099,7 @@ impl RimeraContext {
     }
 
     fn code_flags(code: &CodeObject) -> u32 {
+        if let Some(flags) = code.flags_override { return flags; }
         if code.code_address == 0 {
             return 0;
         }
@@ -2545,7 +3148,13 @@ impl RimeraContext {
             }
             return self
                 .namespace_value(namespace, name)
-                .ok_or_else(|| format!("module '{}' has no attribute '{name}'", module.name));
+                .ok_or_else(|| {
+                    if module.state == ModuleState::Initializing {
+                        format!("partially initialized module '{}' has no attribute '{name}' (most likely due to a circular import)", module.name)
+                    } else {
+                        format!("module '{}' has no attribute '{name}'", module.name)
+                    }
+                });
         }
         if let Some(HeapObject::Function(function)) = self.heap.get(receiver) {
             let function_name = function.name.clone();
@@ -2711,53 +3320,187 @@ impl RimeraContext {
         }
         if let Some(HeapObject::Generator(generator)) = self.heap.get(receiver) {
             let function = generator.function;
-            let generator_name = generator.name.clone();
-            let qualified_name = generator.qualified_name.clone();
+            let name_override = generator.name_override.clone();
+            let qualified_name_override = generator.qualified_name_override.clone();
+            let (function_name, function_qualified_name, code) = match self.heap.get(function) {
+                Some(HeapObject::Function(function)) => (
+                    function.name.clone(),
+                    function.qualified_name.clone(),
+                    Some(function.code),
+                ),
+                _ => (String::new(), String::new(), None),
+            };
+            let generator_name = name_override.unwrap_or(function_name);
+            let qualified_name = qualified_name_override.unwrap_or(function_qualified_name);
+            let kind = generator.kind;
             let frame = generator.frame;
             let running = generator.running;
+            let async_running = generator.running || generator.async_operation_active;
+            let terminal = generator.completed || generator.closed;
             let suspended = generator.started
                 && !generator.running
                 && !generator.completed
                 && !generator.closed;
             let delegate = generator.delegate;
-            let code = match self.heap.get(function) {
-                Some(HeapObject::Function(function)) => Some(function.code),
-                _ => None,
+            return match kind {
+                SuspendedKind::Generator => match name {
+                    "__name__" => crate::operations::string(self, &generator_name),
+                    "__qualname__" => crate::operations::string(self, &qualified_name),
+                    "gi_code" => {
+                        code.ok_or_else(|| "generator function has no code object".to_owned())
+                    }
+                    "gi_frame" => Ok(frame.unwrap_or(RValue::NONE)),
+                    "gi_running" => Ok(RValue::boolean(running)),
+                    "gi_suspended" => Ok(RValue::boolean(suspended)),
+                    "gi_yieldfrom" => Ok(delegate.unwrap_or(RValue::NONE)),
+                    "__iter__" => self.bound_builtin_method(
+                        receiver,
+                        "generator.__iter__",
+                        BuiltinFunctionKind::GeneratorIter,
+                    ),
+                    "__next__" => self.bound_builtin_method(
+                        receiver,
+                        "generator.__next__",
+                        BuiltinFunctionKind::GeneratorNext,
+                    ),
+                    "send" => self.bound_builtin_method(
+                        receiver,
+                        "generator.send",
+                        BuiltinFunctionKind::GeneratorSend,
+                    ),
+                    "throw" => self.bound_builtin_method(
+                        receiver,
+                        "generator.throw",
+                        BuiltinFunctionKind::GeneratorThrow,
+                    ),
+                    "close" => self.bound_builtin_method(
+                        receiver,
+                        "generator.close",
+                        BuiltinFunctionKind::GeneratorClose,
+                    ),
+                    _ => Err(format!("'generator' object has no attribute '{name}'")),
+                },
+                SuspendedKind::Coroutine => match name {
+                    "__name__" => crate::operations::string(self, &generator_name),
+                    "__qualname__" => crate::operations::string(self, &qualified_name),
+                    "cr_code" => {
+                        code.ok_or_else(|| "coroutine function has no code object".to_owned())
+                    }
+                    "cr_frame" => {
+                        if terminal {
+                            Ok(RValue::NONE)
+                        } else if let Some(frame) = frame {
+                            Ok(frame)
+                        } else {
+                            self.ensure_suspended_frame(receiver)
+                        }
+                    }
+                    "cr_running" => Ok(RValue::boolean(running)),
+                    "cr_suspended" => Ok(RValue::boolean(suspended)),
+                    "cr_await" => Ok(delegate.unwrap_or(RValue::NONE)),
+                    "send" => self.bound_builtin_method(
+                        receiver,
+                        "coroutine.send",
+                        BuiltinFunctionKind::GeneratorSend,
+                    ),
+                    "throw" => self.bound_builtin_method(
+                        receiver,
+                        "coroutine.throw",
+                        BuiltinFunctionKind::GeneratorThrow,
+                    ),
+                    "close" => self.bound_builtin_method(
+                        receiver,
+                        "coroutine.close",
+                        BuiltinFunctionKind::GeneratorClose,
+                    ),
+                    _ => Err(format!("'coroutine' object has no attribute '{name}'")),
+                },
+                SuspendedKind::AsyncGenerator => match name {
+                    "__name__" => crate::operations::string(self, &generator_name),
+                    "__qualname__" => crate::operations::string(self, &qualified_name),
+                    "ag_code" => {
+                        code.ok_or_else(|| "async generator function has no code object".to_owned())
+                    }
+                    "ag_frame" => {
+                        if terminal {
+                            Ok(RValue::NONE)
+                        } else if let Some(frame) = frame {
+                            Ok(frame)
+                        } else {
+                            // Match coroutine/generator reflection without
+                            // charging unobserved async generators for frame
+                            // metadata. The first `ag_frame` read publishes
+                            // one traced frame and every later read reuses it.
+                            self.ensure_suspended_frame(receiver)
+                        }
+                    }
+                    "ag_running" => Ok(RValue::boolean(async_running)),
+                    "ag_await" => Ok(delegate.unwrap_or(RValue::NONE)),
+                    "__aiter__" => self.bound_builtin_method(
+                        receiver,
+                        "async_generator.__aiter__",
+                        BuiltinFunctionKind::AsyncGeneratorIter,
+                    ),
+                    "__anext__" => self.bound_builtin_method(
+                        receiver,
+                        "async_generator.__anext__",
+                        BuiltinFunctionKind::AsyncGeneratorNext,
+                    ),
+                    "asend" => self.bound_builtin_method(
+                        receiver,
+                        "async_generator.asend",
+                        BuiltinFunctionKind::AsyncGeneratorSend,
+                    ),
+                    "athrow" => self.bound_builtin_method(
+                        receiver,
+                        "async_generator.athrow",
+                        BuiltinFunctionKind::AsyncGeneratorThrow,
+                    ),
+                    "aclose" => self.bound_builtin_method(
+                        receiver,
+                        "async_generator.aclose",
+                        BuiltinFunctionKind::AsyncGeneratorClose,
+                    ),
+                    _ => Err(format!(
+                        "'async_generator' object has no attribute '{name}'"
+                    )),
+                },
+            };
+        }
+        if let Some(HeapObject::AsyncGeneratorOperation(operation)) = self.heap.get(receiver) {
+            let type_name = match operation.kind {
+                crate::object::AsyncGeneratorOperationKind::Next
+                | crate::object::AsyncGeneratorOperationKind::Send => "async_generator_asend",
+                crate::object::AsyncGeneratorOperationKind::Throw
+                | crate::object::AsyncGeneratorOperationKind::Close => "async_generator_athrow",
             };
             return match name {
-                "__name__" => crate::operations::string(self, &generator_name),
-                "__qualname__" => crate::operations::string(self, &qualified_name),
-                "gi_code" => code.ok_or_else(|| "generator function has no code object".to_owned()),
-                "gi_frame" => Ok(frame.unwrap_or(RValue::NONE)),
-                "gi_running" => Ok(RValue::boolean(running)),
-                "gi_suspended" => Ok(RValue::boolean(suspended)),
-                "gi_yieldfrom" => Ok(delegate.unwrap_or(RValue::NONE)),
-                "__iter__" => self.bound_builtin_method(
+                "__await__" | "__iter__" => self.bound_builtin_method(
                     receiver,
-                    "generator.__iter__",
-                    BuiltinFunctionKind::GeneratorIter,
+                    &format!("{type_name}.__await__"),
+                    BuiltinFunctionKind::AsyncGeneratorIter,
                 ),
                 "__next__" => self.bound_builtin_method(
                     receiver,
-                    "generator.__next__",
-                    BuiltinFunctionKind::GeneratorNext,
+                    &format!("{type_name}.__next__"),
+                    BuiltinFunctionKind::AsyncGeneratorOperationNext,
                 ),
                 "send" => self.bound_builtin_method(
                     receiver,
-                    "generator.send",
-                    BuiltinFunctionKind::GeneratorSend,
+                    &format!("{type_name}.send"),
+                    BuiltinFunctionKind::AsyncGeneratorOperationSend,
                 ),
                 "throw" => self.bound_builtin_method(
                     receiver,
-                    "generator.throw",
-                    BuiltinFunctionKind::GeneratorThrow,
+                    &format!("{type_name}.throw"),
+                    BuiltinFunctionKind::AsyncGeneratorOperationThrow,
                 ),
                 "close" => self.bound_builtin_method(
                     receiver,
-                    "generator.close",
-                    BuiltinFunctionKind::GeneratorClose,
+                    &format!("{type_name}.close"),
+                    BuiltinFunctionKind::AsyncGeneratorOperationClose,
                 ),
-                _ => Err(format!("'generator' object has no attribute '{name}'")),
+                _ => Err(format!("'{type_name}' object has no attribute '{name}'")),
             };
         }
         if let Some(HeapObject::Traceback(traceback)) = self.heap.get(receiver) {
@@ -3184,7 +3927,10 @@ impl RimeraContext {
                 let storage = instance.storage;
                 if let Some(hook) = self.class_attribute(class, "__getattribute__") {
                     let callable = self.descriptor_get(hook, Some(receiver), class)?;
-                    let name_value = crate::operations::string(self, name)?;
+                    let name_value = self
+                        .with_temporary_roots(&[receiver, callable], |context| {
+                            crate::operations::string(context, name)
+                        })?;
                     let result = self
                         .with_temporary_roots(&[receiver, callable, name_value], |context| {
                             crate::call::invoke(context, callable, &[name_value], &[])
@@ -3201,7 +3947,10 @@ impl RimeraContext {
                             if let Some(fallback) = self.class_attribute(class, "__getattr__") {
                                 let callable =
                                     self.descriptor_get(fallback, Some(receiver), class)?;
-                                let name_value = crate::operations::string(self, name)?;
+                                let name_value = self
+                                    .with_temporary_roots(&[receiver, callable], |context| {
+                                        crate::operations::string(context, name)
+                                    })?;
                                 return self.with_temporary_roots(
                                     &[receiver, callable, name_value],
                                     |context| {
@@ -3509,7 +4258,7 @@ impl RimeraContext {
             enum FunctionAttributeUpdate {
                 Name(String),
                 QualifiedName(String),
-                Code(RValue),
+                Code(RValue, FastCallMetadata),
                 Defaults(Option<RValue>),
                 KeywordDefaults(Option<RValue>),
                 Annotations(Option<RValue>),
@@ -3548,9 +4297,9 @@ impl RimeraContext {
                     }
                 },
                 "__code__" => {
-                    let free_count = match self.heap.get(value) {
+                    let (free_count, fast_call) = match self.heap.get(value) {
                         Some(HeapObject::Code(code)) if code.code_address != 0 => {
-                            code.free_names.len()
+                            (code.free_names.len(), code.fast_call_metadata())
                         }
                         _ => {
                             return self
@@ -3566,7 +4315,7 @@ impl RimeraContext {
                             ),
                         );
                     }
-                    FunctionAttributeUpdate::Code(value)
+                    FunctionAttributeUpdate::Code(value, fast_call)
                 }
                 "__closure__" => {
                     return self.raise_error("AttributeError", "readonly attribute");
@@ -3619,22 +4368,39 @@ impl RimeraContext {
                 }
                 _ => return Err(format!("'function' object has no attribute '{name}'")),
             };
+            let (before_size, mut candidate) = match self.heap.get(receiver) {
+                Some(HeapObject::Function(function)) => (
+                    HeapObject::Function(function.clone()).managed_size(),
+                    function.clone(),
+                ),
+                _ => return Err("function disappeared while setting metadata".to_owned()),
+            };
+            match update {
+                FunctionAttributeUpdate::Name(value) => candidate.name = value,
+                FunctionAttributeUpdate::QualifiedName(value) => candidate.qualified_name = value,
+                FunctionAttributeUpdate::Code(value, fast_call) => {
+                    candidate.code = value;
+                    candidate.fast_call = fast_call;
+                }
+                FunctionAttributeUpdate::Defaults(value) => candidate.defaults = value,
+                FunctionAttributeUpdate::KeywordDefaults(value) => {
+                    candidate.keyword_defaults = value
+                }
+                FunctionAttributeUpdate::Annotations(value) => candidate.annotations = value,
+                FunctionAttributeUpdate::TypeParameters(value) => {
+                    candidate.type_params = Some(value)
+                }
+            }
+            let after_size = HeapObject::Function(candidate.clone()).managed_size();
+            let growth = after_size.saturating_sub(before_size);
+            self.with_temporary_roots(&[receiver, value], |context| {
+                context.preflight_managed_growth(growth)
+            })?;
             let Some(HeapObject::Function(function)) = self.heap.get_mut(receiver) else {
                 return Err("function disappeared while setting metadata".to_owned());
             };
-            match update {
-                FunctionAttributeUpdate::Name(value) => function.name = value,
-                FunctionAttributeUpdate::QualifiedName(value) => function.qualified_name = value,
-                FunctionAttributeUpdate::Code(value) => function.code = value,
-                FunctionAttributeUpdate::Defaults(value) => function.defaults = value,
-                FunctionAttributeUpdate::KeywordDefaults(value) => {
-                    function.keyword_defaults = value
-                }
-                FunctionAttributeUpdate::Annotations(value) => function.annotations = value,
-                FunctionAttributeUpdate::TypeParameters(value) => {
-                    function.type_params = Some(value)
-                }
-            }
+            *function = candidate;
+            self.heap.refresh_managed_bytes();
             return Ok(());
         }
         if matches!(self.heap.get(receiver), Some(HeapObject::Code(_))) {
@@ -3659,14 +4425,28 @@ impl RimeraContext {
                             );
                         }
                     };
+                    let (before_size, mut candidate) = match self.heap.get(receiver) {
+                        Some(HeapObject::Generator(generator)) => (
+                            HeapObject::Generator(generator.clone()).managed_size(),
+                            generator.clone(),
+                        ),
+                        _ => unreachable!("generator receiver was checked"),
+                    };
+                    if name == "__name__" {
+                        candidate.name_override = Some(text);
+                    } else {
+                        candidate.qualified_name_override = Some(text);
+                    }
+                    let after_size = HeapObject::Generator(candidate.clone()).managed_size();
+                    let growth = after_size.saturating_sub(before_size);
+                    self.with_temporary_roots(&[receiver, value], |context| {
+                        context.preflight_managed_growth(growth)
+                    })?;
                     let Some(HeapObject::Generator(generator)) = self.heap.get_mut(receiver) else {
                         unreachable!("generator receiver was checked");
                     };
-                    if name == "__name__" {
-                        generator.name = text;
-                    } else {
-                        generator.qualified_name = text;
-                    }
+                    *generator = candidate;
+                    self.heap.refresh_managed_bytes();
                     return Ok(());
                 }
                 "gi_code" | "gi_frame" | "gi_running" | "gi_suspended" | "gi_yieldfrom" => {
@@ -3875,15 +4655,29 @@ impl RimeraContext {
                     );
                 }
             };
+            let (before_size, mut candidate) = match self.heap.get(receiver) {
+                Some(HeapObject::Type(class)) => (
+                    HeapObject::Type(class.clone()).managed_size(),
+                    class.clone(),
+                ),
+                _ => unreachable!("class receiver was checked"),
+            };
+            if name == "__name__" {
+                candidate.name = text;
+            } else {
+                candidate.qualified_name = text;
+            }
+            let after_size = HeapObject::Type(candidate.clone()).managed_size();
+            let growth = after_size.saturating_sub(before_size);
+            self.with_temporary_roots(&[receiver, value], |context| {
+                context.preflight_managed_growth(growth)
+            })?;
             let Some(HeapObject::Type(class)) = self.heap.get_mut(receiver) else {
                 unreachable!("class receiver was checked");
             };
-            if name == "__name__" {
-                class.name = text;
-            } else {
-                class.qualified_name = text;
-            }
-            self.bump_type_version(receiver);
+            *class = candidate;
+            self.heap.refresh_managed_bytes();
+            self.invalidate_type_observers(receiver);
             return Ok(());
         }
         if class_receiver && name == "__mro__" {
@@ -3893,7 +4687,11 @@ impl RimeraContext {
             );
         }
         if class_receiver && name == "__bases__" {
-            return self.set_class_bases(receiver, value);
+            return match self.set_class_bases(receiver, value) {
+                Ok(()) => Ok(()),
+                Err(error) if self.raised.is_some() => Err(error),
+                Err(error) => self.raise_error("TypeError", error),
+            };
         }
         if !class_receiver
             && let Some((_, descriptor)) = self.class_attribute_with_owner(class, name)
@@ -3909,7 +4707,7 @@ impl RimeraContext {
         };
         self.namespace_set(namespace, name, value)?;
         if class_receiver {
-            self.bump_type_version(receiver);
+            self.invalidate_type_observers(receiver);
         }
         Ok(())
     }
@@ -4092,7 +4890,7 @@ impl RimeraContext {
         };
         if removed {
             if class_receiver {
-                self.bump_type_version(receiver);
+                self.invalidate_type_observers(receiver);
             }
             Ok(())
         } else {
@@ -4140,6 +4938,18 @@ impl RimeraContext {
         value: RValue,
         name: &str,
     ) -> Result<Option<RValue>, String> {
+        // Native suspended objects expose protocol slots through the runtime
+        // rather than materializing Python methods in their builtin type
+        // namespaces. Special-method lookup must still observe those slots,
+        // while continuing to ignore arbitrary instance shadowing.
+        if matches!(
+            self.heap.get(value),
+            Some(HeapObject::Generator(generator))
+                if generator.kind == SuspendedKind::AsyncGenerator
+                    && matches!(name, "__aiter__" | "__anext__")
+        ) {
+            return self.attribute_get(value, name).map(Some);
+        }
         let class = self.type_of(value)?;
         let Some((_, method)) = self.class_attribute_with_owner(class, name) else {
             return Ok(None);
@@ -4154,6 +4964,14 @@ impl RimeraContext {
         value: RValue,
         name: &str,
     ) -> Result<bool, String> {
+        if matches!(
+            self.heap.get(value),
+            Some(HeapObject::Generator(generator))
+                if generator.kind == SuspendedKind::AsyncGenerator
+                    && matches!(name, "__aiter__" | "__anext__")
+        ) {
+            return Ok(true);
+        }
         let class = self.type_of(value)?;
         Ok(self.class_attribute_with_owner(class, name).is_some())
     }
@@ -4658,16 +5476,40 @@ impl RimeraContext {
         })
     }
 
-    fn type_name(&self, type_value: RValue) -> String {
+    pub(crate) fn type_name(&self, type_value: RValue) -> String {
         match self.heap.get(type_value) {
             Some(HeapObject::Type(class)) => class.name.clone(),
             _ => "object".to_owned(),
         }
     }
 
-    fn bump_type_version(&mut self, type_value: RValue) {
-        if let Some(HeapObject::Type(class)) = self.heap.get_mut(type_value) {
-            class.version_tag = class.version_tag.wrapping_add(1);
+    fn invalidate_type_observers(&mut self, type_value: RValue) {
+        // Attribute/method/type-relation observations may be cached by the
+        // mutated class itself, any subclass inheriting through it, or a class
+        // whose metaclass inherits a mutated metaclass. Keep one version-tag
+        // invalidation owner even though today's lookup path is deliberately
+        // dynamic and does not yet retain a separate attribute cache.
+        let affected = self
+            .heap
+            .live_values()
+            .into_iter()
+            .filter(|candidate| {
+                let Some(HeapObject::Type(class)) = self.heap.get(*candidate) else {
+                    return false;
+                };
+                if *candidate == type_value || class.mro.contains(&type_value) {
+                    return true;
+                }
+                matches!(
+                    self.heap.get(class.metaclass),
+                    Some(HeapObject::Type(metaclass)) if metaclass.mro.contains(&type_value)
+                )
+            })
+            .collect::<Vec<_>>();
+        for value in affected {
+            if let Some(HeapObject::Type(class)) = self.heap.get_mut(value) {
+                class.version_tag = class.version_tag.wrapping_add(1);
+            }
         }
     }
 
@@ -4771,15 +5613,400 @@ impl RimeraContext {
     }
 
     pub(crate) fn globals(&self) -> Option<RValue> {
-        self.kernel.as_ref().map(|kernel| kernel.globals)
+        self.module_namespaces
+            .last()
+            .copied()
+            .or_else(|| self.kernel.as_ref().map(|kernel| kernel.globals))
+    }
+
+    fn global_lookup_cache_slot(callsite: usize) -> usize {
+        // Generated constant-data addresses are stable for the executable. A
+        // direct-mapped cache intentionally trades collisions for a tiny,
+        // allocation-free hot path.
+        (callsite.rotate_right(4) ^ (callsite >> 11)) & (GLOBAL_LOOKUP_CACHE_LEN - 1)
+    }
+
+    pub(crate) fn cached_global_lookup(&self, callsite: usize, name: &[u8]) -> Option<RValue> {
+        let namespace = self.globals()?;
+        let cached = self.global_lookup_cache[Self::global_lookup_cache_slot(callsite)];
+        if !cached.valid || cached.callsite != callsite || cached.namespace != namespace {
+            return None;
+        }
+        let Some(HeapObject::Dictionary(dictionary)) = self.heap.get(namespace) else {
+            return None;
+        };
+        let (key, value) = dictionary.entries.get(cached.entry_index)?;
+        // Never cache the value itself: rebinding an existing global replaces
+        // the value in-place, so this read always observes current Python state.
+        (key.as_bytes() == name).then_some(*value)
+    }
+
+    pub(crate) fn remember_global_lookup(
+        &mut self,
+        callsite: usize,
+        namespace: RValue,
+        entry_index: usize,
+    ) {
+        let slot = Self::global_lookup_cache_slot(callsite);
+        self.global_lookup_cache[slot] = GlobalLookupCacheEntry {
+            callsite,
+            namespace,
+            entry_index,
+            valid: true,
+        };
+    }
+
+    pub(crate) fn push_module_namespace(&mut self, namespace: RValue) {
+        self.module_namespaces.push(namespace);
+    }
+
+    pub(crate) fn pop_module_namespace(&mut self, expected: RValue) {
+        let popped = self.module_namespaces.pop();
+        debug_assert_eq!(popped, Some(expected));
+    }
+
+    fn module_cache(&self) -> Result<RValue, String> {
+        self.kernel
+            .as_ref()
+            .map(|kernel| kernel.module_cache)
+            .ok_or_else(|| "module cache is unavailable before kernel initialization".to_owned())
+    }
+
+    fn cached_module(&self, name: &str) -> Option<RValue> {
+        let cache = self.kernel.as_ref()?.module_cache;
+        match self.heap.get(cache) {
+            Some(HeapObject::Dictionary(dictionary)) => dictionary.get(name),
+            _ => None,
+        }
+    }
+
+    fn cache_module(&mut self, name: &str, value: RValue) -> Result<(), String> {
+        let cache = self.module_cache()?;
+        let growth = match self.heap.get(cache) {
+            Some(HeapObject::Dictionary(dictionary)) => dictionary.managed_growth_for_insert(name),
+            _ => return Err("module cache is corrupt".to_owned()),
+        };
+        self.with_temporary_roots(&[cache, value], |context| {
+            context.preflight_managed_growth(growth)
+        })?;
+        let Some(HeapObject::Dictionary(dictionary)) = self.heap.get_mut(cache) else {
+            return Err("module cache is corrupt".to_owned());
+        };
+        dictionary.insert(name.to_owned(), value);
+        self.heap.refresh_managed_bytes();
+        Ok(())
+    }
+
+    fn remove_cached_module_if(&mut self, name: &str, expected: RValue) {
+        let Ok(cache) = self.module_cache() else {
+            return;
+        };
+        let Some(HeapObject::Dictionary(dictionary)) = self.heap.get_mut(cache) else {
+            return;
+        };
+        if dictionary.get(name) == Some(expected) {
+            dictionary.remove(name);
+            self.heap.refresh_managed_bytes();
+        }
+    }
+
+    fn initialize_sys_module(&mut self) -> Result<(), String> {
+        if self.cached_module("sys").is_some() {
+            return Ok(());
+        }
+        let cache = self.module_cache()?;
+        let namespace = self.allocate(HeapObject::Dictionary(DictionaryObject {
+            entries: Vec::new(),
+        }))?;
+        self.with_temporary_roots(&[cache, namespace], |context| {
+            let name = crate::operations::string(context, "sys")?;
+            let package = crate::operations::string(context, "")?;
+            context.with_temporary_roots(&[cache, namespace, name, package], |context| {
+                context.namespace_set(namespace, "__name__", name)?;
+                context.namespace_set(namespace, "__package__", package)?;
+                context.namespace_set(namespace, "__loader__", RValue::NONE)?;
+                context.namespace_set(namespace, "__spec__", RValue::NONE)?;
+                context.namespace_set(namespace, "modules", cache)?;
+                let module = context.allocate(HeapObject::Module(ModuleObject {
+                    name: "sys".to_owned(),
+                    namespace,
+                    state: ModuleState::Created,
+                }))?;
+                context.with_temporary_roots(&[cache, namespace, module], |context| {
+                    context.transition_module(module, ModuleState::Initializing)?;
+                    context.cache_module("sys", module)?;
+                    context.transition_module(module, ModuleState::Ready)
+                })
+            })
+        })
+    }
+
+    fn initialize_builtins_module(&mut self) -> Result<(), String> {
+        if self.cached_module("builtins").is_some() {
+            return Ok(());
+        }
+        let namespace = self
+            .builtins()
+            .ok_or_else(|| "builtins namespace is unavailable".to_owned())?;
+        self.with_temporary_roots(&[namespace], |context| {
+            let name = crate::operations::string(context, "builtins")?;
+            let package = crate::operations::string(context, "")?;
+            context.with_temporary_roots(&[namespace, name, package], |context| {
+                context.namespace_set(namespace, "__name__", name)?;
+                context.namespace_set(namespace, "__package__", package)?;
+                context.namespace_set(namespace, "__loader__", RValue::NONE)?;
+                context.namespace_set(namespace, "__spec__", RValue::NONE)?;
+                let module = context.allocate(HeapObject::Module(ModuleObject {
+                    name: "builtins".to_owned(),
+                    namespace,
+                    state: ModuleState::Created,
+                }))?;
+                context.with_temporary_roots(&[namespace, module], |context| {
+                    context.transition_module(module, ModuleState::Initializing)?;
+                    context.cache_module("builtins", module)?;
+                    context.transition_module(module, ModuleState::Ready)
+                })
+            })
+        })
+    }
+
+    pub(crate) fn register_source_module(
+        &mut self,
+        name: &str,
+        filename: &str,
+        package: &str,
+        is_package: bool,
+        initializer: RNativeModuleInitializer,
+    ) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("module definition requires a non-empty canonical name".to_owned());
+        }
+        let definition = NativeModuleDefinition::Source {
+            filename: filename.to_owned(),
+            package: package.to_owned(),
+            is_package,
+            initializer,
+        };
+        self.module_registry.register(name, definition)
+    }
+
+    pub(crate) fn register_namespace_module(
+        &mut self,
+        name: &str,
+        search_locations: &[&str],
+    ) -> Result<(), String> {
+        if name.is_empty() || search_locations.is_empty() {
+            return Err(
+                "namespace module definition requires a name and search location".to_owned(),
+            );
+        }
+        let definition = NativeModuleDefinition::Namespace {
+            search_locations: search_locations
+                .iter()
+                .map(|location| (*location).to_owned())
+                .collect(),
+        };
+        self.module_registry.register(name, definition)
+    }
+
+    pub(crate) fn import_registered(&mut self, name: &str) -> Result<RValue, String> {
+        self.initialize_kernel()?;
+        if let Some(module) = self.cached_module(name) {
+            if module == RValue::NONE {
+                return self.raise_error(
+                    "ModuleNotFoundError",
+                    format!("import of {name} halted; None in sys.modules"),
+                );
+            }
+            return Ok(module);
+        }
+        match self.module_registry.get(name).as_deref() {
+            Some(NativeModuleDefinition::Source {
+                filename,
+                package,
+                is_package,
+                initializer,
+            }) => self.import_source(name, filename, package, *is_package, *initializer),
+            Some(NativeModuleDefinition::Namespace { search_locations }) => {
+                let locations = search_locations
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                self.import_namespace(name, &locations)
+            }
+            None => self.import_name(name),
+        }
+    }
+
+    pub(crate) fn import_builtin_target(
+        &mut self,
+        name: &str,
+        globals: RValue,
+        fromlist_is_empty: bool,
+        level: usize,
+    ) -> Result<(String, RValue), String> {
+        let absolute = if level == 0 {
+            if name.is_empty() {
+                return self.raise_error("ValueError", "Empty module name");
+            }
+            name.to_owned()
+        } else {
+            if globals == RValue::NONE {
+                return self.raise_error("KeyError", "'__name__' not in globals");
+            }
+            let package = self
+                .namespace_value(globals, "__package__")
+                .or_else(|| self.namespace_value(globals, "__name__"))
+                .and_then(|value| crate::operations::string_value(self, value))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    "globals must contain a string __package__ or __name__".to_owned()
+                })?;
+            let mut parts = package.split('.').collect::<Vec<_>>();
+            if level > parts.len() {
+                return self.raise_error(
+                    "ImportError",
+                    "attempted relative import beyond top-level package",
+                );
+            }
+            parts.truncate(parts.len() + 1 - level);
+            if !name.is_empty() {
+                parts.extend(name.split('.'));
+            }
+            parts.join(".")
+        };
+
+        let mut leaf = RValue::NONE;
+        let mut prefix = String::new();
+        for component in absolute.split('.') {
+            if component.is_empty() {
+                return self.raise_error(
+                    "ModuleNotFoundError",
+                    format!("No module named '{absolute}'"),
+                );
+            }
+            if !prefix.is_empty() {
+                prefix.push('.');
+            }
+            prefix.push_str(component);
+            leaf = self.import_registered(&prefix)?;
+        }
+        if fromlist_is_empty {
+            let top = absolute.split('.').next().unwrap_or(&absolute).to_owned();
+            Ok((absolute, self.import_registered(&top)?))
+        } else {
+            Ok((absolute, leaf))
+        }
+    }
+
+    pub(crate) fn has_module_definition(&self, name: &str) -> bool {
+        self.module_registry.contains(name)
+    }
+
+    pub(crate) fn module_has_path(&self, module: RValue) -> bool {
+        let Some(HeapObject::Module(module)) = self.heap.get(module) else {
+            return false;
+        };
+        self.namespace_value(module.namespace, "__path__").is_some()
+    }
+
+    pub(crate) fn register_module_resource(
+        &mut self,
+        module: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if !self.module_registry.contains(module) {
+            return Err(format!(
+                "resource owner '{module}' is not in the compiled graph"
+            ));
+        }
+        self.module_registry.register_resource(module, name, bytes)
+    }
+
+    pub(crate) fn read_module_resource(
+        &mut self,
+        package: RValue,
+        name: &str,
+    ) -> Result<RValue, String> {
+        let module = match self.heap.get(package) {
+            Some(HeapObject::Module(module)) => module.name.clone(),
+            Some(HeapObject::String(module)) => module.clone(),
+            _ => return self.raise_error("TypeError", "package must be a module or module name"),
+        };
+        let bytes = self
+            .module_registry
+            .resource(&module, name)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| format!("resource '{name}' does not exist in package '{module}'"))?;
+        crate::operations::bytes(self, &bytes)
+    }
+
+    pub(crate) fn reload_module(&mut self, module: RValue) -> Result<RValue, String> {
+        let (name, namespace) = match self.heap.get(module) {
+            Some(HeapObject::Module(module)) => (module.name.clone(), module.namespace),
+            _ => {
+                return self.raise_error("TypeError", "reload() argument must be a module");
+            }
+        };
+        if self.cached_module(&name) != Some(module) {
+            return self.raise_error("ImportError", format!("module {name} not in sys.modules"));
+        }
+        let Some(definition) = self.module_registry.get(&name) else {
+            return self.raise_error(
+                "ModuleNotFoundError",
+                format!("spec not found for the module '{name}'"),
+            );
+        };
+        match definition.as_ref() {
+            NativeModuleDefinition::Namespace { .. } => Ok(module),
+            NativeModuleDefinition::Source { initializer, .. } => {
+                self.transition_module(module, ModuleState::Initializing)?;
+                self.push_module_namespace(namespace);
+                let arguments = RValue::NONE;
+                let mut output = RValue::NONE;
+                let status = unsafe {
+                    (*initializer)(
+                        (self as *mut Self).cast(),
+                        &raw const module,
+                        &raw const arguments,
+                        0,
+                        &raw mut output,
+                    )
+                };
+                self.pop_module_namespace(namespace);
+                self.transition_module(module, ModuleState::Ready)?;
+                if status == RStatus::Ok {
+                    Ok(module)
+                } else {
+                    Err("native module reload failed".to_owned())
+                }
+            }
+        }
     }
 
     pub(crate) fn import_name(&mut self, name: &str) -> Result<RValue, String> {
         self.initialize_kernel()?;
-        if let Some(module) = self.modules.get(name).copied() {
+        if let Some(module) = self.cached_module(name) {
+            if module == RValue::NONE {
+                return self.raise_error(
+                    "ModuleNotFoundError",
+                    format!("import of {name} halted; None in sys.modules"),
+                );
+            }
             return Ok(module);
         }
-        if !matches!(name, "inspect" | "weakref") {
+        if !matches!(
+            name,
+            "builtins"
+                | "importlib"
+                | "importlib.resources"
+                | "inspect"
+                | "weakref"
+                | "sys"
+                | "rimera"
+                | "rimera.async_runtime"
+        ) {
             return self.raise_error("ModuleNotFoundError", format!("No module named '{name}'"));
         }
 
@@ -4789,18 +6016,471 @@ impl RimeraContext {
         self.with_temporary_roots(&[namespace], |context| {
             let module_name = crate::operations::string(context, name)?;
             context.with_temporary_roots(&[namespace, module_name], |context| {
-                context.namespace_set(namespace, "__name__", module_name)?;
-                context.namespace_set(namespace, "__package__", RValue::NONE)?;
-                context.namespace_set(namespace, "__loader__", RValue::NONE)?;
-                context.namespace_set(namespace, "__spec__", RValue::NONE)?;
                 let module = context.allocate(HeapObject::Module(ModuleObject {
                     name: name.to_owned(),
                     namespace,
+                    state: ModuleState::Created,
                 }))?;
-                context.modules.insert(name.to_owned(), module);
-                Ok(module)
+                context.with_temporary_roots(&[namespace, module], |context| {
+                    context.transition_module(module, ModuleState::Initializing)?;
+                    let initialized = (|| {
+                        context.namespace_set(namespace, "__name__", module_name)?;
+                        context.namespace_set(namespace, "__package__", RValue::NONE)?;
+                        context.namespace_set(namespace, "__loader__", RValue::NONE)?;
+                        context.namespace_set(namespace, "__spec__", RValue::NONE)?;
+                        if name == "importlib" {
+                            let reload = context.allocate(HeapObject::BuiltinFunction(
+                                BuiltinFunctionObject {
+                                    name: "reload".to_owned(),
+                                    kind: BuiltinFunctionKind::Reload,
+                                },
+                            ))?;
+                            context.namespace_set(namespace, "reload", reload)?;
+                            let invalidate = context.allocate(HeapObject::BuiltinFunction(
+                                BuiltinFunctionObject {
+                                    name: "invalidate_caches".to_owned(),
+                                    kind: BuiltinFunctionKind::InvalidateImportCaches,
+                                },
+                            ))?;
+                            context.namespace_set(namespace, "invalidate_caches", invalidate)?;
+                        } else if name == "importlib.resources" {
+                            let read_binary = context.allocate(HeapObject::BuiltinFunction(
+                                BuiltinFunctionObject {
+                                    name: "read_binary".to_owned(),
+                                    kind: BuiltinFunctionKind::ReadBinaryResource,
+                                },
+                            ))?;
+                            context.namespace_set(namespace, "read_binary", read_binary)?;
+                        } else if name == "rimera.async_runtime" {
+                            let run = context.allocate(HeapObject::BuiltinFunction(
+                                BuiltinFunctionObject {
+                                    name: "run".to_owned(),
+                                    kind: BuiltinFunctionKind::AsyncRuntimeRun,
+                                },
+                            ))?;
+                            context.namespace_set(namespace, "run", run)?;
+                        }
+                        Ok(())
+                    })();
+                    match initialized {
+                        Ok(()) => {
+                            context.cache_module(name, module)?;
+                            if let Err(error) = context.publish_module_to_parent(name, module) {
+                                context.transition_module(module, ModuleState::Failed)?;
+                                context.remove_cached_module_if(name, module);
+                                return Err(error);
+                            }
+                            context.transition_module(module, ModuleState::Ready)?;
+                            Ok(module)
+                        }
+                        Err(cause) => {
+                            context.transition_module(module, ModuleState::Failed)?;
+                            Err(cause)
+                        }
+                    }
+                })
             })
         })
+    }
+
+    pub(crate) fn import_source(
+        &mut self,
+        name: &str,
+        filename: &str,
+        package: &str,
+        is_package: bool,
+        initializer: RNativeModuleInitializer,
+    ) -> Result<RValue, String> {
+        self.initialize_kernel()?;
+        if let Some(module) = self.cached_module(name) {
+            if module == RValue::NONE {
+                return self.raise_error(
+                    "ModuleNotFoundError",
+                    format!("import of {name} halted; None in sys.modules"),
+                );
+            }
+            return Ok(module);
+        }
+
+        let namespace = self.allocate(HeapObject::Dictionary(DictionaryObject {
+            entries: Vec::new(),
+        }))?;
+        self.with_temporary_roots(&[namespace], |context| {
+            context.initialize_source_module_metadata(
+                namespace, name, filename, package, is_package,
+            )?;
+            context.with_temporary_roots(&[namespace], |context| {
+                let module = context.allocate(HeapObject::Module(ModuleObject {
+                    name: name.to_owned(),
+                    namespace,
+                    state: ModuleState::Created,
+                }))?;
+                context.with_temporary_roots(&[namespace, module], |context| {
+                    context.transition_module(module, ModuleState::Initializing)?;
+                    context.cache_module(name, module)?;
+                    if let Err(error) = context.publish_module_to_parent(name, module) {
+                        context.transition_module(module, ModuleState::Failed)?;
+                        context.remove_cached_module_if(name, module);
+                        return Err(error);
+                    }
+                    context.push_module_namespace(namespace);
+                    let arguments = RValue::NONE;
+                    let mut output = RValue::NONE;
+                    // SAFETY: codegen registers only an exported initializer
+                    // with the documented five-argument native signature.
+                    let status = unsafe {
+                        initializer(
+                            (context as *mut Self).cast(),
+                            &raw const module,
+                            &raw const arguments,
+                            0,
+                            &raw mut output,
+                        )
+                    };
+                    context.pop_module_namespace(namespace);
+                    if status == RStatus::Ok {
+                        let Some(published) = context.cached_module(name) else {
+                            context.transition_module(module, ModuleState::Failed)?;
+                            context.remove_module_from_parent_if(name, module);
+                            return context.raise_error("KeyError", format!("'{name}'"));
+                        };
+                        if published == RValue::NONE {
+                            context.transition_module(module, ModuleState::Failed)?;
+                            context.remove_module_from_parent_if(name, module);
+                            return context.raise_error(
+                                "ModuleNotFoundError",
+                                format!("import of {name} halted; None in sys.modules"),
+                            );
+                        }
+                        if let Err(error) = context.publish_module_to_parent(name, published) {
+                            context.transition_module(module, ModuleState::Failed)?;
+                            context.remove_cached_module_if(name, module);
+                            context.remove_module_from_parent_if(name, module);
+                            return Err(error);
+                        }
+                        context.transition_module(module, ModuleState::Ready)?;
+                        Ok(published)
+                    } else {
+                        context.transition_module(module, ModuleState::Failed)?;
+                        context.remove_cached_module_if(name, module);
+                        context.remove_module_from_parent_if(name, module);
+                        Err("native module initializer failed".to_owned())
+                    }
+                })
+            })
+        })
+    }
+
+    pub(crate) fn import_namespace(
+        &mut self,
+        name: &str,
+        search_locations: &[&str],
+    ) -> Result<RValue, String> {
+        self.initialize_kernel()?;
+        if let Some(module) = self.cached_module(name) {
+            if module == RValue::NONE {
+                return self.raise_error(
+                    "ModuleNotFoundError",
+                    format!("import of {name} halted; None in sys.modules"),
+                );
+            }
+            return Ok(module);
+        }
+        if search_locations.is_empty() {
+            return self.raise_error("ModuleNotFoundError", format!("No module named '{name}'"));
+        }
+
+        let namespace = self.allocate(HeapObject::Dictionary(DictionaryObject {
+            entries: Vec::new(),
+        }))?;
+        self.with_temporary_roots(&[namespace], |context| {
+            context.initialize_namespace_module_metadata(namespace, name, search_locations)?;
+            context.with_temporary_roots(&[namespace], |context| {
+                let module = context.allocate(HeapObject::Module(ModuleObject {
+                    name: name.to_owned(),
+                    namespace,
+                    state: ModuleState::Created,
+                }))?;
+                context.with_temporary_roots(&[namespace, module], |context| {
+                    context.transition_module(module, ModuleState::Initializing)?;
+                    context.cache_module(name, module)?;
+                    if let Err(error) = context.publish_module_to_parent(name, module) {
+                        context.transition_module(module, ModuleState::Failed)?;
+                        context.remove_cached_module_if(name, module);
+                        return Err(error);
+                    }
+                    context.transition_module(module, ModuleState::Ready)?;
+                    Ok(module)
+                })
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_from(
+        &mut self,
+        module: RValue,
+        name: &str,
+        filename: &str,
+        package: &str,
+        is_package: bool,
+        initializer: Option<RNativeModuleInitializer>,
+        search_locations: &[&str],
+    ) -> Result<RValue, String> {
+        let module_name = match self.heap.get(module) {
+            Some(HeapObject::Module(module)) => module.name.clone(),
+            _ => return self.raise_error("TypeError", "from-import target is not a module"),
+        };
+        if let Ok(value) = self.attribute_get(module, name) {
+            return Ok(value);
+        }
+        if let Some(initializer) = initializer {
+            let submodule = format!("{module_name}.{name}");
+            return self.with_temporary_roots(&[module], |context| {
+                context.import_source(&submodule, filename, package, is_package, initializer)
+            });
+        }
+        if !search_locations.is_empty() {
+            let submodule = format!("{module_name}.{name}");
+            return self.with_temporary_roots(&[module], |context| {
+                context.import_namespace(&submodule, search_locations)
+            });
+        }
+        let submodule = format!("{module_name}.{name}");
+        if submodule == "rimera.async_runtime" {
+            return self
+                .with_temporary_roots(&[module], |context| context.import_registered(&submodule));
+        }
+        self.raise_error(
+            "ImportError",
+            format!("cannot import name '{name}' from '{module_name}'"),
+        )
+    }
+
+    fn initialize_source_module_metadata(
+        &mut self,
+        namespace: RValue,
+        name: &str,
+        filename: &str,
+        package: &str,
+        is_package: bool,
+    ) -> Result<(), String> {
+        let module_name = crate::operations::string(self, name)?;
+        self.namespace_set(namespace, "__name__", module_name)?;
+        let filename_value = crate::operations::string(self, filename)?;
+        self.namespace_set(namespace, "__file__", filename_value)?;
+        let package_value = crate::operations::string(self, package)?;
+        self.namespace_set(namespace, "__package__", package_value)?;
+
+        let search_path = if is_package {
+            let directory = std::path::Path::new(filename)
+                .parent()
+                .map_or_else(String::new, |path| path.display().to_string());
+            let directory = crate::operations::string(self, &directory)?;
+            self.with_temporary_roots(&[namespace, directory], |context| {
+                crate::operations::list(context, &[directory])
+            })?
+        } else {
+            RValue::NONE
+        };
+        if is_package {
+            self.namespace_set(namespace, "__path__", search_path)?;
+        }
+
+        let loader_type = self
+            .ensure_builtin_type("SourceFileLoader")?
+            .ok_or_else(|| "SourceFileLoader type is unavailable".to_owned())?;
+        let loader = self.new_instance(loader_type)?;
+        self.namespace_set(namespace, "__loader__", loader)?;
+        self.attribute_set(loader, "name", module_name)?;
+        self.attribute_set(loader, "path", filename_value)?;
+
+        let spec_type = self
+            .ensure_builtin_type("ModuleSpec")?
+            .ok_or_else(|| "ModuleSpec type is unavailable".to_owned())?;
+        let spec = self.new_instance(spec_type)?;
+        self.namespace_set(namespace, "__spec__", spec)?;
+        self.attribute_set(spec, "name", module_name)?;
+        self.attribute_set(spec, "loader", loader)?;
+        self.attribute_set(spec, "origin", filename_value)?;
+        self.attribute_set(spec, "parent", package_value)?;
+        self.attribute_set(spec, "submodule_search_locations", search_path)?;
+        self.attribute_set(spec, "has_location", RValue::boolean(true))?;
+        Ok(())
+    }
+
+    fn initialize_namespace_module_metadata(
+        &mut self,
+        namespace: RValue,
+        name: &str,
+        search_locations: &[&str],
+    ) -> Result<(), String> {
+        let module_name = crate::operations::string(self, name)?;
+        self.with_temporary_roots(&[namespace, module_name], |context| {
+            context.namespace_set(namespace, "__name__", module_name)?;
+            context.namespace_set(namespace, "__package__", module_name)?;
+            context.namespace_set(namespace, "__file__", RValue::NONE)?;
+
+            let mut location_values = Vec::with_capacity(search_locations.len());
+            for location in search_locations {
+                let value = context.with_temporary_roots(&location_values, |context| {
+                    crate::operations::string(context, location)
+                })?;
+                location_values.push(value);
+            }
+            context.with_temporary_roots(&location_values, |context| {
+                let search_path = crate::operations::list(context, &location_values)?;
+                context.with_temporary_roots(&[search_path], |context| {
+                    context.namespace_set(namespace, "__path__", search_path)?;
+
+                    let loader_type = context
+                        .ensure_builtin_type("NamespaceLoader")?
+                        .ok_or_else(|| "NamespaceLoader type is unavailable".to_owned())?;
+                    let loader = context.new_instance(loader_type)?;
+                    context.with_temporary_roots(&[search_path, loader], |context| {
+                        context.namespace_set(namespace, "__loader__", loader)?;
+                        context.attribute_set(loader, "name", module_name)?;
+
+                        let spec_type = context
+                            .ensure_builtin_type("ModuleSpec")?
+                            .ok_or_else(|| "ModuleSpec type is unavailable".to_owned())?;
+                        let spec = context.new_instance(spec_type)?;
+                        context.with_temporary_roots(&[search_path, loader, spec], |context| {
+                            context.namespace_set(namespace, "__spec__", spec)?;
+                            context.attribute_set(spec, "name", module_name)?;
+                            context.attribute_set(spec, "loader", loader)?;
+                            context.attribute_set(spec, "origin", RValue::NONE)?;
+                            context.attribute_set(spec, "parent", module_name)?;
+                            context.attribute_set(
+                                spec,
+                                "submodule_search_locations",
+                                search_path,
+                            )?;
+                            context.attribute_set(spec, "has_location", RValue::boolean(false))
+                        })
+                    })
+                })
+            })
+        })
+    }
+
+    fn publish_module_to_parent(&mut self, name: &str, module: RValue) -> Result<(), String> {
+        let Some((parent_name, child_name)) = name.rsplit_once('.') else {
+            return Ok(());
+        };
+        let parent = self
+            .cached_module(parent_name)
+            .ok_or_else(|| "import parent is not initialized".to_owned())?;
+        let parent_namespace = match self.heap.get(parent) {
+            Some(HeapObject::Module(parent)) => parent.namespace,
+            _ => return Err("import parent is not a module".to_owned()),
+        };
+        self.namespace_set(parent_namespace, child_name, module)
+    }
+
+    fn remove_module_from_parent_if(&mut self, name: &str, expected: RValue) {
+        let Some((parent_name, child_name)) = name.rsplit_once('.') else {
+            return;
+        };
+        let Some(parent) = self.cached_module(parent_name) else {
+            return;
+        };
+        let namespace = match self.heap.get(parent) {
+            Some(HeapObject::Module(parent)) => parent.namespace,
+            _ => return,
+        };
+        let Some(HeapObject::Dictionary(dictionary)) = self.heap.get_mut(namespace) else {
+            return;
+        };
+        if dictionary.get(child_name) == Some(expected) {
+            dictionary.remove(child_name);
+        }
+    }
+
+    pub(crate) fn import_star(&mut self, module: RValue) -> Result<RValue, String> {
+        let (module_name, namespace) = match self.heap.get(module) {
+            Some(HeapObject::Module(module)) => (module.name.clone(), module.namespace),
+            _ => return self.raise_error("TypeError", "star-import target is not a module"),
+        };
+        let globals = self
+            .globals()
+            .ok_or_else(|| "module globals are unavailable".to_owned())?;
+        if let Some(all) = self.namespace_value(namespace, "__all__") {
+            let iterator = self.with_temporary_roots(&[module, all, globals], |context| {
+                crate::operations::import_names_iterator(context, all)
+            })?;
+            return self.with_temporary_roots(&[module, namespace, globals, iterator], |context| {
+                loop {
+                    let Some(value) = crate::operations::iterator_next(context, iterator)? else {
+                        return Ok(RValue::NONE);
+                    };
+                    context.with_temporary_roots(&[value], |context| {
+                        let Some(name) = crate::operations::string_value(context, value) else {
+                            let value_type = context.type_of(value)?;
+                            let type_name = context.type_name(value_type);
+                            return context.raise_error(
+                                "TypeError",
+                                format!(
+                                    "Item in {module_name}.__all__ must be str, not {type_name}"
+                                ),
+                            );
+                        };
+                        let name = name.to_owned();
+                        let value = match context.attribute_get(module, &name) {
+                            Ok(value) => value,
+                            Err(error) => return context.raise_error("AttributeError", error),
+                        };
+                        context.namespace_set(globals, &name, value)
+                    })?;
+                }
+            });
+        }
+        let names = match self.heap.get(namespace) {
+            Some(HeapObject::Dictionary(dictionary)) => dictionary
+                .entries
+                .iter()
+                .map(|(name, _)| name.clone())
+                .filter(|name| !name.starts_with('_'))
+                .collect::<Vec<_>>(),
+            _ => return Err("module namespace is invalid".to_owned()),
+        };
+        self.with_temporary_roots(&[module, namespace, globals], |context| {
+            for name in names {
+                let value = match context.attribute_get(module, &name) {
+                    Ok(value) => value,
+                    Err(error) => return context.raise_error("AttributeError", error),
+                };
+                context.namespace_set(globals, &name, value)?;
+            }
+            Ok(RValue::NONE)
+        })
+    }
+
+    pub(crate) fn transition_module(
+        &mut self,
+        module: RValue,
+        next: ModuleState,
+    ) -> Result<(), String> {
+        let Some(HeapObject::Module(module)) = self.heap.get_mut(module) else {
+            return Err("module state transition requires a module object".to_owned());
+        };
+        let legal = matches!(
+            (&module.state, &next),
+            (ModuleState::Created, ModuleState::Initializing)
+                | (ModuleState::Ready, ModuleState::Initializing)
+                | (
+                    ModuleState::Initializing,
+                    ModuleState::Ready | ModuleState::Failed
+                )
+        );
+        if !legal {
+            return Err(format!(
+                "illegal module state transition from {:?} to {next:?}",
+                module.state
+            ));
+        }
+        module.state = next;
+        Ok(())
     }
 
     pub(crate) fn builtins(&self) -> Option<RValue> {
@@ -5228,6 +6908,7 @@ impl RimeraContext {
             .last()
             .copied()
             .or(self.raised)
+            .or_else(|| self.ambient_exception_context.last().copied())
             .filter(|active| *active != exception);
         let Some(HeapObject::Exception(object)) = self.heap.get_mut(exception) else {
             return Err("exception handle became invalid".to_owned());
@@ -5484,9 +7165,16 @@ impl RimeraContext {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn add_context_root(&mut self, value: RValue) {
         self.context_roots.push(value);
+    }
+
+    pub(crate) fn remove_context_root(&mut self, value: RValue) -> bool {
+        let Some(index) = self.context_roots.iter().rposition(|root| *root == value) else {
+            return false;
+        };
+        self.context_roots.remove(index);
+        true
     }
 
     #[cfg(test)]

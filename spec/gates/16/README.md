@@ -40,6 +40,32 @@ audits the complete public contract and qualifies a release.
 8. Run the full ecosystem boundary and publish a machine-readable matrix of
    package name, version, target, install mode, extension ABI, and result.
 
+## Required flagship profiles
+
+Gate 16 cannot close with only synthetic packages. Its minimum continuously
+qualified application profiles are:
+
+- **Flask:** install the locked Flask/Werkzeug/Jinja/Click/MarkupSafe graph;
+  run the CLI, application factory, routing, request/response, templates,
+  sessions, JSON, error handlers, test client, and a live WSGI HTTP workload.
+- **FastAPI:** qualify both the base and declared standard installation tiers,
+  including Starlette, Pydantic and `pydantic-core`, Uvicorn, validation,
+  dependency injection, OpenAPI generation, middleware, background work,
+  test clients, HTTP serving, WebSockets, and lifespan behavior.
+- **discord.py:** install its locked async/network dependency graph and run
+  gateway protocol simulations, event dispatch, commands, rate limiting,
+  reconnect/resume, HTTP, WebSocket, SSL, cancellation, and shutdown tests.
+- **Pycord:** run the corresponding bot, command, interaction, gateway,
+  reconnect, and shutdown suites. Qualify base, voice, and speed extras as
+  separate profiles because their native dependencies differ.
+
+Each profile pins the framework and complete transitive graph. “Supported”
+means install, import, public upstream tests applicable to the target, a real
+minimal application, failure behavior, and sustained workload all pass without
+patching the framework or adding a framework-specific compiler branch. Passing
+one version does not imply future releases; latest-compatible versions run in a
+separate tracking lane and enter the guarantee only after qualification.
+
 Passing Gate 16 establishes measured package-ecosystem coverage. Gate 17 must
 still prove that the underlying public contract is complete enough to warrant
 a drop-in release guarantee.

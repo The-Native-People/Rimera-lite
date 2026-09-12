@@ -70,7 +70,7 @@ def main() -> None:
     parser.add_argument(
         "--rimera",
         type=Path,
-        default=repository / "target/debug/rimera",
+        default=repository / "target/debug/rimera-lite",
         help="built Rimera Lite executable used for calibration",
     )
     arguments = parser.parse_args()

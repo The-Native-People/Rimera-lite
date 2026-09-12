@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::lir::NativeProgram;
 use crate::mir::{self as mir, OperationKind, Terminator};
+use crate::project::AsyncBackend;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     AbiParam, FuncRef, InstBuilder, StackSlot, StackSlotData, StackSlotKind, Value, types,
@@ -14,14 +15,133 @@ use rimera_abi::ABI_VERSION;
 
 const VALUE_SIZE: u32 = 16;
 
+#[derive(Debug, Clone)]
+pub struct ModuleInitializer {
+    pub symbol: Option<String>,
+    pub filename: String,
+    pub package: String,
+    pub is_package: bool,
+    pub search_locations: Vec<String>,
+    pub resources: Vec<ModuleResource>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleResource {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct DeclaredModuleInitializer {
+    function: Option<cranelift_module::FuncId>,
+    filename: String,
+    package: String,
+    is_package: bool,
+    search_locations: String,
+    resources: Vec<ModuleResource>,
+}
+
 pub fn emit_object(
     program: &NativeProgram,
     release: bool,
     heap_limit_bytes: Option<u64>,
 ) -> Result<Vec<u8>, String> {
-    mir::verify(&program.mir)?;
-    let entry = &program.mir.functions[program.mir.entry.0 as usize];
-    let root_plan = mir::safepoint_plan(entry)?;
+    emit_object_with_modules(
+        program,
+        release,
+        heap_limit_bytes,
+        &BTreeMap::new(),
+        None,
+        false,
+        None,
+    )
+}
+
+pub fn emit_entry_object(
+    program: &NativeProgram,
+    release: bool,
+    heap_limit_bytes: Option<u64>,
+    module_initializers: &BTreeMap<String, ModuleInitializer>,
+    linked_async_backend: Option<AsyncBackend>,
+    dynamic_compilation: bool,
+) -> Result<Vec<u8>, String> {
+    emit_object_with_modules(
+        program,
+        release,
+        heap_limit_bytes,
+        module_initializers,
+        linked_async_backend,
+        dynamic_compilation,
+        None,
+    )
+}
+
+pub fn emit_module_object(
+    program: &NativeProgram,
+    release: bool,
+    module_initializers: &BTreeMap<String, ModuleInitializer>,
+    export_symbol: &str,
+) -> Result<Vec<u8>, String> {
+    emit_object_with_modules(
+        program,
+        release,
+        None,
+        module_initializers,
+        None,
+        false,
+        Some(export_symbol),
+    )
+}
+
+fn coroutine_has_ready_entry(function: &mir::Function) -> bool {
+    function.kind == mir::FunctionKind::Coroutine
+        && function.blocks.iter().all(|block| {
+            !matches!(
+                block.terminator,
+                mir::Terminator::Yield { .. } | mir::Terminator::Suspend { .. }
+            )
+        })
+}
+
+fn coroutine_is_repeat_pure(function: &mir::Function) -> bool {
+    if !coroutine_has_ready_entry(function)
+        || !function.parameters.is_empty()
+        || function.native_local_count != 0
+        || !function.exception_edges.is_empty()
+        || function.blocks.len() != 1
+    {
+        return false;
+    }
+    let block = &function.blocks[0];
+    if !matches!(block.terminator, mir::Terminator::ReturnValue { .. }) {
+        return false;
+    }
+    block
+        .operations
+        .iter()
+        .all(|operation| match &operation.kind {
+            OperationKind::Constant {
+                value: mir::Constant::None | mir::Constant::Bool(_),
+                ..
+            }
+            | OperationKind::Copy { .. } => true,
+            OperationKind::Constant {
+                value: mir::Constant::Int(value),
+                ..
+            } => value.parse::<i64>().is_ok(),
+            _ => false,
+        })
+}
+
+fn emit_object_with_modules(
+    program: &NativeProgram,
+    release: bool,
+    heap_limit_bytes: Option<u64>,
+    module_initializers: &BTreeMap<String, ModuleInitializer>,
+    linked_async_backend: Option<AsyncBackend>,
+    dynamic_compilation: bool,
+    module_export: Option<&str>,
+) -> Result<Vec<u8>, String> {
     let mut flags = settings::builder();
     flags
         .set("is_pic", "true")
@@ -42,19 +162,49 @@ pub fn emit_object(
     let builder = ObjectBuilder::new(isa, "rimera", cranelift_module::default_libcall_names())
         .map_err(|error| error.to_string())?;
     let mut module = ObjectModule::new(builder);
+    populate_module(&mut module, program, heap_limit_bytes, module_initializers,
+        linked_async_backend, dynamic_compilation, module_export)?;
+    Ok(module.finish().emit().map_err(|error| error.to_string())?.to_vec())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn populate_module(
+    module: &mut dyn Module,
+    program: &NativeProgram,
+    heap_limit_bytes: Option<u64>,
+    module_initializers: &BTreeMap<String, ModuleInitializer>,
+    linked_async_backend: Option<AsyncBackend>,
+    dynamic_compilation: bool,
+    module_export: Option<&str>,
+) -> Result<Option<cranelift_module::FuncId>, String> {
+    mir::verify(&program.mir)?;
+    let entry = &program.mir.functions[program.mir.entry.0 as usize];
+    let root_plan = mir::safepoint_plan(entry)?;
     let pointer = module.target_config().pointer_type();
-    let imports = Imports::declare(&mut module, pointer, &program.mir)?;
+    let imports = Imports::declare(
+        module,
+        pointer,
+        &program.mir,
+        module_initializers,
+        linked_async_backend,
+        dynamic_compilation,
+    )?;
     let native_functions = program
         .mir
         .functions
         .iter()
         .enumerate()
         .map(|(index, function)| {
-            if index == program.mir.entry.0 as usize {
+            if index == program.mir.entry.0 as usize && module_export.is_none() {
                 return Ok(None);
             }
             let mut signature = module.make_signature();
-            if function.kind == mir::FunctionKind::Generator {
+            if matches!(
+                function.kind,
+                mir::FunctionKind::Generator
+                    | mir::FunctionKind::Coroutine
+                    | mir::FunctionKind::AsyncGenerator
+            ) {
                 signature.params.extend([
                     AbiParam::new(pointer),
                     AbiParam::new(pointer),
@@ -69,9 +219,39 @@ pub fn emit_object(
                     .extend((0..5).map(|_| AbiParam::new(pointer)));
             }
             signature.returns.push(AbiParam::new(types::I32));
+            let (name, linkage) = if index == program.mir.entry.0 as usize {
+                (
+                    module_export
+                        .expect("module entry has an export symbol")
+                        .to_owned(),
+                    Linkage::Export,
+                )
+            } else {
+                (format!("rimera_native_{index}"), Linkage::Local)
+            };
+            module
+                .declare_function(&name, linkage, &signature)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let ready_coroutine_functions = program
+        .mir
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(index, function)| {
+            if !coroutine_has_ready_entry(function) {
+                return Ok(None);
+            }
+            let mut signature = module.make_signature();
+            signature
+                .params
+                .extend((0..5).map(|_| AbiParam::new(pointer)));
+            signature.returns.push(AbiParam::new(types::I32));
             module
                 .declare_function(
-                    &format!("rimera_native_{index}"),
+                    &format!("rimera_ready_coroutine_{index}"),
                     Linkage::Local,
                     &signature,
                 )
@@ -79,14 +259,14 @@ pub fn emit_object(
                 .map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let data = define_constants(&mut module, &program.mir)?;
+    let data = define_constants(module, &program.mir, module_initializers)?;
     for (index, function) in program.mir.functions.iter().enumerate() {
         let Some(function_id) = native_functions[index] else {
             continue;
         };
         let root_plan = mir::safepoint_plan(function)?;
         define_native_function(
-            &mut module,
+            module,
             &program.mir,
             function,
             function_id,
@@ -95,31 +275,66 @@ pub fn emit_object(
             &imports,
             &data,
             &native_functions,
+            &ready_coroutine_functions,
             index as u32,
         )?;
+        if let Some(ready_function_id) = ready_coroutine_functions[index] {
+            let mut ready_function = function.clone();
+            ready_function.kind = mir::FunctionKind::Python;
+            let ready_root_plan = mir::safepoint_plan(&ready_function)?;
+            define_native_function(
+                module,
+                &program.mir,
+                &ready_function,
+                ready_function_id,
+                &ready_root_plan,
+                pointer,
+                &imports,
+                &data,
+                &native_functions,
+                &ready_coroutine_functions,
+                index as u32,
+            )?;
+        }
     }
-    define_main(
-        &mut module,
-        entry,
-        &root_plan,
-        pointer,
-        &imports,
-        &data,
-        &program.mir,
-        &native_functions,
-        program.mir.entry.0,
-        heap_limit_bytes,
-    )?;
-    Ok(module
-        .finish()
-        .emit()
-        .map_err(|error| error.to_string())?
-        .to_vec())
+    if module_export.is_none() {
+        define_main(
+            module,
+            entry,
+            &root_plan,
+            pointer,
+            &imports,
+            &data,
+            &program.mir,
+            &native_functions,
+            &ready_coroutine_functions,
+            program.mir.entry.0,
+            heap_limit_bytes,
+        )?;
+    }
+    Ok(native_functions[program.mir.entry.0 as usize])
+}
+
+pub(crate) fn emit_jit(
+    program: &NativeProgram,
+    symbols: &[(&str, *const u8)],
+) -> Result<(cranelift_jit::JITModule, *const u8), String> {
+    let mut builder = cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names())
+        .map_err(|error| error.to_string())?;
+    for (name, address) in symbols {
+        builder.symbol(*name, *address);
+    }
+    let mut module = cranelift_jit::JITModule::new(builder);
+    let entry = populate_module(&mut module, program, None, &BTreeMap::new(), None,
+        false, Some("rimera_dynamic_entry"))?.expect("dynamic entry is exported");
+    module.finalize_definitions().map_err(|error| error.to_string())?;
+    let pointer = module.get_finalized_function(entry);
+    Ok((module, pointer))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn define_generator_function(
-    module: &mut ObjectModule,
+    module: &mut dyn Module,
     module_program: &mir::Program,
     program: &mir::Function,
     function_id: cranelift_module::FuncId,
@@ -128,6 +343,7 @@ fn define_generator_function(
     imports: &Imports,
     data: &ConstantData,
     native_functions: &[Option<cranelift_module::FuncId>],
+    ready_coroutine_functions: &[Option<cranelift_module::FuncId>],
     function_index: u32,
 ) -> Result<(), String> {
     let persistent = mir::generator_persistent_values(program)?;
@@ -287,6 +503,13 @@ fn define_generator_function(
             .enumerate()
             .filter_map(|(index, block)| match block.terminator {
                 Terminator::Yield {
+                    resume_value,
+                    resume_target,
+                    exception_target,
+                    delegate,
+                    ..
+                }
+                | Terminator::Suspend {
                     resume_value,
                     resume_target,
                     exception_target,
@@ -581,6 +804,7 @@ fn define_generator_function(
                     data,
                     module_program,
                     native_functions,
+                    ready_coroutine_functions,
                     function_index,
                     block_index as u32,
                     operation_index,
@@ -688,14 +912,14 @@ fn define_generator_function(
     }
     module
         .define_function(function_id, &mut context)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("{error:?}"))?;
     module.clear_context(&mut context);
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn define_native_function(
-    module: &mut ObjectModule,
+    module: &mut dyn Module,
     module_program: &mir::Program,
     program: &mir::Function,
     function_id: cranelift_module::FuncId,
@@ -704,9 +928,15 @@ fn define_native_function(
     imports: &Imports,
     data: &ConstantData,
     native_functions: &[Option<cranelift_module::FuncId>],
+    ready_coroutine_functions: &[Option<cranelift_module::FuncId>],
     function_index: u32,
 ) -> Result<(), String> {
-    if program.kind == mir::FunctionKind::Generator {
+    if matches!(
+        program.kind,
+        mir::FunctionKind::Generator
+            | mir::FunctionKind::Coroutine
+            | mir::FunctionKind::AsyncGenerator
+    ) {
         return define_generator_function(
             module,
             module_program,
@@ -717,6 +947,7 @@ fn define_native_function(
             imports,
             data,
             native_functions,
+            ready_coroutine_functions,
             function_index,
         );
     }
@@ -790,9 +1021,21 @@ fn define_native_function(
                 .ins()
                 .stack_store(second, values_slot, value_offset(parameter.value) + 8);
         }
+        // Ordinary non-captured Python locals live in a trailing region of the
+        // native root frame. GC sees them without heap Cell objects, while
+        // transient safepoint publication only rewrites the prefix.
         let root_capacity = root_plan.max_roots();
-        let root_bytes = u32::try_from(root_capacity.max(1).saturating_mul(VALUE_SIZE as usize))
-            .map_err(|_| "root frame is too large")?;
+        let native_local_count =
+            usize::try_from(program.native_local_count).map_err(|_| "too many native locals")?;
+        let total_root_capacity = root_capacity
+            .checked_add(native_local_count)
+            .ok_or_else(|| "root frame capacity overflow".to_owned())?;
+        let root_bytes = u32::try_from(
+            total_root_capacity
+                .max(1)
+                .saturating_mul(VALUE_SIZE as usize),
+        )
+        .map_err(|_| "root frame is too large")?;
         let roots_slot = builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             root_bytes,
@@ -805,6 +1048,18 @@ fn define_native_function(
                 roots_slot,
                 i32::try_from(offset).map_err(|_| "root frame is too large")?,
             );
+        }
+        // Packed RValue::UNBOUND header: tag=None (0), flags=1.
+        for index in 0..native_local_count {
+            let slot = root_capacity
+                .checked_add(index)
+                .ok_or_else(|| "native local root offset overflow".to_owned())?;
+            let offset = i32::try_from(slot.saturating_mul(VALUE_SIZE as usize))
+                .map_err(|_| "native local root offset is too large")?;
+            let unbound_header = builder.ins().iconst(types::I64, 1_i64 << 32);
+            builder
+                .ins()
+                .stack_store(unbound_header, roots_slot, offset);
         }
         let frame_slot =
             builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3));
@@ -820,7 +1075,7 @@ fn define_native_function(
         builder.ins().stack_store(roots_pointer, frame_slot, 8);
         let root_count = builder.ins().iconst(
             pointer,
-            i64::try_from(root_capacity).map_err(|_| "too many GC roots")?,
+            i64::try_from(total_root_capacity).map_err(|_| "too many GC roots")?,
         );
         builder.ins().stack_store(root_count, frame_slot, 16);
         let frame_pointer = builder.ins().stack_addr(pointer, frame_slot, 0);
@@ -833,6 +1088,23 @@ fn define_native_function(
             &[context_value, frame_pointer],
             failure,
         );
+        if native_local_count != 0 {
+            let native_offset = i32::try_from(root_capacity.saturating_mul(VALUE_SIZE as usize))
+                .map_err(|_| "native local root offset is too large")?;
+            let native_values = builder.ins().stack_addr(pointer, roots_slot, native_offset);
+            let native_count = builder.ins().iconst(
+                pointer,
+                i64::try_from(native_local_count).map_err(|_| "too many native locals")?,
+            );
+            let register = module
+                .declare_func_in_func(imports.reflection_native_locals_register, builder.func);
+            emit_status_call(
+                &mut builder,
+                register,
+                &[context_value, native_values, native_count],
+                failure,
+            );
+        }
         let refs = FunctionRefs::new(module, builder.func, imports);
         let block_map = program
             .blocks
@@ -878,6 +1150,7 @@ fn define_native_function(
                     data,
                     module_program,
                     native_functions,
+                    ready_coroutine_functions,
                     function_index,
                     block_index as u32,
                     operation_index,
@@ -892,6 +1165,11 @@ fn define_native_function(
                     operation_failure,
                 )?;
             }
+            let return_mode = if program.kind == mir::FunctionKind::Module {
+                ReturnMode::Initializer
+            } else {
+                ReturnMode::Native { output }
+            };
             emit_terminator(
                 &mut builder,
                 &refs,
@@ -905,7 +1183,7 @@ fn define_native_function(
                 root_plan.terminator_roots(block_index),
                 context_value,
                 frame_pointer,
-                ReturnMode::Native { output },
+                return_mode,
                 failure,
             )?;
         }
@@ -987,7 +1265,7 @@ fn define_native_function(
     }
     module
         .define_function(function_id, &mut context)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("{error:?}"))?;
     module.clear_context(&mut context);
     Ok(())
 }
@@ -999,16 +1277,31 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
         "rimera_context_free",
         "rimera_roots_push",
         "rimera_roots_pop",
+        "rimera_traceback_append",
         "rimera_traceback_append_module",
         "rimera_render_error",
     ]);
-    if program.functions.len() > 1 {
-        required.insert("rimera_traceback_append");
-    }
     for function in &program.functions {
-        if function.kind == mir::FunctionKind::Generator {
+        if function.native_local_count != 0 {
+            required.insert("rimera_reflection_native_locals_register");
+            required.insert("rimera_unbound_local");
+        }
+        if coroutine_has_ready_entry(function) {
+            required.insert("rimera_function_ready_coroutine_set");
+        }
+        if matches!(
+            function.kind,
+            mir::FunctionKind::Generator
+                | mir::FunctionKind::Coroutine
+                | mir::FunctionKind::AsyncGenerator
+        ) {
+            required.insert(match function.kind {
+                mir::FunctionKind::Generator => "rimera_generator_function_new",
+                mir::FunctionKind::Coroutine => "rimera_coroutine_function_new",
+                mir::FunctionKind::AsyncGenerator => "rimera_async_generator_function_new",
+                _ => unreachable!(),
+            });
             required.extend([
-                "rimera_generator_function_new",
                 "rimera_generator_function_get",
                 "rimera_generator_state_get",
                 "rimera_generator_state_set",
@@ -1026,6 +1319,9 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                 Terminator::Yield {
                     delegate: Some(_),
                     ..
+                } | Terminator::Suspend {
+                    delegate: Some(_),
+                    ..
                 }
             ) {
                 required.insert("rimera_generator_delegate_set");
@@ -1041,7 +1337,11 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                         mir::Constant::Complex { .. } => Some("rimera_complex_new"),
                         mir::Constant::None | mir::Constant::Bool(_) => None,
                     },
-                    OperationKind::Copy { .. } | OperationKind::CallModuleChunk { .. } => None,
+                    OperationKind::Copy { .. }
+                    | OperationKind::CallModuleChunk { .. }
+                    | OperationKind::NativeLocalGet { .. }
+                    | OperationKind::NativeLocalSet { .. }
+                    | OperationKind::NativeLocalClear { .. } => None,
                     OperationKind::Unary { .. } => Some("rimera_unary"),
                     OperationKind::Binary { .. } => Some("rimera_binary"),
                     OperationKind::InPlace { .. } => Some("rimera_inplace"),
@@ -1062,6 +1362,13 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                     OperationKind::ItemGet { .. } => Some("rimera_item_get"),
                     OperationKind::Length { .. } => Some("rimera_length"),
                     OperationKind::IteratorNew { .. } => Some("rimera_iterator_new"),
+                    OperationKind::RangeCollapseProbe { .. } => Some("rimera_range_collapse_probe"),
+                    OperationKind::CoroutineCloseElideProbe { .. } => {
+                        Some("rimera_coroutine_close_elide_probe")
+                    }
+                    OperationKind::AwaitIterator { .. } => Some("rimera_await_iterator"),
+                    OperationKind::AsyncIteratorNew { .. } => Some("rimera_async_iterator_new"),
+                    OperationKind::AsyncIteratorNext { .. } => Some("rimera_async_iterator_next"),
                     OperationKind::IteratorNext { .. } => Some("rimera_iterator_next"),
                     OperationKind::YieldFromNext { .. } => Some("rimera_generator_delegate_start"),
                     OperationKind::Range { .. } => Some("rimera_range_new"),
@@ -1086,9 +1393,18 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                     OperationKind::ClassNamespaceDelete { .. } => Some("rimera_namespace_delete"),
                     OperationKind::ClassNew { .. } => Some("rimera_class_new"),
                     OperationKind::AttributeGet { .. } => Some("rimera_attr_get"),
+                    OperationKind::TypeOf { .. } => Some("rimera_type_of"),
+                    OperationKind::SpecialMethodGet { .. } => Some("rimera_special_method_get"),
                     OperationKind::AttributeSet { .. } => Some("rimera_attr_set"),
                     OperationKind::AttributeDelete { .. } => Some("rimera_attr_delete"),
-                    OperationKind::Call { .. } => Some("rimera_call"),
+                    OperationKind::Call { keywords, .. } => Some(if keywords.is_empty() {
+                        "rimera_call_positional_rooted"
+                    } else {
+                        "rimera_call"
+                    }),
+                    OperationKind::CallAwaitReady { .. } => {
+                        Some("rimera_call_ready_coroutine_rooted")
+                    }
                     OperationKind::CallArgumentsNew { .. } => Some("rimera_call_arguments_new"),
                     OperationKind::CallArgumentAdd { .. } => Some("rimera_call_argument_add"),
                     OperationKind::CallPrepared { .. } => Some("rimera_call_prepared"),
@@ -1107,7 +1423,9 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                     OperationKind::ClosureGet { .. } => Some("rimera_function_closure_get"),
                     OperationKind::CellSet { .. } => Some("rimera_cell_set"),
                     OperationKind::CellClear { .. } => Some("rimera_cell_clear"),
-                    OperationKind::ImportName { .. } => Some("rimera_import_name"),
+                    OperationKind::ImportName { .. } => Some("rimera_import_dispatch"),
+                    OperationKind::ImportFrom { .. } => Some("rimera_import_from"),
+                    OperationKind::ImportStar { .. } => Some("rimera_import_star"),
                     OperationKind::GlobalGet { .. } => Some("rimera_global_get"),
                     OperationKind::GlobalSet { .. } => Some("rimera_global_set"),
                     OperationKind::GlobalDelete { .. } => Some("rimera_global_delete"),
@@ -1124,6 +1442,7 @@ fn required_runtime_imports(program: &mir::Program) -> BTreeSet<&'static str> {
                     OperationKind::Reraise => Some("rimera_reraise"),
                     OperationKind::Propagate => Some("rimera_exception_propagate"),
                     OperationKind::Print { .. } => Some("rimera_print"),
+                    OperationKind::Display { .. } => Some("rimera_display"),
                     OperationKind::PrintLiteral { .. } => Some("rimera_print_literal"),
                     OperationKind::Collect => Some("rimera_collect"),
                 };
@@ -1140,6 +1459,8 @@ struct Imports {
     context_new: cranelift_module::FuncId,
     context_set_heap_limit: cranelift_module::FuncId,
     kernel_initialize: cranelift_module::FuncId,
+    dynamic_compilation_enable: Option<cranelift_module::FuncId>,
+    async_backend_select: Option<cranelift_module::FuncId>,
     context_free: cranelift_module::FuncId,
     roots_push: cranelift_module::FuncId,
     roots_pop: cranelift_module::FuncId,
@@ -1166,6 +1487,11 @@ struct Imports {
     length: cranelift_module::FuncId,
     range_new: cranelift_module::FuncId,
     iterator_new: cranelift_module::FuncId,
+    range_collapse_probe: cranelift_module::FuncId,
+    coroutine_close_elide_probe: cranelift_module::FuncId,
+    await_iterator: cranelift_module::FuncId,
+    async_iterator_new: cranelift_module::FuncId,
+    async_iterator_next: cranelift_module::FuncId,
     iterator_next: cranelift_module::FuncId,
     value_array_get: cranelift_module::FuncId,
     pattern_sequence: cranelift_module::FuncId,
@@ -1176,6 +1502,9 @@ struct Imports {
     type_parameter_new: cranelift_module::FuncId,
     type_alias_new: cranelift_module::FuncId,
     generator_function_new: cranelift_module::FuncId,
+    coroutine_function_new: cranelift_module::FuncId,
+    function_ready_coroutine_set: cranelift_module::FuncId,
+    async_generator_function_new: cranelift_module::FuncId,
     generator_function_get: cranelift_module::FuncId,
     generator_state_get: cranelift_module::FuncId,
     generator_state_set: cranelift_module::FuncId,
@@ -1193,21 +1522,33 @@ struct Imports {
     namespace_delete: cranelift_module::FuncId,
     class_new: cranelift_module::FuncId,
     attr_get: cranelift_module::FuncId,
+    type_of: cranelift_module::FuncId,
+    special_method_get: cranelift_module::FuncId,
     attr_set: cranelift_module::FuncId,
     attr_delete: cranelift_module::FuncId,
     call: cranelift_module::FuncId,
+    call_positional_rooted: cranelift_module::FuncId,
+    call_ready_coroutine_rooted: cranelift_module::FuncId,
     call_arguments_new: cranelift_module::FuncId,
     call_argument_add: cranelift_module::FuncId,
     call_prepared: cranelift_module::FuncId,
     cell_new: cranelift_module::FuncId,
     reflection_scope_configure: cranelift_module::FuncId,
+    reflection_native_locals_register: cranelift_module::FuncId,
     reflection_local_register: cranelift_module::FuncId,
+    unbound_local: cranelift_module::FuncId,
     cell_get: cranelift_module::FuncId,
     cell_get_named: cranelift_module::FuncId,
     cell_set: cranelift_module::FuncId,
     cell_clear: cranelift_module::FuncId,
     closure_get: cranelift_module::FuncId,
     import_name: cranelift_module::FuncId,
+    register_source_module: cranelift_module::FuncId,
+    register_namespace_module: cranelift_module::FuncId,
+    register_module_resource: cranelift_module::FuncId,
+    import_from: cranelift_module::FuncId,
+    import_star: cranelift_module::FuncId,
+    module_initializers: BTreeMap<String, DeclaredModuleInitializer>,
     global_get: cranelift_module::FuncId,
     global_set: cranelift_module::FuncId,
     global_delete: cranelift_module::FuncId,
@@ -1233,6 +1574,7 @@ struct Imports {
     annotations_ensure: cranelift_module::FuncId,
     truthy: cranelift_module::FuncId,
     print: cranelift_module::FuncId,
+    display: cranelift_module::FuncId,
     print_literal: cranelift_module::FuncId,
     collect: cranelift_module::FuncId,
     render_error: cranelift_module::FuncId,
@@ -1240,13 +1582,16 @@ struct Imports {
 
 impl Imports {
     fn declare(
-        module: &mut ObjectModule,
+        module: &mut dyn Module,
         pointer: cranelift_codegen::ir::Type,
         program: &mir::Program,
+        module_initializers: &BTreeMap<String, ModuleInitializer>,
+        linked_async_backend: Option<AsyncBackend>,
+        dynamic_compilation: bool,
     ) -> Result<Self, String> {
         let required = required_runtime_imports(program);
         fn raw_declaration(
-            module: &mut ObjectModule,
+            module: &mut dyn Module,
             name: &str,
             parameters: &[cranelift_codegen::ir::Type],
             returns_status: bool,
@@ -1264,7 +1609,7 @@ impl Imports {
         }
         let context_new =
             raw_declaration(module, "rimera_context_new", &[types::I32, pointer], true)?;
-        let declaration = |module: &mut ObjectModule,
+        let declaration = |module: &mut dyn Module,
                            name: &str,
                            parameters: &[cranelift_codegen::ir::Type],
                            returns_status: bool|
@@ -1275,6 +1620,65 @@ impl Imports {
                 Ok(context_new)
             }
         };
+        let native_initializer_signature = |module: &dyn Module| {
+            let mut signature = module.make_signature();
+            signature
+                .params
+                .extend((0..5).map(|_| AbiParam::new(pointer)));
+            signature.returns.push(AbiParam::new(types::I32));
+            signature
+        };
+        let mut declared_initializers = BTreeMap::new();
+        for (name, initializer) in module_initializers {
+            let function = initializer
+                .symbol
+                .as_deref()
+                .map(|symbol| {
+                    module
+                        .declare_function(
+                            symbol,
+                            Linkage::Import,
+                            &native_initializer_signature(module),
+                        )
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()?;
+            declared_initializers.insert(
+                name.clone(),
+                DeclaredModuleInitializer {
+                    function,
+                    filename: initializer.filename.clone(),
+                    package: initializer.package.clone(),
+                    is_package: initializer.is_package,
+                    search_locations: initializer.search_locations.join("\0"),
+                    resources: initializer.resources.clone(),
+                },
+            );
+        }
+        let dynamic_compilation_enable = dynamic_compilation
+            .then(|| {
+                raw_declaration(
+                    module,
+                    "rimera_dynamic_compiler_install",
+                    &[pointer],
+                    true,
+                )
+            })
+            .transpose()?;
+        let async_backend_select = linked_async_backend
+            .map(|backend| match backend {
+                AsyncBackend::Compio => raw_declaration(
+                    module,
+                    "rimera_async_backend_select_compio",
+                    &[pointer],
+                    true,
+                ),
+                AsyncBackend::Auto | AsyncBackend::Monoio | AsyncBackend::Tokio => Err(format!(
+                    "invalid linked async backend `{}`",
+                    backend.as_str()
+                )),
+            })
+            .transpose()?;
         Ok(Self {
             context_new,
             context_set_heap_limit: declaration(
@@ -1284,6 +1688,8 @@ impl Imports {
                 true,
             )?,
             kernel_initialize: declaration(module, "rimera_kernel_initialize", &[pointer], true)?,
+            dynamic_compilation_enable,
+            async_backend_select,
             context_free: declaration(module, "rimera_context_free", &[pointer], false)?,
             roots_push: declaration(module, "rimera_roots_push", &[pointer, pointer], true)?,
             roots_pop: declaration(module, "rimera_roots_pop", &[pointer, pointer], true)?,
@@ -1420,6 +1826,36 @@ impl Imports {
                 &[pointer, pointer, pointer],
                 true,
             )?,
+            range_collapse_probe: declaration(
+                module,
+                "rimera_range_collapse_probe",
+                &[pointer, pointer, pointer, pointer, pointer, pointer],
+                true,
+            )?,
+            coroutine_close_elide_probe: declaration(
+                module,
+                "rimera_coroutine_close_elide_probe",
+                &[pointer, pointer, pointer],
+                true,
+            )?,
+            await_iterator: declaration(
+                module,
+                "rimera_await_iterator",
+                &[pointer, pointer, pointer],
+                true,
+            )?,
+            async_iterator_new: declaration(
+                module,
+                "rimera_async_iterator_new",
+                &[pointer, pointer, pointer],
+                true,
+            )?,
+            async_iterator_next: declaration(
+                module,
+                "rimera_async_iterator_next",
+                &[pointer, pointer, pointer],
+                true,
+            )?,
             iterator_next: declaration(
                 module,
                 "rimera_iterator_next",
@@ -1522,6 +1958,30 @@ impl Imports {
                 ],
                 true,
             )?,
+            coroutine_function_new: declaration(
+                module,
+                "rimera_coroutine_function_new",
+                &[
+                    pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+                    pointer, pointer, pointer, pointer, pointer,
+                ],
+                true,
+            )?,
+            function_ready_coroutine_set: declaration(
+                module,
+                "rimera_function_ready_coroutine_set",
+                &[pointer, pointer, pointer, types::I8],
+                true,
+            )?,
+            async_generator_function_new: declaration(
+                module,
+                "rimera_async_generator_function_new",
+                &[
+                    pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+                    pointer, pointer, pointer, pointer, pointer,
+                ],
+                true,
+            )?,
             generator_function_get: declaration(
                 module,
                 "rimera_generator_function_get",
@@ -1609,6 +2069,13 @@ impl Imports {
                 &[pointer, pointer, pointer, pointer, pointer],
                 true,
             )?,
+            type_of: declaration(module, "rimera_type_of", &[pointer, pointer, pointer], true)?,
+            special_method_get: declaration(
+                module,
+                "rimera_special_method_get",
+                &[pointer, pointer, pointer, pointer, pointer],
+                true,
+            )?,
             attr_set: declaration(
                 module,
                 "rimera_attr_set",
@@ -1625,6 +2092,26 @@ impl Imports {
                 module,
                 "rimera_call",
                 &[pointer, pointer, pointer, pointer],
+                true,
+            )?,
+            call_positional_rooted: declaration(
+                module,
+                "rimera_call_positional_rooted",
+                &[pointer, pointer, pointer, pointer, pointer],
+                true,
+            )?,
+            call_ready_coroutine_rooted: declaration(
+                module,
+                "rimera_call_ready_coroutine_rooted",
+                &[
+                    pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                    types::I8,
+                    pointer,
+                    pointer,
+                ],
                 true,
             )?,
             call_arguments_new: declaration(
@@ -1657,10 +2144,22 @@ impl Imports {
                 &[pointer, pointer, types::I8],
                 true,
             )?,
+            reflection_native_locals_register: declaration(
+                module,
+                "rimera_reflection_native_locals_register",
+                &[pointer, pointer, pointer],
+                true,
+            )?,
             reflection_local_register: declaration(
                 module,
                 "rimera_reflection_local_register",
                 &[pointer, pointer, pointer, pointer],
+                true,
+            )?,
+            unbound_local: declaration(
+                module,
+                "rimera_unbound_local",
+                &[pointer, pointer, pointer],
                 true,
             )?,
             cell_get: declaration(
@@ -1690,10 +2189,83 @@ impl Imports {
             )?,
             import_name: declaration(
                 module,
-                "rimera_import_name",
+                "rimera_import_dispatch",
                 &[pointer, pointer, pointer, pointer],
                 true,
             )?,
+            register_source_module: if module_initializers
+                .values()
+                .all(|initializer| initializer.symbol.is_none())
+            {
+                context_new
+            } else {
+                raw_declaration(
+                    module,
+                    "rimera_register_source_module",
+                    &[
+                        pointer,
+                        pointer,
+                        pointer,
+                        pointer,
+                        pointer,
+                        pointer,
+                        pointer,
+                        types::I8,
+                        pointer,
+                    ],
+                    true,
+                )?
+            },
+            register_namespace_module: if module_initializers
+                .values()
+                .all(|initializer| initializer.symbol.is_some())
+            {
+                context_new
+            } else {
+                raw_declaration(
+                    module,
+                    "rimera_register_namespace_module",
+                    &[pointer, pointer, pointer, pointer, pointer],
+                    true,
+                )?
+            },
+            register_module_resource: if module_initializers
+                .values()
+                .all(|initializer| initializer.resources.is_empty())
+            {
+                context_new
+            } else {
+                raw_declaration(
+                    module,
+                    "rimera_register_module_resource",
+                    &[
+                        pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+                    ],
+                    true,
+                )?
+            },
+            import_from: declaration(
+                module,
+                "rimera_import_from",
+                &[
+                    pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                    types::I8,
+                    pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                ],
+                true,
+            )?,
+            import_star: declaration(module, "rimera_import_star", &[pointer, pointer], true)?,
+            module_initializers: declared_initializers,
             global_get: declaration(
                 module,
                 "rimera_global_get",
@@ -1824,6 +2396,7 @@ impl Imports {
             )?,
             truthy: declaration(module, "rimera_truthy", &[pointer, pointer, pointer], true)?,
             print: declaration(module, "rimera_print", &[pointer, pointer, pointer], true)?,
+            display: declaration(module, "rimera_display", &[pointer, pointer], true)?,
             print_literal: declaration(
                 module,
                 "rimera_print_literal",
@@ -1840,13 +2413,37 @@ impl Imports {
 struct ConstantData {
     values: BTreeMap<(u32, u32, usize), (DataId, usize)>,
     strings: BTreeMap<String, (DataId, usize)>,
+    resources: BTreeMap<(String, String), (DataId, usize)>,
 }
 
 fn define_constants(
-    module: &mut ObjectModule,
+    module: &mut dyn Module,
     program: &mir::Program,
+    module_initializers: &BTreeMap<String, ModuleInitializer>,
 ) -> Result<ConstantData, String> {
     let mut data = ConstantData::default();
+    for (name, initializer) in module_initializers {
+        define_string(module, &mut data, name)?;
+        define_string(module, &mut data, &initializer.filename)?;
+        define_string(module, &mut data, &initializer.package)?;
+        define_string(module, &mut data, &initializer.search_locations.join("\0"))?;
+        for resource in &initializer.resources {
+            define_string(module, &mut data, &resource.name)?;
+            let symbol = format!("rimera_resource_{}", data.resources.len());
+            let id = module
+                .declare_data(&symbol, Linkage::Local, false, false)
+                .map_err(|error| error.to_string())?;
+            let mut description = DataDescription::new();
+            description.define(resource.bytes.clone().into_boxed_slice());
+            module
+                .define_data(id, &description)
+                .map_err(|error| error.to_string())?;
+            data.resources.insert(
+                (name.clone(), resource.name.clone()),
+                (id, resource.bytes.len()),
+            );
+        }
+    }
     for (function_index, function) in program.functions.iter().enumerate() {
         define_string(module, &mut data, &program.filename)?;
         define_string(module, &mut data, &function.name)?;
@@ -1911,6 +2508,7 @@ fn define_constants(
                     }
                     OperationKind::TypeParameterNew { name, .. }
                     | OperationKind::TypeAliasNew { name, .. }
+                    | OperationKind::NativeLocalGet { name, .. }
                     | OperationKind::ReflectionLocalRegister { name, .. }
                     | OperationKind::ImportName { name, .. }
                     | OperationKind::GlobalGet { name, .. }
@@ -1922,9 +2520,16 @@ fn define_constants(
                     | OperationKind::ClassNamespaceDelete { name, .. }
                     | OperationKind::ClassNew { name, .. }
                     | OperationKind::AttributeGet { name, .. }
+                    | OperationKind::SpecialMethodGet { name, .. }
                     | OperationKind::AttributeSet { name, .. }
                     | OperationKind::AttributeDelete { name, .. } => {
                         define_string(module, &mut data, name)?;
+                    }
+                    OperationKind::ImportFrom {
+                        name, submodule, ..
+                    } => {
+                        define_string(module, &mut data, name)?;
+                        define_string(module, &mut data, submodule)?;
                     }
                     OperationKind::CellGet {
                         name: Some(name), ..
@@ -1945,7 +2550,7 @@ fn define_constants(
 }
 
 fn define_string(
-    module: &mut ObjectModule,
+    module: &mut dyn Module,
     data: &mut ConstantData,
     value: &str,
 ) -> Result<(), String> {
@@ -1967,7 +2572,7 @@ fn define_string(
 
 #[allow(clippy::too_many_arguments)]
 fn define_main(
-    module: &mut ObjectModule,
+    module: &mut dyn Module,
     program: &mir::Function,
     root_plan: &mir::SafepointPlan,
     pointer: cranelift_codegen::ir::Type,
@@ -1975,6 +2580,7 @@ fn define_main(
     data: &ConstantData,
     module_program: &mir::Program,
     native_functions: &[Option<cranelift_module::FuncId>],
+    ready_coroutine_functions: &[Option<cranelift_module::FuncId>],
     function_index: u32,
     heap_limit_bytes: Option<u64>,
 ) -> Result<(), String> {
@@ -2074,6 +2680,14 @@ fn define_main(
         let kernel_initialize =
             module.declare_func_in_func(imports.kernel_initialize, builder.func);
         emit_status_call(&mut builder, kernel_initialize, &[context_value], failure);
+        if let Some(dynamic_compilation_enable) = imports.dynamic_compilation_enable {
+            let enable = module.declare_func_in_func(dynamic_compilation_enable, builder.func);
+            emit_status_call(&mut builder, enable, &[context_value], failure);
+        }
+        if let Some(async_backend_select) = imports.async_backend_select {
+            let select = module.declare_func_in_func(async_backend_select, builder.func);
+            emit_status_call(&mut builder, select, &[context_value], failure);
+        }
         let set_heap_limit =
             module.declare_func_in_func(imports.context_set_heap_limit, builder.func);
         let heap_limit = builder
@@ -2085,6 +2699,83 @@ fn define_main(
             &[context_value, heap_limit],
             failure,
         );
+        for (name, descriptor) in &imports.module_initializers {
+            let (name_pointer, name_len) =
+                metadata_pointer(&mut builder, module, data, name, pointer)?;
+            if let Some(initializer) = descriptor.function {
+                let (filename, filename_len) =
+                    metadata_pointer(&mut builder, module, data, &descriptor.filename, pointer)?;
+                let (package, package_len) =
+                    metadata_pointer(&mut builder, module, data, &descriptor.package, pointer)?;
+                let is_package = builder
+                    .ins()
+                    .iconst(types::I8, i64::from(descriptor.is_package));
+                let initializer = module.declare_func_in_func(initializer, builder.func);
+                let initializer = builder.ins().func_addr(pointer, initializer);
+                let register =
+                    module.declare_func_in_func(imports.register_source_module, builder.func);
+                emit_status_call(
+                    &mut builder,
+                    register,
+                    &[
+                        context_value,
+                        name_pointer,
+                        name_len,
+                        filename,
+                        filename_len,
+                        package,
+                        package_len,
+                        is_package,
+                        initializer,
+                    ],
+                    failure,
+                );
+            } else {
+                let (locations, locations_len) = metadata_pointer(
+                    &mut builder,
+                    module,
+                    data,
+                    &descriptor.search_locations,
+                    pointer,
+                )?;
+                let register =
+                    module.declare_func_in_func(imports.register_namespace_module, builder.func);
+                emit_status_call(
+                    &mut builder,
+                    register,
+                    &[
+                        context_value,
+                        name_pointer,
+                        name_len,
+                        locations,
+                        locations_len,
+                    ],
+                    failure,
+                );
+            }
+            for resource in &descriptor.resources {
+                let (resource_name, resource_name_len) =
+                    metadata_pointer(&mut builder, module, data, &resource.name, pointer)?;
+                let (resource_data, resource_data_len) =
+                    resource_pointer(&mut builder, module, data, name, &resource.name, pointer)?;
+                let register =
+                    module.declare_func_in_func(imports.register_module_resource, builder.func);
+                emit_status_call(
+                    &mut builder,
+                    register,
+                    &[
+                        context_value,
+                        name_pointer,
+                        name_len,
+                        resource_name,
+                        resource_name_len,
+                        resource_data,
+                        resource_data_len,
+                    ],
+                    failure,
+                );
+            }
+        }
 
         let block_map = program
             .blocks
@@ -2133,6 +2824,7 @@ fn define_main(
                     data,
                     module_program,
                     native_functions,
+                    ready_coroutine_functions,
                     function_index,
                     block_index as u32,
                     operation_index,
@@ -2245,7 +2937,7 @@ struct FunctionRefs {
 
 impl FunctionRefs {
     fn new(
-        module: &mut ObjectModule,
+        module: &mut dyn Module,
         function: &mut cranelift_codegen::ir::Function,
         imports: &Imports,
     ) -> Self {
@@ -2259,7 +2951,7 @@ impl FunctionRefs {
     }
 
     fn new_module(
-        module: &mut ObjectModule,
+        module: &mut dyn Module,
         function: &mut cranelift_codegen::ir::Function,
         imports: &Imports,
     ) -> Self {
@@ -2272,11 +2964,12 @@ impl FunctionRefs {
 #[allow(clippy::too_many_arguments)]
 fn emit_operation(
     builder: &mut FunctionBuilder<'_>,
-    module: &mut ObjectModule,
+    module: &mut dyn Module,
     imports: &Imports,
     data: &ConstantData,
     module_program: &mir::Program,
     native_functions: &[Option<cranelift_module::FuncId>],
+    ready_coroutine_functions: &[Option<cranelift_module::FuncId>],
     function_index: u32,
     block_index: u32,
     operation_index: usize,
@@ -2290,7 +2983,25 @@ fn emit_operation(
     function_value: Option<Value>,
     failure: cranelift_codegen::ir::Block,
 ) -> Result<(), String> {
-    if let Some(roots) = roots {
+    // These operations call the runtime only on a cold specialization miss.
+    // Keep the successful primitive path free of transient-root publication.
+    let cold_only_safepoint = match &operation.kind {
+        OperationKind::NativeLocalGet { .. } => true,
+        OperationKind::Binary { op, .. } | OperationKind::InPlace { op, .. } => {
+            *op == mir::BinaryOperator::Add
+        }
+        OperationKind::Compare { op, .. } => matches!(
+            op,
+            mir::CompareOperator::Equal
+                | mir::CompareOperator::NotEqual
+                | mir::CompareOperator::Less
+                | mir::CompareOperator::LessEqual
+                | mir::CompareOperator::Greater
+                | mir::CompareOperator::GreaterEqual
+        ),
+        _ => false,
+    };
+    if !cold_only_safepoint && let Some(roots) = roots {
         publish_roots(builder, values_slot, roots_slot, root_capacity, roots)?;
     }
     match &operation.kind {
@@ -2424,38 +3135,96 @@ fn emit_operation(
             op,
             left,
             right,
-        } => {
-            let left = value_pointer(builder, pointer, values_slot, *left);
-            let right = value_pointer(builder, pointer, values_slot, *right);
-            let output = value_pointer(builder, pointer, values_slot, *dest);
-            let opcode = builder.ins().iconst(types::I8, i64::from(*op as u8));
-            let runtime_call = module.declare_func_in_func(imports.binary, builder.func);
-
-            emit_status_call(
-                builder,
-                runtime_call,
-                &[context, opcode, left, right, output],
-                failure,
-            );
         }
-        OperationKind::InPlace {
+        | OperationKind::InPlace {
             dest,
             op,
             left,
             right,
         } => {
-            let left = value_pointer(builder, pointer, values_slot, *left);
-            let right = value_pointer(builder, pointer, values_slot, *right);
-            let output = value_pointer(builder, pointer, values_slot, *dest);
-            let opcode = builder.ins().iconst(types::I8, i64::from(*op as u8));
-            let runtime_call = module.declare_func_in_func(imports.inplace, builder.func);
+            let runtime_id = if matches!(operation.kind, OperationKind::Binary { .. }) {
+                imports.binary
+            } else {
+                imports.inplace
+            };
+            if *op == mir::BinaryOperator::Add {
+                let check_right = builder.create_block();
+                let fast = builder.create_block();
+                let store = builder.create_block();
+                let fallback = builder.create_block();
+                let done = builder.create_block();
 
-            emit_status_call(
-                builder,
-                runtime_call,
-                &[context, opcode, left, right, output],
-                failure,
-            );
+                let left_header =
+                    builder
+                        .ins()
+                        .stack_load(types::I64, values_slot, value_offset(*left));
+                let left_small = builder.ins().icmp_imm(IntCC::Equal, left_header, 2);
+                builder
+                    .ins()
+                    .brif(left_small, check_right, &[], fallback, &[]);
+
+                builder.switch_to_block(check_right);
+                let right_header =
+                    builder
+                        .ins()
+                        .stack_load(types::I64, values_slot, value_offset(*right));
+                let right_small = builder.ins().icmp_imm(IntCC::Equal, right_header, 2);
+                builder.ins().brif(right_small, fast, &[], fallback, &[]);
+
+                builder.switch_to_block(fast);
+                let left_payload =
+                    builder
+                        .ins()
+                        .stack_load(types::I64, values_slot, value_offset(*left) + 8);
+                let right_payload =
+                    builder
+                        .ins()
+                        .stack_load(types::I64, values_slot, value_offset(*right) + 8);
+                let (sum, overflow) = builder.ins().sadd_overflow(left_payload, right_payload);
+                builder.ins().brif(overflow, fallback, &[], store, &[]);
+
+                builder.switch_to_block(store);
+                let header = builder.ins().iconst(types::I64, 2);
+                builder
+                    .ins()
+                    .stack_store(header, values_slot, value_offset(*dest));
+                builder
+                    .ins()
+                    .stack_store(sum, values_slot, value_offset(*dest) + 8);
+                builder.ins().jump(done, &[]);
+
+                builder.switch_to_block(fallback);
+                let roots = roots.ok_or_else(|| {
+                    "internal error: small-int add fallback is missing GC roots".to_owned()
+                })?;
+                publish_roots(builder, values_slot, roots_slot, root_capacity, roots)?;
+                let left = value_pointer(builder, pointer, values_slot, *left);
+                let right = value_pointer(builder, pointer, values_slot, *right);
+                let output = value_pointer(builder, pointer, values_slot, *dest);
+                let opcode = builder.ins().iconst(types::I8, i64::from(*op as u8));
+                let runtime_call = module.declare_func_in_func(runtime_id, builder.func);
+                emit_status_call(
+                    builder,
+                    runtime_call,
+                    &[context, opcode, left, right, output],
+                    failure,
+                );
+                builder.ins().jump(done, &[]);
+
+                builder.switch_to_block(done);
+            } else {
+                let left = value_pointer(builder, pointer, values_slot, *left);
+                let right = value_pointer(builder, pointer, values_slot, *right);
+                let output = value_pointer(builder, pointer, values_slot, *dest);
+                let opcode = builder.ins().iconst(types::I8, i64::from(*op as u8));
+                let runtime_call = module.declare_func_in_func(runtime_id, builder.func);
+                emit_status_call(
+                    builder,
+                    runtime_call,
+                    &[context, opcode, left, right, output],
+                    failure,
+                );
+            }
         }
         OperationKind::Compare {
             dest,
@@ -2463,18 +3232,99 @@ fn emit_operation(
             left,
             right,
         } => {
-            let left = value_pointer(builder, pointer, values_slot, *left);
-            let right = value_pointer(builder, pointer, values_slot, *right);
-            let output = value_pointer(builder, pointer, values_slot, *dest);
-            let opcode = builder.ins().iconst(types::I8, i64::from(*op as u8));
-            let runtime_call = module.declare_func_in_func(imports.compare, builder.func);
-
-            emit_status_call(
-                builder,
-                runtime_call,
-                &[context, opcode, left, right, output],
-                failure,
+            let fast_int = matches!(
+                op,
+                mir::CompareOperator::Equal
+                    | mir::CompareOperator::NotEqual
+                    | mir::CompareOperator::Less
+                    | mir::CompareOperator::LessEqual
+                    | mir::CompareOperator::Greater
+                    | mir::CompareOperator::GreaterEqual
             );
+            if fast_int {
+                let check_right = builder.create_block();
+                let fast = builder.create_block();
+                let fallback = builder.create_block();
+                let done = builder.create_block();
+
+                let left_header =
+                    builder
+                        .ins()
+                        .stack_load(types::I64, values_slot, value_offset(*left));
+                let left_small = builder.ins().icmp_imm(IntCC::Equal, left_header, 2);
+                builder
+                    .ins()
+                    .brif(left_small, check_right, &[], fallback, &[]);
+
+                builder.switch_to_block(check_right);
+                let right_header =
+                    builder
+                        .ins()
+                        .stack_load(types::I64, values_slot, value_offset(*right));
+                let right_small = builder.ins().icmp_imm(IntCC::Equal, right_header, 2);
+                builder.ins().brif(right_small, fast, &[], fallback, &[]);
+
+                builder.switch_to_block(fast);
+                let left_payload =
+                    builder
+                        .ins()
+                        .stack_load(types::I64, values_slot, value_offset(*left) + 8);
+                let right_payload =
+                    builder
+                        .ins()
+                        .stack_load(types::I64, values_slot, value_offset(*right) + 8);
+                let condition = match op {
+                    mir::CompareOperator::Equal => IntCC::Equal,
+                    mir::CompareOperator::NotEqual => IntCC::NotEqual,
+                    mir::CompareOperator::Less => IntCC::SignedLessThan,
+                    mir::CompareOperator::LessEqual => IntCC::SignedLessThanOrEqual,
+                    mir::CompareOperator::Greater => IntCC::SignedGreaterThan,
+                    mir::CompareOperator::GreaterEqual => IntCC::SignedGreaterThanOrEqual,
+                    _ => unreachable!("guarded primitive comparison"),
+                };
+                let result = builder.ins().icmp(condition, left_payload, right_payload);
+                let result = builder.ins().uextend(types::I64, result);
+                let bool_header = builder.ins().iconst(types::I64, 1);
+                builder
+                    .ins()
+                    .stack_store(bool_header, values_slot, value_offset(*dest));
+                builder
+                    .ins()
+                    .stack_store(result, values_slot, value_offset(*dest) + 8);
+                builder.ins().jump(done, &[]);
+
+                builder.switch_to_block(fallback);
+                let roots = roots.ok_or_else(|| {
+                    "internal error: small-int compare fallback is missing GC roots".to_owned()
+                })?;
+                publish_roots(builder, values_slot, roots_slot, root_capacity, roots)?;
+                let left = value_pointer(builder, pointer, values_slot, *left);
+                let right = value_pointer(builder, pointer, values_slot, *right);
+                let output = value_pointer(builder, pointer, values_slot, *dest);
+                let opcode = builder.ins().iconst(types::I8, i64::from(*op as u8));
+                let runtime_call = module.declare_func_in_func(imports.compare, builder.func);
+                emit_status_call(
+                    builder,
+                    runtime_call,
+                    &[context, opcode, left, right, output],
+                    failure,
+                );
+                builder.ins().jump(done, &[]);
+
+                builder.switch_to_block(done);
+            } else {
+                let left = value_pointer(builder, pointer, values_slot, *left);
+                let right = value_pointer(builder, pointer, values_slot, *right);
+                let output = value_pointer(builder, pointer, values_slot, *dest);
+                let opcode = builder.ins().iconst(types::I8, i64::from(*op as u8));
+                let runtime_call = module.declare_func_in_func(imports.compare, builder.func);
+                emit_status_call(
+                    builder,
+                    runtime_call,
+                    &[context, opcode, left, right, output],
+                    failure,
+                );
+            }
         }
         OperationKind::FormatValue {
             dest,
@@ -2922,6 +3772,62 @@ fn emit_operation(
 
             emit_status_call(builder, runtime_call, &[context, value, output], failure);
         }
+        OperationKind::AwaitIterator { dest, value } => {
+            let value = value_pointer(builder, pointer, values_slot, *value);
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call = module.declare_func_in_func(imports.await_iterator, builder.func);
+
+            emit_status_call(builder, runtime_call, &[context, value, output], failure);
+        }
+        OperationKind::RangeCollapseProbe {
+            first,
+            last,
+            matched,
+            nonempty,
+            value,
+        } => {
+            let value = value_pointer(builder, pointer, values_slot, *value);
+            let first = value_pointer(builder, pointer, values_slot, *first);
+            let last = value_pointer(builder, pointer, values_slot, *last);
+            let matched = value_pointer(builder, pointer, values_slot, *matched);
+            let nonempty = value_pointer(builder, pointer, values_slot, *nonempty);
+            let runtime_call =
+                module.declare_func_in_func(imports.range_collapse_probe, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, value, first, last, matched, nonempty],
+                failure,
+            );
+        }
+        OperationKind::CoroutineCloseElideProbe { matched, callable } => {
+            let callable = value_pointer(builder, pointer, values_slot, *callable);
+            let matched = value_pointer(builder, pointer, values_slot, *matched);
+            let runtime_call =
+                module.declare_func_in_func(imports.coroutine_close_elide_probe, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, callable, matched],
+                failure,
+            );
+        }
+        OperationKind::AsyncIteratorNew { dest, value } => {
+            let value = value_pointer(builder, pointer, values_slot, *value);
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call =
+                module.declare_func_in_func(imports.async_iterator_new, builder.func);
+
+            emit_status_call(builder, runtime_call, &[context, value, output], failure);
+        }
+        OperationKind::AsyncIteratorNext { dest, iterator } => {
+            let iterator = value_pointer(builder, pointer, values_slot, *iterator);
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call =
+                module.declare_func_in_func(imports.async_iterator_next, builder.func);
+
+            emit_status_call(builder, runtime_call, &[context, iterator, output], failure);
+        }
         OperationKind::IteratorNext {
             item,
             has_value,
@@ -3165,7 +4071,12 @@ fn emit_operation(
             let code_metadata = builder.ins().stack_addr(pointer, code_metadata_slot, 0);
 
             let output = value_pointer(builder, pointer, values_slot, *dest);
-            if target.kind == mir::FunctionKind::Generator {
+            if matches!(
+                target.kind,
+                mir::FunctionKind::Generator
+                    | mir::FunctionKind::Coroutine
+                    | mir::FunctionKind::AsyncGenerator
+            ) {
                 let persistent = mir::generator_persistent_values(target)?;
                 let parameter_values = target
                     .parameters
@@ -3180,10 +4091,15 @@ fn emit_operation(
                 let persistent_slot_count = builder.ins().iconst(
                     pointer,
                     i64::try_from(persistent_slot_count)
-                        .map_err(|_| "too many generator persistent slots")?,
+                        .map_err(|_| "too many suspended persistent slots")?,
                 );
-                let runtime_call =
-                    module.declare_func_in_func(imports.generator_function_new, builder.func);
+                let constructor = match target.kind {
+                    mir::FunctionKind::Generator => imports.generator_function_new,
+                    mir::FunctionKind::Coroutine => imports.coroutine_function_new,
+                    mir::FunctionKind::AsyncGenerator => imports.async_generator_function_new,
+                    _ => unreachable!(),
+                };
+                let runtime_call = module.declare_func_in_func(constructor, builder.func);
                 emit_status_call(
                     builder,
                     runtime_call,
@@ -3204,6 +4120,26 @@ fn emit_operation(
                     ],
                     failure,
                 );
+                if target.kind == mir::FunctionKind::Coroutine
+                    && let Some(ready_function_id) = ready_coroutine_functions
+                        .get(function.0 as usize)
+                        .and_then(|function| *function)
+                {
+                    let ready_ref = module.declare_func_in_func(ready_function_id, builder.func);
+                    let ready_code = builder.ins().func_addr(pointer, ready_ref);
+                    let setter = module
+                        .declare_func_in_func(imports.function_ready_coroutine_set, builder.func);
+                    let repeat_pure = builder.ins().iconst(
+                        types::I8,
+                        i64::from(u8::from(coroutine_is_repeat_pure(target))),
+                    );
+                    emit_status_call(
+                        builder,
+                        setter,
+                        &[context, output, ready_code, repeat_pure],
+                        failure,
+                    );
+                }
             } else {
                 let runtime_call = module.declare_func_in_func(imports.function_new, builder.func);
                 emit_status_call(
@@ -3419,6 +4355,29 @@ fn emit_operation(
                 failure,
             );
         }
+        OperationKind::TypeOf { dest, value } => {
+            let value = value_pointer(builder, pointer, values_slot, *value);
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call = module.declare_func_in_func(imports.type_of, builder.func);
+            emit_status_call(builder, runtime_call, &[context, value, output], failure);
+        }
+        OperationKind::SpecialMethodGet {
+            dest,
+            receiver,
+            name,
+        } => {
+            let receiver = value_pointer(builder, pointer, values_slot, *receiver);
+            let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call =
+                module.declare_func_in_func(imports.special_method_get, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[context, receiver, name, name_len, output],
+                failure,
+            );
+        }
         OperationKind::AttributeSet {
             receiver,
             name,
@@ -3476,55 +4435,123 @@ fn emit_operation(
                 pointer,
                 i64::try_from(positional.len()).map_err(|_| "too many call arguments")?,
             );
-            let keyword_bytes = u32::try_from(keywords.len().max(1) * 32)
-                .map_err(|_| "keyword argument storage is too large")?;
-            let keyword_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            let callable = value_pointer(builder, pointer, values_slot, *callable);
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            if keywords.is_empty() {
+                let runtime_call =
+                    module.declare_func_in_func(imports.call_positional_rooted, builder.func);
+                emit_status_call(
+                    builder,
+                    runtime_call,
+                    &[
+                        context,
+                        callable,
+                        positional_pointer,
+                        positional_count,
+                        output,
+                    ],
+                    failure,
+                );
+            } else {
+                let keyword_bytes = u32::try_from(keywords.len() * 32)
+                    .map_err(|_| "keyword argument storage is too large")?;
+                let keyword_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    keyword_bytes,
+                    3,
+                ));
+                for (index, (name, value)) in keywords.iter().enumerate() {
+                    let offset = i32::try_from(index * 32)
+                        .map_err(|_| "keyword argument offset is too large")?;
+                    let (name_pointer, name_len) =
+                        metadata_pointer(builder, module, data, name, pointer)?;
+                    builder
+                        .ins()
+                        .stack_store(name_pointer, keyword_slot, offset);
+                    builder
+                        .ins()
+                        .stack_store(name_len, keyword_slot, offset + 8);
+                    copy_between_slots(
+                        builder,
+                        values_slot,
+                        value_offset(*value),
+                        keyword_slot,
+                        offset + 16,
+                    );
+                }
+                let keyword_pointer = builder.ins().stack_addr(pointer, keyword_slot, 0);
+                let keyword_count = builder.ins().iconst(
+                    pointer,
+                    i64::try_from(keywords.len()).map_err(|_| "too many keyword arguments")?,
+                );
+                let descriptor = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    32,
+                    3,
+                ));
+                builder.ins().stack_store(positional_pointer, descriptor, 0);
+                builder.ins().stack_store(positional_count, descriptor, 8);
+                builder.ins().stack_store(keyword_pointer, descriptor, 16);
+                builder.ins().stack_store(keyword_count, descriptor, 24);
+                let descriptor = builder.ins().stack_addr(pointer, descriptor, 0);
+                let runtime_call = module.declare_func_in_func(imports.call, builder.func);
+                emit_status_call(
+                    builder,
+                    runtime_call,
+                    &[context, callable, descriptor, output],
+                    failure,
+                );
+            }
+        }
+        OperationKind::CallAwaitReady {
+            dest,
+            matched,
+            callable,
+            positional,
+            pure_only,
+        } => {
+            let positional_bytes = u32::try_from(positional.len().max(1) * VALUE_SIZE as usize)
+                .map_err(|_| "ready-await argument storage is too large")?;
+            let positional_slot = builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
-                keyword_bytes,
+                positional_bytes,
                 3,
             ));
-            for (index, (name, value)) in keywords.iter().enumerate() {
-                let offset = i32::try_from(index * 32)
-                    .map_err(|_| "keyword argument offset is too large")?;
-                let (name_pointer, name_len) =
-                    metadata_pointer(builder, module, data, name, pointer)?;
-                builder
-                    .ins()
-                    .stack_store(name_pointer, keyword_slot, offset);
-                builder
-                    .ins()
-                    .stack_store(name_len, keyword_slot, offset + 8);
+            for (index, value) in positional.iter().enumerate() {
                 copy_between_slots(
                     builder,
                     values_slot,
                     value_offset(*value),
-                    keyword_slot,
-                    offset + 16,
+                    positional_slot,
+                    i32::try_from(index * VALUE_SIZE as usize)
+                        .map_err(|_| "ready-await argument offset is too large")?,
                 );
             }
-            let keyword_pointer = builder.ins().stack_addr(pointer, keyword_slot, 0);
-            let keyword_count = builder.ins().iconst(
+            let positional_pointer = builder.ins().stack_addr(pointer, positional_slot, 0);
+            let positional_count = builder.ins().iconst(
                 pointer,
-                i64::try_from(keywords.len()).map_err(|_| "too many keyword arguments")?,
+                i64::try_from(positional.len()).map_err(|_| "too many ready-await arguments")?,
             );
-            let descriptor = builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                32,
-                3,
-            ));
-            builder.ins().stack_store(positional_pointer, descriptor, 0);
-            builder.ins().stack_store(positional_count, descriptor, 8);
-            builder.ins().stack_store(keyword_pointer, descriptor, 16);
-            builder.ins().stack_store(keyword_count, descriptor, 24);
-            let descriptor = builder.ins().stack_addr(pointer, descriptor, 0);
             let callable = value_pointer(builder, pointer, values_slot, *callable);
+            let pure_only = builder
+                .ins()
+                .iconst(types::I8, i64::from(u8::from(*pure_only)));
             let output = value_pointer(builder, pointer, values_slot, *dest);
-            let runtime_call = module.declare_func_in_func(imports.call, builder.func);
-
+            let matched = value_pointer(builder, pointer, values_slot, *matched);
+            let runtime_call =
+                module.declare_func_in_func(imports.call_ready_coroutine_rooted, builder.func);
             emit_status_call(
                 builder,
                 runtime_call,
-                &[context, callable, descriptor, output],
+                &[
+                    context,
+                    callable,
+                    positional_pointer,
+                    positional_count,
+                    pure_only,
+                    output,
+                    matched,
+                ],
                 failure,
             );
         }
@@ -3605,6 +4632,74 @@ fn emit_operation(
             let runtime_call = module.declare_func_in_func(imports.cell_new, builder.func);
 
             emit_status_call(builder, runtime_call, &[context, initial, output], failure);
+        }
+        OperationKind::NativeLocalSet { index, value } => {
+            let offset = i32::try_from(
+                root_capacity
+                    .checked_add(*index as usize)
+                    .ok_or_else(|| "native local offset overflow".to_owned())?
+                    .saturating_mul(VALUE_SIZE as usize),
+            )
+            .map_err(|_| "native local offset is too large")?;
+            copy_between_slots(
+                builder,
+                values_slot,
+                value_offset(*value),
+                roots_slot,
+                offset,
+            );
+        }
+        OperationKind::NativeLocalClear { index } => {
+            let offset = i32::try_from(
+                root_capacity
+                    .checked_add(*index as usize)
+                    .ok_or_else(|| "native local offset overflow".to_owned())?
+                    .saturating_mul(VALUE_SIZE as usize),
+            )
+            .map_err(|_| "native local offset is too large")?;
+            let unbound_header = builder.ins().iconst(types::I64, 1_i64 << 32);
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder
+                .ins()
+                .stack_store(unbound_header, roots_slot, offset);
+            builder.ins().stack_store(zero, roots_slot, offset + 8);
+        }
+        OperationKind::NativeLocalGet { dest, index, name } => {
+            let offset = i32::try_from(
+                root_capacity
+                    .checked_add(*index as usize)
+                    .ok_or_else(|| "native local offset overflow".to_owned())?
+                    .saturating_mul(VALUE_SIZE as usize),
+            )
+            .map_err(|_| "native local offset is too large")?;
+            let header = builder.ins().stack_load(types::I64, roots_slot, offset);
+            let unbound = builder.ins().icmp_imm(IntCC::Equal, header, 1_i64 << 32);
+            let cold = builder.create_block();
+            let bound = builder.create_block();
+            let done = builder.create_block();
+            builder.ins().brif(unbound, cold, &[], bound, &[]);
+
+            builder.switch_to_block(bound);
+            copy_between_slots(
+                builder,
+                roots_slot,
+                offset,
+                values_slot,
+                value_offset(*dest),
+            );
+            builder.ins().jump(done, &[]);
+
+            builder.switch_to_block(cold);
+            let roots = roots.ok_or_else(|| {
+                "internal error: native local read is missing cold-path GC roots".to_owned()
+            })?;
+            publish_roots(builder, values_slot, roots_slot, root_capacity, roots)?;
+            let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
+            let runtime_call = module.declare_func_in_func(imports.unbound_local, builder.func);
+            emit_status_call(builder, runtime_call, &[context, name, name_len], failure);
+            builder.ins().jump(done, &[]);
+
+            builder.switch_to_block(done);
         }
         OperationKind::ReflectionScopeConfigure {
             namespace,
@@ -3692,13 +4787,104 @@ fn emit_operation(
             let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
             let output = value_pointer(builder, pointer, values_slot, *dest);
             let runtime_call = module.declare_func_in_func(imports.import_name, builder.func);
-
             emit_status_call(
                 builder,
                 runtime_call,
                 &[context, name, name_len, output],
                 failure,
             );
+        }
+        OperationKind::ImportFrom {
+            dest,
+            module: module_value,
+            name,
+            submodule,
+        } => {
+            let module_value = value_pointer(builder, pointer, values_slot, *module_value);
+            let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
+            let (
+                filename,
+                filename_len,
+                package,
+                package_len,
+                is_package,
+                initializer,
+                locations,
+                locations_len,
+            ) = if let Some(initializer) = imports.module_initializers.get(submodule) {
+                let (filename, filename_len) =
+                    metadata_pointer(builder, module, data, &initializer.filename, pointer)?;
+                let (package, package_len) =
+                    metadata_pointer(builder, module, data, &initializer.package, pointer)?;
+                let is_package = builder
+                    .ins()
+                    .iconst(types::I8, i64::from(initializer.is_package));
+                let function = initializer
+                    .function
+                    .map(|function| module.declare_func_in_func(function, builder.func));
+                let function = match function {
+                    Some(function) => builder.ins().func_addr(pointer, function),
+                    None => builder.ins().iconst(pointer, 0),
+                };
+                let (locations, locations_len) = metadata_pointer(
+                    builder,
+                    module,
+                    data,
+                    &initializer.search_locations,
+                    pointer,
+                )?;
+                (
+                    filename,
+                    filename_len,
+                    package,
+                    package_len,
+                    is_package,
+                    function,
+                    locations,
+                    locations_len,
+                )
+            } else {
+                let empty = builder.ins().iconst(pointer, 0);
+                (
+                    empty,
+                    empty,
+                    empty,
+                    empty,
+                    builder.ins().iconst(types::I8, 0),
+                    empty,
+                    empty,
+                    empty,
+                )
+            };
+            let output = value_pointer(builder, pointer, values_slot, *dest);
+            let runtime_call = module.declare_func_in_func(imports.import_from, builder.func);
+            emit_status_call(
+                builder,
+                runtime_call,
+                &[
+                    context,
+                    module_value,
+                    name,
+                    name_len,
+                    filename,
+                    filename_len,
+                    package,
+                    package_len,
+                    is_package,
+                    initializer,
+                    locations,
+                    locations_len,
+                    output,
+                ],
+                failure,
+            );
+        }
+        OperationKind::ImportStar {
+            module: module_value,
+        } => {
+            let module_value = value_pointer(builder, pointer, values_slot, *module_value);
+            let runtime_call = module.declare_func_in_func(imports.import_star, builder.func);
+            emit_status_call(builder, runtime_call, &[context, module_value], failure);
         }
         OperationKind::GlobalGet { dest, name } => {
             let (name, name_len) = metadata_pointer(builder, module, data, name, pointer)?;
@@ -3845,6 +5031,11 @@ fn emit_operation(
 
             emit_status_call(builder, runtime_call, &[context], failure);
         }
+        OperationKind::Display { value } => {
+            let value = value_pointer(builder, pointer, values_slot, *value);
+            let runtime_call = module.declare_func_in_func(imports.display, builder.func);
+            emit_status_call(builder, runtime_call, &[context, value], failure);
+        }
         OperationKind::Print { values } => {
             let size = u32::try_from(values.len().max(1) * VALUE_SIZE as usize)
                 .map_err(|_| "print argument frame is too large")?;
@@ -3902,7 +5093,7 @@ fn emit_operation(
 #[allow(clippy::too_many_arguments)]
 fn emit_generator_terminator(
     builder: &mut FunctionBuilder<'_>,
-    module: &mut ObjectModule,
+    module: &mut dyn Module,
     imports: &Imports,
     refs: &FunctionRefs,
     program: &mir::Function,
@@ -3983,6 +5174,9 @@ fn emit_generator_terminator(
         }
         Terminator::Yield {
             value, delegate, ..
+        }
+        | Terminator::Suspend {
+            value, delegate, ..
         } => {
             let roots = roots.ok_or_else(|| {
                 "internal error: yield is missing its persistent root set".to_owned()
@@ -4050,7 +5244,12 @@ fn emit_generator_terminator(
                 output,
                 8,
             );
-            let yielded = builder.ins().iconst(types::I8, 0);
+            let suspension_outcome = if matches!(terminator, Terminator::Suspend { .. }) {
+                2
+            } else {
+                0
+            };
+            let yielded = builder.ins().iconst(types::I8, suspension_outcome);
             builder.ins().store(
                 cranelift_codegen::ir::MemFlags::trusted(),
                 yielded,
@@ -4142,22 +5341,57 @@ fn emit_terminator(
             let roots = roots.ok_or_else(|| {
                 "internal error: branch is missing its GC safepoint roots".to_owned()
             })?;
+            let then_edge = builder.create_block();
+            let else_edge = builder.create_block();
+            let check_bool = builder.create_block();
+            let check_int = builder.create_block();
+            let fallback = builder.create_block();
+
+            // Immediate tagged values never need the generic truthiness
+            // protocol. Keep the hot loop branch entirely inside Cranelift.
+            let offset = value_offset(*condition);
+            let header = builder.ins().stack_load(types::I64, values_slot, offset);
+            let is_none = builder.ins().icmp_imm(IntCC::Equal, header, 0);
+            builder.ins().brif(is_none, else_edge, &[], check_bool, &[]);
+
+            builder.switch_to_block(check_bool);
+            let is_bool = builder.ins().icmp_imm(IntCC::Equal, header, 1);
+            let bool_value = builder.create_block();
+            builder.ins().brif(is_bool, bool_value, &[], check_int, &[]);
+            builder.switch_to_block(bool_value);
+            let payload = builder
+                .ins()
+                .stack_load(types::I64, values_slot, offset + 8);
+            let truth = builder.ins().icmp_imm(IntCC::NotEqual, payload, 0);
+            builder.ins().brif(truth, then_edge, &[], else_edge, &[]);
+
+            builder.switch_to_block(check_int);
+            let is_small_int = builder.ins().icmp_imm(IntCC::Equal, header, 2);
+            let int_value = builder.create_block();
+            builder
+                .ins()
+                .brif(is_small_int, int_value, &[], fallback, &[]);
+            builder.switch_to_block(int_value);
+            let payload = builder
+                .ins()
+                .stack_load(types::I64, values_slot, offset + 8);
+            let truth = builder.ins().icmp_imm(IntCC::NotEqual, payload, 0);
+            builder.ins().brif(truth, then_edge, &[], else_edge, &[]);
+
+            builder.switch_to_block(fallback);
             publish_roots(builder, values_slot, roots_slot, root_capacity, roots)?;
-            let truth = builder.create_sized_stack_slot(StackSlotData::new(
+            let truth_value = builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
                 VALUE_SIZE,
                 3,
             ));
             let input = value_pointer(builder, pointer, values_slot, *condition);
-            let output = builder.ins().stack_addr(pointer, truth, 0);
+            let output = builder.ins().stack_addr(pointer, truth_value, 0);
             emit_status_call(builder, refs.truthy, &[context, input, output], failure);
-            let payload = builder.ins().stack_load(types::I64, truth, 8);
-            let condition = builder.ins().icmp_imm(IntCC::NotEqual, payload, 0);
-            let then_edge = builder.create_block();
-            let else_edge = builder.create_block();
-            builder
-                .ins()
-                .brif(condition, then_edge, &[], else_edge, &[]);
+            let payload = builder.ins().stack_load(types::I64, truth_value, 8);
+            let truth = builder.ins().icmp_imm(IntCC::NotEqual, payload, 0);
+            builder.ins().brif(truth, then_edge, &[], else_edge, &[]);
+
             builder.switch_to_block(then_edge);
             copy_edge_arguments(
                 builder,
@@ -4176,11 +5410,13 @@ fn emit_terminator(
             builder.ins().jump(blocks[else_target.0 as usize], &[]);
         }
         Terminator::Return { code } => {
-            if !matches!(return_mode, ReturnMode::Main) {
+            if !matches!(return_mode, ReturnMode::Main | ReturnMode::Initializer) {
                 return Err("exit-code return cannot terminate a Python function".to_owned());
             }
             builder.ins().call(refs.roots_pop, &[context, frame]);
-            builder.ins().call(refs.context_free, &[context]);
+            if matches!(return_mode, ReturnMode::Main) {
+                builder.ins().call(refs.context_free, &[context]);
+            }
             let return_code = builder.ins().iconst(types::I32, i64::from(*code));
             builder.ins().return_(&[return_code]);
         }
@@ -4221,6 +5457,9 @@ fn emit_terminator(
         Terminator::Yield { .. } => {
             return Err("yield terminator reached the non-generator code path".to_owned());
         }
+        Terminator::Suspend { .. } => {
+            return Err("async suspension reached the non-coroutine code path".to_owned());
+        }
         Terminator::Unreachable => return Err("cannot emit unterminated MIR block".to_owned()),
     }
     Ok(())
@@ -4229,6 +5468,7 @@ fn emit_terminator(
 #[derive(Clone, Copy)]
 enum ReturnMode {
     Main,
+    Initializer,
     Native { output: Value },
 }
 
@@ -4279,7 +5519,7 @@ fn copy_edge_arguments(
 
 fn metadata_pointer(
     builder: &mut FunctionBuilder<'_>,
-    module: &mut ObjectModule,
+    module: &mut dyn Module,
     data: &ConstantData,
     value: &str,
     pointer: cranelift_codegen::ir::Type,
@@ -4298,9 +5538,31 @@ fn metadata_pointer(
     Ok((address, len))
 }
 
+fn resource_pointer(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut dyn Module,
+    data: &ConstantData,
+    module_name: &str,
+    resource_name: &str,
+    pointer: cranelift_codegen::ir::Type,
+) -> Result<(Value, Value), String> {
+    let (data_id, len) = data
+        .resources
+        .get(&(module_name.to_owned(), resource_name.to_owned()))
+        .copied()
+        .ok_or_else(|| format!("resource {module_name}:{resource_name} is missing"))?;
+    let global = module.declare_data_in_func(data_id, builder.func);
+    let address = builder.ins().symbol_value(pointer, global);
+    let len = builder.ins().iconst(
+        pointer,
+        i64::try_from(len).map_err(|_| "resource is too large")?,
+    );
+    Ok((address, len))
+}
+
 fn name_specs_pointer(
     builder: &mut FunctionBuilder<'_>,
-    module: &mut ObjectModule,
+    module: &mut dyn Module,
     data: &ConstantData,
     names: &[String],
     pointer: cranelift_codegen::ir::Type,
@@ -4332,7 +5594,7 @@ fn source_line(line_starts: &[u32], offset: u32) -> u32 {
 #[allow(clippy::too_many_arguments)]
 fn emit_data_constructor(
     builder: &mut FunctionBuilder<'_>,
-    module: &mut ObjectModule,
+    module: &mut dyn Module,
     function: FuncRef,
     data: &ConstantData,
     function_index: u32,

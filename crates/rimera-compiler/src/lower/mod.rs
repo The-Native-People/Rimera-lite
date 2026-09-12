@@ -12,18 +12,28 @@ type TypeParameterCells = Vec<(String, Option<mir::ValueId>)>;
 type InstalledTypeParameters = (Vec<mir::ValueId>, TypeParameterCells);
 
 pub fn lower(module: &hir::Module) -> Result<mir::Program, String> {
+    lower_with_chunk_limit(module, MODULE_CHUNK_STATEMENTS)
+}
+
+pub(crate) fn lower_dynamic(module: &hir::Module) -> Result<mir::Program, String> {
+    lower_with_chunk_limit(module, usize::MAX)
+}
+
+fn lower_with_chunk_limit(module: &hir::Module, chunk_limit: usize) -> Result<mir::Program, String> {
     let mut program = ProgramLowerer {
         functions: Vec::new(),
     };
-    let entry = if module.statements.len() <= MODULE_CHUNK_STATEMENTS {
+    let entry = if module.statements.len() <= chunk_limit {
         program.lower_scope(
             "<module>".to_owned(),
             "<module>".to_owned(),
             &[],
             &[],
             &[],
+            &[],
             &module.statements,
             true,
+            false,
         )?
     } else {
         let mut chunks = Vec::new();
@@ -34,7 +44,9 @@ pub fn lower(module: &hir::Module) -> Result<mir::Program, String> {
                 &[],
                 &[],
                 &[],
+                &[],
                 statements,
+                false,
                 false,
             )?;
             let span = statements
@@ -126,9 +138,10 @@ fn statement_contains_yield(statement: &hir::Statement) -> bool {
             value.as_ref().is_some_and(expression_contains_yield)
         }
         hir::StatementKind::Import { .. }
+        | hir::StatementKind::ImportFrom { .. }
         | hir::StatementKind::Break
         | hir::StatementKind::Continue => false,
-        hir::StatementKind::Expression(value) => expression_contains_yield(value),
+        hir::StatementKind::Expression(value) | hir::StatementKind::Display(value) => expression_contains_yield(value),
         hir::StatementKind::Raise { exception, cause } => {
             exception.as_ref().is_some_and(expression_contains_yield)
                 || cause.as_ref().is_some_and(expression_contains_yield)
@@ -151,6 +164,12 @@ fn statement_contains_yield(statement: &hir::Statement) -> bool {
                 || statements_contain_yield(else_body)
                 || statements_contain_yield(finally_body)
         }
+        hir::StatementKind::With { items, body, .. } => {
+            items.iter().any(|item| {
+                expression_contains_yield(&item.context)
+                    || item.target.as_ref().is_some_and(target_contains_yield)
+            }) || statements_contain_yield(body)
+        }
         hir::StatementKind::Print { values } => values.iter().any(expression_contains_yield),
         hir::StatementKind::If {
             condition,
@@ -169,6 +188,7 @@ fn statement_contains_yield(statement: &hir::Statement) -> bool {
             iterable,
             body,
             else_body,
+            ..
         } => {
             target_contains_yield(target)
                 || expression_contains_yield(iterable)
@@ -200,6 +220,7 @@ fn target_contains_yield(target: &hir::Target) -> bool {
 fn expression_contains_yield(expression: &hir::Expression) -> bool {
     match &expression.kind {
         hir::ExpressionKind::Yield { .. } | hir::ExpressionKind::YieldFrom { .. } => true,
+        hir::ExpressionKind::Await { value } => expression_contains_yield(value),
         hir::ExpressionKind::Slice { start, stop, step } => [start, stop, step]
             .into_iter()
             .flatten()
@@ -353,6 +374,7 @@ impl ProgramLowerer {
             name,
             qualified_name,
             parameters: vec![parameter],
+            native_local_count: 0,
             entry: mir::BlockId(0),
             blocks: lowerer.blocks,
             value_count: lowerer.next_value,
@@ -392,6 +414,7 @@ impl ProgramLowerer {
             name: "<module>".to_owned(),
             qualified_name: "<module>".to_owned(),
             parameters: vec![],
+            native_local_count: 0,
             entry: mir::BlockId(0),
             blocks: lowerer.blocks,
             value_count: lowerer.next_value,
@@ -407,9 +430,11 @@ impl ProgramLowerer {
         qualified_name: String,
         parameters: &[hir::Parameter],
         locals: &[String],
+        cells: &[String],
         free: &[String],
         statements: &[hir::Statement],
         module_scope: bool,
+        is_async: bool,
     ) -> Result<mir::FunctionId, String> {
         let id = mir::FunctionId(
             u32::try_from(self.functions.len()).map_err(|_| "too many MIR functions")?,
@@ -417,8 +442,13 @@ impl ProgramLowerer {
         self.functions.push(None);
         let source_generator =
             !module_scope && name != "<module>" && statements_contain_yield(statements);
+        let source_async_generator = is_async && source_generator;
         let mut lowerer = Lowerer::new(self);
         lowerer.module_semantics = name == "<module>";
+        let native_locals_allowed = !module_scope
+            && !is_async
+            && !source_generator
+            && !matches!(name.as_str(), "<listcomp>" | "<setcomp>" | "<dictcomp>");
         if !module_scope {
             lowerer.qualname_prefix = Some(qualified_name.clone());
             lowerer.nested_uses_locals = true;
@@ -448,6 +478,21 @@ impl ProgramLowerer {
                 lowerer.cells.insert(name.clone(), cell);
             }
             for local in locals {
+                if native_locals_allowed && !cells.iter().any(|cell| cell == local) {
+                    let index = u32::try_from(lowerer.native_locals.len())
+                        .map_err(|_| "too many native locals")?;
+                    lowerer.native_locals.insert(local.clone(), index);
+                    if let Some(initial) = parameter_values.get(local).copied() {
+                        lowerer.emit(
+                            Span::default(),
+                            mir::OperationKind::NativeLocalSet {
+                                index,
+                                value: initial,
+                            },
+                        );
+                    }
+                    continue;
+                }
                 let cell = lowerer.value();
                 lowerer.emit(
                     Span::default(),
@@ -458,13 +503,9 @@ impl ProgramLowerer {
                 );
                 lowerer.cells.insert(local.clone(), cell);
             }
-            lowerer.emit(
-                Span::default(),
-                mir::OperationKind::ReflectionScopeConfigure {
-                    namespace: None,
-                    comprehension: false,
-                },
-            );
+            // Active native calls already default to function-style reflection
+            // semantics (`namespace=None`, `comprehension=false`). Do not pay a
+            // runtime FFI call just to restate that invariant on every entry.
             let mut registered = Vec::new();
             for name in parameters
                 .iter()
@@ -506,6 +547,10 @@ impl ProgramLowerer {
         let function = mir::Function {
             kind: if module_scope {
                 mir::FunctionKind::Module
+            } else if source_async_generator {
+                mir::FunctionKind::AsyncGenerator
+            } else if is_async {
+                mir::FunctionKind::Coroutine
             } else if source_generator {
                 mir::FunctionKind::Generator
             } else {
@@ -514,6 +559,8 @@ impl ProgramLowerer {
             name,
             qualified_name,
             parameters: mir_parameters,
+            native_local_count: u32::try_from(lowerer.native_locals.len())
+                .map_err(|_| "too many native locals")?,
             entry,
             blocks: lowerer.blocks,
             value_count: lowerer.next_value,
@@ -535,6 +582,7 @@ impl ProgramLowerer {
         qualname_prefix: Option<String>,
         nested_uses_locals: bool,
     ) -> Result<mir::FunctionId, String> {
+        let contains_async_clause = clauses.iter().any(|clause| clause.is_async);
         let id = mir::FunctionId(
             u32::try_from(self.functions.len()).map_err(|_| "too many MIR functions")?,
         );
@@ -676,14 +724,19 @@ impl ProgramLowerer {
             value: (kind != hir::ComprehensionKind::Generator).then_some(result),
         })?;
         self.functions[id.0 as usize] = Some(mir::Function {
-            kind: if kind == hir::ComprehensionKind::Generator {
+            kind: if kind == hir::ComprehensionKind::Generator && contains_async_clause {
+                mir::FunctionKind::AsyncGenerator
+            } else if kind == hir::ComprehensionKind::Generator {
                 mir::FunctionKind::Generator
+            } else if contains_async_clause {
+                mir::FunctionKind::Coroutine
             } else {
                 mir::FunctionKind::Python
             },
             name: name.to_owned(),
             qualified_name: name.to_owned(),
             parameters: vec![parameter],
+            native_local_count: 0,
             entry: mir::BlockId(0),
             blocks: lowerer.blocks,
             value_count: lowerer.next_value,
@@ -699,6 +752,7 @@ struct Lowerer<'a> {
     current: mir::BlockId,
     next_value: u32,
     cells: BTreeMap<String, mir::ValueId>,
+    native_locals: BTreeMap<String, u32>,
     exception_edges: BTreeMap<(u32, u32), mir::BlockId>,
     exception_target: Option<mir::BlockId>,
     cleanups: Vec<CleanupAction>,
@@ -727,6 +781,12 @@ enum CleanupAction {
     ClassHandler {
         binding: Option<(String, hir::Binding)>,
         exception_target: Option<mir::BlockId>,
+    },
+    ContextExit {
+        exit: mir::ValueId,
+        span: Span,
+        exception_target: Option<mir::BlockId>,
+        is_async: bool,
     },
 }
 
@@ -849,6 +909,7 @@ impl<'a> Lowerer<'a> {
             current: mir::BlockId(0),
             next_value: 0,
             cells: BTreeMap::new(),
+            native_locals: BTreeMap::new(),
             exception_edges: BTreeMap::new(),
             exception_target: None,
             cleanups: Vec::new(),
@@ -983,12 +1044,31 @@ impl<'a> Lowerer<'a> {
             }
             hir::StatementKind::Import { aliases } => {
                 for alias in aliases {
+                    let (top, leaf) = self.lower_import(statement.span, &alias.module);
+                    let value = if !alias.explicit_alias { top } else { leaf };
+                    self.store_name(statement.span, &alias.bind_name, alias.binding, value)?;
+                }
+            }
+            hir::StatementKind::ImportFrom { module, aliases } => {
+                let (_, module_value) = self.lower_import(statement.span, module);
+                for alias in aliases {
+                    if alias.module == "*" {
+                        self.emit(
+                            statement.span,
+                            mir::OperationKind::ImportStar {
+                                module: module_value,
+                            },
+                        );
+                        continue;
+                    }
                     let value = self.value();
                     self.emit(
                         statement.span,
-                        mir::OperationKind::ImportName {
+                        mir::OperationKind::ImportFrom {
                             dest: value,
+                            module: module_value,
                             name: alias.module.clone(),
+                            submodule: format!("{module}.{}", alias.module),
                         },
                     );
                     self.store_name(statement.span, &alias.bind_name, alias.binding, value)?;
@@ -997,6 +1077,7 @@ impl<'a> Lowerer<'a> {
             hir::StatementKind::FunctionDef {
                 name,
                 binding,
+                is_async,
                 type_params,
                 decorators,
                 parameters,
@@ -1019,9 +1100,11 @@ impl<'a> Lowerer<'a> {
                     qualified_name,
                     parameters,
                     locals,
+                    cells,
                     free,
                     body,
                     false,
+                    *is_async,
                 )?;
                 let mut defaults = Vec::new();
                 for (index, parameter) in parameters.iter().enumerate() {
@@ -1383,6 +1466,10 @@ impl<'a> Lowerer<'a> {
                     })?;
                 }
             }
+            hir::StatementKind::Display(expression) => {
+                let value = self.expression(expression)?;
+                self.emit(statement.span, mir::OperationKind::Display { value });
+            }
             hir::StatementKind::Expression(expression) => {
                 self.expression(expression)?;
             }
@@ -1422,6 +1509,17 @@ impl<'a> Lowerer<'a> {
                     self.lower_try(body, handlers, else_body, finally_body)?;
                 }
             }
+            hir::StatementKind::With {
+                items,
+                body,
+                is_async,
+            } => {
+                if *is_async {
+                    self.lower_async_with(statement.span, items, body)?;
+                } else {
+                    self.lower_with(statement.span, items, body)?;
+                }
+            }
             hir::StatementKind::Print { values } => {
                 if let [
                     hir::Expression {
@@ -1457,11 +1555,264 @@ impl<'a> Lowerer<'a> {
                 iterable,
                 body,
                 else_body,
-            } => self.lower_for(statement.span, target, iterable, body, else_body)?,
+                is_async,
+            } => {
+                if *is_async {
+                    self.lower_async_for(statement.span, target, iterable, body, else_body)?;
+                } else {
+                    self.lower_for(statement.span, target, iterable, body, else_body)?;
+                }
+            }
             hir::StatementKind::Match { subject, cases } => {
                 self.lower_match(statement.span, subject, cases)?;
             }
         }
+        Ok(())
+    }
+
+    fn lower_with(
+        &mut self,
+        span: Span,
+        items: &[hir::WithItem],
+        body: &[hir::Statement],
+    ) -> Result<(), String> {
+        self.lower_with_kind(span, items, body, false)
+    }
+
+    fn lower_async_with(
+        &mut self,
+        span: Span,
+        items: &[hir::WithItem],
+        body: &[hir::Statement],
+    ) -> Result<(), String> {
+        self.lower_with_kind(span, items, body, true)
+    }
+
+    fn lower_with_kind(
+        &mut self,
+        span: Span,
+        items: &[hir::WithItem],
+        body: &[hir::Statement],
+        is_async: bool,
+    ) -> Result<(), String> {
+        let Some((item, remaining)) = items.split_first() else {
+            return self.statements(body);
+        };
+        let manager = self.expression(&item.context)?;
+        let enter = self.value();
+        self.emit(
+            item.context.span,
+            mir::OperationKind::SpecialMethodGet {
+                dest: enter,
+                receiver: manager,
+                name: if is_async {
+                    "__aenter__".to_owned()
+                } else {
+                    "__enter__".to_owned()
+                },
+            },
+        );
+        let exit = self.value();
+        self.emit(
+            item.context.span,
+            mir::OperationKind::SpecialMethodGet {
+                dest: exit,
+                receiver: manager,
+                name: if is_async {
+                    "__aexit__".to_owned()
+                } else {
+                    "__exit__".to_owned()
+                },
+            },
+        );
+        let entered_call = self.value();
+        self.emit(
+            item.context.span,
+            mir::OperationKind::Call {
+                dest: entered_call,
+                callable: enter,
+                positional: Vec::new(),
+                keywords: Vec::new(),
+            },
+        );
+        // An asynchronous manager does not own a cleanup record until its
+        // __aenter__ await has completed successfully. Entry failure therefore
+        // remains an exception of the surrounding scope.
+        let entered = if is_async {
+            self.lower_await_value(item.context.span, entered_call)?
+        } else {
+            entered_call
+        };
+        let outer_exception = self.exception_target;
+        let exceptional_exit = self.new_block();
+        let join = self.new_block();
+        self.cleanups.push(CleanupAction::ContextExit {
+            exit,
+            span,
+            exception_target: outer_exception,
+            is_async,
+        });
+        self.exception_target = Some(exceptional_exit);
+        if let Some(target) = &item.target {
+            self.write_target(target, entered)?;
+        }
+        self.lower_with_kind(span, remaining, body, is_async)?;
+        self.cleanups.pop();
+        if self.is_open() {
+            self.exception_target = outer_exception;
+            self.emit_context_exit_normal(span, exit, is_async)?;
+            if self.is_open() {
+                self.terminate(mir::Terminator::Jump {
+                    target: join,
+                    arguments: Vec::new(),
+                })?;
+            }
+        }
+
+        self.lower_context_exit_exception(
+            span,
+            exit,
+            exceptional_exit,
+            join,
+            outer_exception,
+            is_async,
+        )?;
+        self.current = join;
+        self.exception_target = outer_exception;
+        Ok(())
+    }
+
+    fn lower_context_exit_exception(
+        &mut self,
+        span: Span,
+        exit: mir::ValueId,
+        exceptional_exit: mir::BlockId,
+        join: mir::BlockId,
+        outer_exception: Option<mir::BlockId>,
+        is_async: bool,
+    ) -> Result<(), String> {
+        self.current = exceptional_exit;
+        self.exception_target = outer_exception;
+        let exception = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::ExceptionActive { dest: exception },
+        );
+        let handled = self.value();
+        self.emit(span, mir::OperationKind::HandlerEnter { dest: handled });
+        let cleanup_failure = self.new_block();
+        self.exception_target = Some(cleanup_failure);
+        let exception_type = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::TypeOf {
+                dest: exception_type,
+                value: handled,
+            },
+        );
+        let traceback = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::AttributeGet {
+                dest: traceback,
+                receiver: handled,
+                name: "__traceback__".to_owned(),
+            },
+        );
+        let exit_result = self.emit_context_exit_call(
+            span,
+            exit,
+            vec![exception_type, handled, traceback],
+            is_async,
+        )?;
+        let should_propagate = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::Unary {
+                dest: should_propagate,
+                op: hir::UnaryOperator::Not,
+                operand: exit_result,
+            },
+        );
+        let propagate = self.new_block();
+        let suppress = self.new_block();
+        self.terminate(mir::Terminator::Branch {
+            condition: should_propagate,
+            then_target: propagate,
+            then_arguments: Vec::new(),
+            else_target: suppress,
+            else_arguments: Vec::new(),
+        })?;
+
+        self.current = propagate;
+        self.exception_target = outer_exception;
+        self.emit(span, mir::OperationKind::ExceptionSetActive { exception });
+        self.emit(span, mir::OperationKind::HandlerLeave);
+        self.emit(span, mir::OperationKind::Propagate);
+        self.terminate(mir::Terminator::Jump {
+            target: join,
+            arguments: Vec::new(),
+        })?;
+
+        self.current = suppress;
+        self.exception_target = outer_exception;
+        self.emit(span, mir::OperationKind::HandlerLeave);
+        self.terminate(mir::Terminator::Jump {
+            target: join,
+            arguments: Vec::new(),
+        })?;
+
+        self.current = cleanup_failure;
+        self.exception_target = outer_exception;
+        self.emit(span, mir::OperationKind::HandlerLeave);
+        self.emit(span, mir::OperationKind::Propagate);
+        self.terminate(mir::Terminator::Jump {
+            target: join,
+            arguments: Vec::new(),
+        })?;
+
+        Ok(())
+    }
+
+    fn emit_context_exit_call(
+        &mut self,
+        span: Span,
+        exit: mir::ValueId,
+        positional: Vec<mir::ValueId>,
+        is_async: bool,
+    ) -> Result<mir::ValueId, String> {
+        let result = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::Call {
+                dest: result,
+                callable: exit,
+                positional,
+                keywords: Vec::new(),
+            },
+        );
+        if is_async {
+            self.lower_await_value(span, result)
+        } else {
+            Ok(result)
+        }
+    }
+
+    fn emit_context_exit_normal(
+        &mut self,
+        span: Span,
+        exit: mir::ValueId,
+        is_async: bool,
+    ) -> Result<(), String> {
+        let none = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::Constant {
+                dest: none,
+                value: mir::Constant::None,
+            },
+        );
+        let _ = self.emit_context_exit_call(span, exit, vec![none, none, none], is_async)?;
         Ok(())
     }
 
@@ -2041,6 +2392,10 @@ impl<'a> Lowerer<'a> {
                     value,
                 },
             ),
+            hir::Binding::Local if self.native_locals.contains_key(name) => {
+                let index = self.native_locals[name];
+                self.emit(span, mir::OperationKind::NativeLocalSet { index, value });
+            }
             hir::Binding::Local | hir::Binding::Cell | hir::Binding::Free => {
                 let cell = self
                     .cells
@@ -2301,14 +2656,27 @@ impl<'a> Lowerer<'a> {
                     finally_body,
                     *is_star,
                 )?,
+                hir::ClassMember::With { items, body } => {
+                    self.lower_class_with(span, namespace, items, body)?
+                }
                 hir::ClassMember::Import { aliases } => {
+                    for alias in aliases {
+                        let (top, leaf) = self.lower_import(span, &alias.module);
+                        let value = if !alias.explicit_alias { top } else { leaf };
+                        self.store_name(span, &alias.bind_name, alias.binding, value)?;
+                    }
+                }
+                hir::ClassMember::ImportFrom { module, aliases } => {
+                    let (_, module_value) = self.lower_import(span, module);
                     for alias in aliases {
                         let value = self.value();
                         self.emit(
                             span,
-                            mir::OperationKind::ImportName {
+                            mir::OperationKind::ImportFrom {
                                 dest: value,
+                                module: module_value,
                                 name: alias.module.clone(),
+                                submodule: format!("{module}.{}", alias.module),
                             },
                         );
                         self.store_name(span, &alias.bind_name, alias.binding, value)?;
@@ -2413,6 +2781,7 @@ impl<'a> Lowerer<'a> {
                     span: member_span,
                     name,
                     binding,
+                    is_async,
                     type_params,
                     decorators,
                     uses_zero_argument_super,
@@ -2441,9 +2810,11 @@ impl<'a> Lowerer<'a> {
                         self.child_qualified_name(name),
                         parameters,
                         locals,
+                        cells,
                         &method_free,
                         body,
                         false,
+                        *is_async,
                     )?;
                     let mut defaults = Vec::new();
                     for (index, parameter) in parameters.iter().enumerate() {
@@ -2523,6 +2894,83 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn lower_class_with(
+        &mut self,
+        span: Span,
+        namespace: mir::ValueId,
+        items: &[hir::WithItem],
+        body: &[hir::ClassMember],
+    ) -> Result<(), String> {
+        let Some((item, remaining)) = items.split_first() else {
+            return self.lower_class_assignment_members(span, namespace, body);
+        };
+        let manager = self.expression(&item.context)?;
+        let enter = self.value();
+        self.emit(
+            item.context.span,
+            mir::OperationKind::SpecialMethodGet {
+                dest: enter,
+                receiver: manager,
+                name: "__enter__".to_owned(),
+            },
+        );
+        let exit = self.value();
+        self.emit(
+            item.context.span,
+            mir::OperationKind::SpecialMethodGet {
+                dest: exit,
+                receiver: manager,
+                name: "__exit__".to_owned(),
+            },
+        );
+        let entered = self.value();
+        self.emit(
+            item.context.span,
+            mir::OperationKind::Call {
+                dest: entered,
+                callable: enter,
+                positional: Vec::new(),
+                keywords: Vec::new(),
+            },
+        );
+        let outer_exception = self.exception_target;
+        let exceptional_exit = self.new_block();
+        let join = self.new_block();
+        self.cleanups.push(CleanupAction::ContextExit {
+            exit,
+            span,
+            exception_target: outer_exception,
+            is_async: false,
+        });
+        self.exception_target = Some(exceptional_exit);
+        if let Some(target) = &item.target {
+            self.write_class_target(namespace, target, entered)?;
+        }
+        self.lower_class_with(span, namespace, remaining, body)?;
+        self.cleanups.pop();
+        if self.is_open() {
+            self.exception_target = outer_exception;
+            self.emit_context_exit_normal(span, exit, false)?;
+            if self.is_open() {
+                self.terminate(mir::Terminator::Jump {
+                    target: join,
+                    arguments: Vec::new(),
+                })?;
+            }
+        }
+        self.lower_context_exit_exception(
+            span,
+            exit,
+            exceptional_exit,
+            join,
+            outer_exception,
+            false,
+        )?;
+        self.current = join;
+        self.exception_target = outer_exception;
         Ok(())
     }
 
@@ -3336,6 +3784,129 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    fn lower_async_for(
+        &mut self,
+        span: Span,
+        target: &hir::Target,
+        iterable: &hir::Expression,
+        body: &[hir::Statement],
+        else_body: &[hir::Statement],
+    ) -> Result<(), String> {
+        let iterable = self.expression(iterable)?;
+        let iterator = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::AsyncIteratorNew {
+                dest: iterator,
+                value: iterable,
+            },
+        );
+
+        let header = self.new_block();
+        let body_block = self.new_block();
+        let exhausted = self.new_block();
+        let exit = self.new_block();
+        let stop_dispatch = self.new_block();
+        let outer_exception = self.exception_target;
+        self.terminate(mir::Terminator::Jump {
+            target: header,
+            arguments: vec![],
+        })?;
+
+        self.current = header;
+        self.exception_target = Some(stop_dispatch);
+        let awaitable = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::AsyncIteratorNext {
+                dest: awaitable,
+                iterator,
+            },
+        );
+        let item = self.lower_await_value(span, awaitable)?;
+        self.exception_target = outer_exception;
+        self.terminate(mir::Terminator::Jump {
+            target: body_block,
+            arguments: vec![],
+        })?;
+
+        self.current = stop_dispatch;
+        self.exception_target = outer_exception;
+        let active = self.value();
+        self.emit(span, mir::OperationKind::ExceptionActive { dest: active });
+        let stop_type = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::GlobalGet {
+                dest: stop_type,
+                name: "StopAsyncIteration".to_owned(),
+            },
+        );
+        let matches = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::ExceptionMatches {
+                dest: matches,
+                exception: active,
+                expected_type: stop_type,
+            },
+        );
+        let stop_selected = self.new_block();
+        let propagate = self.new_block();
+        self.terminate(mir::Terminator::Branch {
+            condition: matches,
+            then_target: stop_selected,
+            then_arguments: vec![],
+            else_target: propagate,
+            else_arguments: vec![],
+        })?;
+
+        self.current = stop_selected;
+        let handled = self.value();
+        self.emit(span, mir::OperationKind::HandlerEnter { dest: handled });
+        self.emit(span, mir::OperationKind::HandlerLeave);
+        self.terminate(mir::Terminator::Jump {
+            target: exhausted,
+            arguments: vec![],
+        })?;
+
+        self.current = propagate;
+        self.exception_target = outer_exception;
+        self.emit(span, mir::OperationKind::Propagate);
+        self.terminate(mir::Terminator::Jump {
+            target: exit,
+            arguments: vec![],
+        })?;
+
+        self.current = body_block;
+        self.exception_target = outer_exception;
+        self.write_clause_target(target, item)?;
+        self.loops.push(LoopTargets {
+            continue_target: header,
+            break_target: exit,
+            cleanup_depth: self.cleanups.len(),
+        });
+        self.statements(body)?;
+        self.loops.pop();
+        if self.is_open() {
+            self.terminate(mir::Terminator::Jump {
+                target: header,
+                arguments: vec![],
+            })?;
+        }
+
+        self.current = exhausted;
+        self.statements(else_body)?;
+        if self.is_open() {
+            self.terminate(mir::Terminator::Jump {
+                target: exit,
+                arguments: vec![],
+            })?;
+        }
+        self.current = exit;
+        Ok(())
+    }
+
     fn lower_for(
         &mut self,
         span: Span,
@@ -3345,6 +3916,325 @@ impl<'a> Lowerer<'a> {
         else_body: &[hir::Statement],
     ) -> Result<(), String> {
         let iterable = self.expression(iterable)?;
+        if else_body.is_empty()
+            && let [
+                hir::Statement {
+                    kind:
+                        hir::StatementKind::Assign {
+                            targets: created_targets,
+                            value:
+                                hir::Expression {
+                                    kind:
+                                        hir::ExpressionKind::Call {
+                                            callable: created_callable,
+                                            parts: created_parts,
+                                        },
+                                    ..
+                                },
+                        },
+                    ..
+                },
+                hir::Statement {
+                    kind:
+                        hir::StatementKind::Expression(hir::Expression {
+                            kind:
+                                hir::ExpressionKind::Call {
+                                    callable: close_callable,
+                                    parts: close_parts,
+                                },
+                            ..
+                        }),
+                    ..
+                },
+            ] = body
+            && created_parts.is_empty()
+            && close_parts.is_empty()
+            && let hir::ExpressionKind::Name {
+                binding: hir::Binding::Global,
+                ..
+            } = &created_callable.kind
+            && let [
+                hir::Target {
+                    kind:
+                        hir::TargetKind::Name {
+                            name: created_name,
+                            binding: hir::Binding::Local | hir::Binding::Cell,
+                        },
+                    ..
+                },
+            ] = created_targets.as_slice()
+            && let hir::ExpressionKind::Attribute {
+                value: close_receiver,
+                name: close_name,
+            } = &close_callable.kind
+            && close_name == "close"
+            && let hir::ExpressionKind::Name {
+                name: close_receiver_name,
+                binding: hir::Binding::Local | hir::Binding::Cell,
+            } = &close_receiver.kind
+            && close_receiver_name == created_name
+            && matches!(
+                target.kind,
+                hir::TargetKind::Name {
+                    binding: hir::Binding::Local | hir::Binding::Cell,
+                    ..
+                }
+            )
+        {
+            return self.lower_coroutine_close_elided_range_for(
+                span,
+                target,
+                iterable,
+                created_callable,
+                body,
+            );
+        }
+        if else_body.is_empty()
+            && let [
+                hir::Statement {
+                    kind:
+                        hir::StatementKind::Assign {
+                            targets: assignment_targets,
+                            value:
+                                hir::Expression {
+                                    kind: hir::ExpressionKind::Await { value: awaited },
+                                    ..
+                                },
+                        },
+                    ..
+                },
+            ] = body
+            && let hir::ExpressionKind::Call { callable, parts } = &awaited.kind
+            && parts.is_empty()
+            && matches!(callable.kind, hir::ExpressionKind::Name { .. })
+            && matches!(
+                target.kind,
+                hir::TargetKind::Name {
+                    binding: hir::Binding::Local | hir::Binding::Cell,
+                    ..
+                }
+            )
+            && assignment_targets.iter().all(|target| {
+                matches!(
+                    target.kind,
+                    hir::TargetKind::Name {
+                        binding: hir::Binding::Local | hir::Binding::Cell,
+                        ..
+                    }
+                )
+            })
+        {
+            return self.lower_repeat_pure_range_for(
+                span,
+                target,
+                iterable,
+                callable,
+                assignment_targets,
+                body,
+            );
+        }
+        self.lower_for_from_iterable(span, target, iterable, body, else_body)
+    }
+
+    fn lower_coroutine_close_elided_range_for(
+        &mut self,
+        span: Span,
+        target: &hir::Target,
+        iterable: mir::ValueId,
+        callable: &hir::Expression,
+        original_body: &[hir::Statement],
+    ) -> Result<(), String> {
+        let first = self.value();
+        let last = self.value();
+        let range_matched = self.value();
+        let nonempty = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::RangeCollapseProbe {
+                first,
+                last,
+                matched: range_matched,
+                nonempty,
+                value: iterable,
+            },
+        );
+
+        let exact_range = self.new_block();
+        let try_elide = self.new_block();
+        let collapsed = self.new_block();
+        let generic = self.new_block();
+        let done = self.new_block();
+        self.terminate(mir::Terminator::Branch {
+            condition: range_matched,
+            then_target: exact_range,
+            then_arguments: Vec::new(),
+            else_target: generic,
+            else_arguments: Vec::new(),
+        })?;
+
+        self.current = exact_range;
+        self.terminate(mir::Terminator::Branch {
+            condition: nonempty,
+            then_target: try_elide,
+            then_arguments: Vec::new(),
+            else_target: done,
+            else_arguments: Vec::new(),
+        })?;
+
+        self.current = try_elide;
+        // Python assigns the loop target before evaluating the body. Preserve
+        // that ordering before the dynamic function guard; if the guard misses,
+        // the generic iterator path restarts from the untouched range object.
+        self.write_clause_target(target, first)?;
+        let callable = self.expression(callable)?;
+        let elide_matched = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::CoroutineCloseElideProbe {
+                matched: elide_matched,
+                callable,
+            },
+        );
+        self.terminate(mir::Terminator::Branch {
+            condition: elide_matched,
+            then_target: collapsed,
+            then_arguments: Vec::new(),
+            else_target: generic,
+            else_arguments: Vec::new(),
+        })?;
+
+        self.current = collapsed;
+        // All skipped iterations would create a fresh unstarted coroutine and
+        // immediately close it, with no user code executed. Run the real body
+        // once for the final iteration so the post-loop temporary remains an
+        // actual closed coroutine object and the loop target has Python's final
+        // value.
+        self.write_clause_target(target, last)?;
+        self.statements(original_body)?;
+        if self.is_open() {
+            self.terminate(mir::Terminator::Jump {
+                target: done,
+                arguments: Vec::new(),
+            })?;
+        }
+
+        self.current = generic;
+        self.lower_for_from_iterable(span, target, iterable, original_body, &[])?;
+        if self.is_open() {
+            self.terminate(mir::Terminator::Jump {
+                target: done,
+                arguments: Vec::new(),
+            })?;
+        }
+        self.current = done;
+        Ok(())
+    }
+
+    fn lower_repeat_pure_range_for(
+        &mut self,
+        span: Span,
+        target: &hir::Target,
+        iterable: mir::ValueId,
+        callable: &hir::Expression,
+        assignment_targets: &[hir::Target],
+        original_body: &[hir::Statement],
+    ) -> Result<(), String> {
+        let first = self.value();
+        let last = self.value();
+        let range_matched = self.value();
+        let nonempty = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::RangeCollapseProbe {
+                first,
+                last,
+                matched: range_matched,
+                nonempty,
+                value: iterable,
+            },
+        );
+
+        let exact_range = self.new_block();
+        let try_pure = self.new_block();
+        let collapsed = self.new_block();
+        let generic = self.new_block();
+        let done = self.new_block();
+        self.terminate(mir::Terminator::Branch {
+            condition: range_matched,
+            then_target: exact_range,
+            then_arguments: Vec::new(),
+            else_target: generic,
+            else_arguments: Vec::new(),
+        })?;
+
+        self.current = exact_range;
+        self.terminate(mir::Terminator::Branch {
+            condition: nonempty,
+            then_target: try_pure,
+            then_arguments: Vec::new(),
+            else_target: done,
+            else_arguments: Vec::new(),
+        })?;
+
+        self.current = try_pure;
+        // The original loop target is assigned before evaluating the first body
+        // expression. Publishing `first` here preserves that state if the name
+        // lookup itself raises. The pure guard may still miss and re-enter the
+        // ordinary iterator path.
+        self.write_clause_target(target, first)?;
+        let callable = self.expression(callable)?;
+        let result = self.value();
+        let pure_matched = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::CallAwaitReady {
+                dest: result,
+                matched: pure_matched,
+                callable,
+                positional: Vec::new(),
+                pure_only: true,
+            },
+        );
+        self.terminate(mir::Terminator::Branch {
+            condition: pure_matched,
+            then_target: collapsed,
+            then_arguments: Vec::new(),
+            else_target: generic,
+            else_arguments: Vec::new(),
+        })?;
+
+        self.current = collapsed;
+        // Final observable state is exactly the final ordinary iteration:
+        // assign the loop target, then assign the awaited result.
+        self.write_clause_target(target, last)?;
+        for assignment_target in assignment_targets {
+            self.write_target(assignment_target, result)?;
+        }
+        self.terminate(mir::Terminator::Jump {
+            target: done,
+            arguments: Vec::new(),
+        })?;
+
+        self.current = generic;
+        self.lower_for_from_iterable(span, target, iterable, original_body, &[])?;
+        if self.is_open() {
+            self.terminate(mir::Terminator::Jump {
+                target: done,
+                arguments: Vec::new(),
+            })?;
+        }
+        self.current = done;
+        Ok(())
+    }
+
+    fn lower_for_from_iterable(
+        &mut self,
+        span: Span,
+        target: &hir::Target,
+        iterable: mir::ValueId,
+        body: &[hir::Statement],
+        else_body: &[hir::Statement],
+    ) -> Result<(), String> {
         let iterator = self.value();
         self.emit(
             span,
@@ -3406,6 +4296,84 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    fn lower_async_next_for_iteration(
+        &mut self,
+        span: Span,
+        iterator: mir::ValueId,
+        exhausted_target: mir::BlockId,
+    ) -> Result<mir::ValueId, String> {
+        let outer_exception = self.exception_target;
+        let stop_dispatch = self.new_block();
+        let success = self.new_block();
+        self.exception_target = Some(stop_dispatch);
+        let awaitable = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::AsyncIteratorNext {
+                dest: awaitable,
+                iterator,
+            },
+        );
+        let item = self.lower_await_value(span, awaitable)?;
+        self.exception_target = outer_exception;
+        self.terminate(mir::Terminator::Jump {
+            target: success,
+            arguments: Vec::new(),
+        })?;
+
+        self.current = stop_dispatch;
+        self.exception_target = outer_exception;
+        let active = self.value();
+        self.emit(span, mir::OperationKind::ExceptionActive { dest: active });
+        let stop_type = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::GlobalGet {
+                dest: stop_type,
+                name: "StopAsyncIteration".to_owned(),
+            },
+        );
+        let matches = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::ExceptionMatches {
+                dest: matches,
+                exception: active,
+                expected_type: stop_type,
+            },
+        );
+        let stop_selected = self.new_block();
+        let propagate = self.new_block();
+        self.terminate(mir::Terminator::Branch {
+            condition: matches,
+            then_target: stop_selected,
+            then_arguments: Vec::new(),
+            else_target: propagate,
+            else_arguments: Vec::new(),
+        })?;
+
+        self.current = stop_selected;
+        let handled = self.value();
+        self.emit(span, mir::OperationKind::HandlerEnter { dest: handled });
+        self.emit(span, mir::OperationKind::HandlerLeave);
+        self.terminate(mir::Terminator::Jump {
+            target: exhausted_target,
+            arguments: Vec::new(),
+        })?;
+
+        self.current = propagate;
+        self.exception_target = outer_exception;
+        self.emit(span, mir::OperationKind::Propagate);
+        self.terminate(mir::Terminator::Jump {
+            target: exhausted_target,
+            arguments: Vec::new(),
+        })?;
+
+        self.current = success;
+        self.exception_target = outer_exception;
+        Ok(item)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn lower_comprehension_level(
         &mut self,
@@ -3432,9 +4400,16 @@ impl<'a> Lowerer<'a> {
             let iterator = self.value();
             self.emit(
                 iterable_expression.span,
-                mir::OperationKind::IteratorNew {
-                    dest: iterator,
-                    value: iterable,
+                if clause.is_async {
+                    mir::OperationKind::AsyncIteratorNew {
+                        dest: iterator,
+                        value: iterable,
+                    }
+                } else {
+                    mir::OperationKind::IteratorNew {
+                        dest: iterator,
+                        value: iterable,
+                    }
                 },
             );
             iterator
@@ -3447,23 +4422,34 @@ impl<'a> Lowerer<'a> {
             arguments: Vec::new(),
         })?;
         self.current = header;
-        let item = self.value();
-        let has_value = self.value();
-        self.emit(
-            clause.target.span,
-            mir::OperationKind::IteratorNext {
-                item,
-                has_value,
-                iterator,
-            },
-        );
-        self.terminate(mir::Terminator::Branch {
-            condition: has_value,
-            then_target: body,
-            then_arguments: Vec::new(),
-            else_target: exhausted,
-            else_arguments: Vec::new(),
-        })?;
+        let item = if clause.is_async {
+            let item =
+                self.lower_async_next_for_iteration(clause.target.span, iterator, exhausted)?;
+            self.terminate(mir::Terminator::Jump {
+                target: body,
+                arguments: Vec::new(),
+            })?;
+            item
+        } else {
+            let item = self.value();
+            let has_value = self.value();
+            self.emit(
+                clause.target.span,
+                mir::OperationKind::IteratorNext {
+                    item,
+                    has_value,
+                    iterator,
+                },
+            );
+            self.terminate(mir::Terminator::Branch {
+                condition: has_value,
+                then_target: body,
+                then_arguments: Vec::new(),
+                else_target: exhausted,
+                else_arguments: Vec::new(),
+            })?;
+            item
+        };
         self.current = body;
         self.write_clause_target(&clause.target, item)?;
         for filter in &clause.filters {
@@ -4039,6 +5025,15 @@ impl<'a> Lowerer<'a> {
                     }
                     self.emit(Span::default(), mir::OperationKind::HandlerLeave);
                 }
+                CleanupAction::ContextExit {
+                    exit,
+                    span,
+                    exception_target,
+                    is_async,
+                } => {
+                    self.exception_target = *exception_target;
+                    self.emit_context_exit_normal(*span, *exit, *is_async)?;
+                }
             }
             if !self.is_open() {
                 return Ok(());
@@ -4056,6 +5051,10 @@ impl<'a> Lowerer<'a> {
                     name: name.to_owned(),
                 },
             ),
+            hir::Binding::Local if self.native_locals.contains_key(name) => {
+                let index = self.native_locals[name];
+                self.emit(span, mir::OperationKind::NativeLocalClear { index });
+            }
             hir::Binding::Local | hir::Binding::Cell | hir::Binding::Free => {
                 let cell = self
                     .cells
@@ -4155,6 +5154,132 @@ impl<'a> Lowerer<'a> {
         })?;
         self.current = suspend;
         self.terminate(mir::Terminator::Yield {
+            value: yielded,
+            resume_value: Some(join_result),
+            resume_target: join,
+            exception_target: self.exception_target,
+            delegate: Some(iterator),
+        })?;
+        self.current = join;
+        Ok(join_result)
+    }
+
+    fn lower_await_expression(
+        &mut self,
+        span: Span,
+        value: &hir::Expression,
+    ) -> Result<mir::ValueId, String> {
+        // Gate 10 Slice 13 fuses the overwhelmingly common `await f(args)`
+        // shape without changing Python's lazy coroutine-call contract. The
+        // callable and positional arguments are evaluated exactly once. The
+        // runtime fast operation executes only a dynamically verified,
+        // non-suspending Rimera coroutine entry; every miss falls through to
+        // the existing call + generic await protocol using those same values.
+        if let hir::ExpressionKind::Call { callable, parts } = &value.kind
+            && parts
+                .iter()
+                .all(|part| matches!(part, hir::CallPart::Positional(_)))
+        {
+            let callable = self.expression(callable)?;
+            let positional = parts
+                .iter()
+                .map(|part| match part {
+                    hir::CallPart::Positional(value) => self.expression(value),
+                    _ => unreachable!("ready-await fusion accepted a non-positional call part"),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let ready_result = self.value();
+            let matched = self.value();
+            self.emit(
+                span,
+                mir::OperationKind::CallAwaitReady {
+                    dest: ready_result,
+                    matched,
+                    callable,
+                    positional: positional.clone(),
+                    pure_only: false,
+                },
+            );
+
+            let fallback = self.new_block();
+            let join = self.new_block();
+            let result = self.value();
+            self.blocks[join.0 as usize].parameters.push(result);
+            self.terminate(mir::Terminator::Branch {
+                condition: matched,
+                then_target: join,
+                then_arguments: vec![ready_result],
+                else_target: fallback,
+                else_arguments: Vec::new(),
+            })?;
+
+            self.current = fallback;
+            let awaitable = self.value();
+            self.emit(
+                value.span,
+                mir::OperationKind::Call {
+                    dest: awaitable,
+                    callable,
+                    positional,
+                    keywords: Vec::new(),
+                },
+            );
+            let fallback_result = self.lower_await_value(span, awaitable)?;
+            self.terminate(mir::Terminator::Jump {
+                target: join,
+                arguments: vec![fallback_result],
+            })?;
+            self.current = join;
+            return Ok(result);
+        }
+
+        let awaitable = self.expression(value)?;
+        self.lower_await_value(span, awaitable)
+    }
+
+    fn lower_await_value(
+        &mut self,
+        span: Span,
+        awaitable: mir::ValueId,
+    ) -> Result<mir::ValueId, String> {
+        // Slice 6 resolves arbitrary awaitables through __await__ exactly once.
+        // The runtime operation preserves Slice 3's native-coroutine fast path
+        // by returning native coroutine objects directly without a wrapper.
+        let iterator = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::AwaitIterator {
+                dest: iterator,
+                value: awaitable,
+            },
+        );
+        let yielded = self.value();
+        let result = self.value();
+        let complete = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::YieldFromNext {
+                yielded,
+                result,
+                complete,
+                iterator,
+            },
+        );
+        let join = self.new_block();
+        let join_result = self.value();
+        self.blocks[join.0 as usize].parameters.push(join_result);
+        let suspend = self.new_block();
+        self.terminate(mir::Terminator::Branch {
+            condition: complete,
+            then_target: join,
+            then_arguments: vec![result],
+            else_target: suspend,
+            else_arguments: Vec::new(),
+        })?;
+        self.current = suspend;
+        self.terminate(mir::Terminator::Suspend {
+            kind: mir::SuspensionKind::Await,
             value: yielded,
             resume_value: Some(join_result),
             resume_target: join,
@@ -4322,8 +5447,10 @@ impl<'a> Lowerer<'a> {
                     self.child_qualified_name("<lambda>"),
                     parameters,
                     locals,
+                    cells,
                     free,
                     &[return_statement],
+                    false,
                     false,
                 )?;
                 let mut defaults = Vec::new();
@@ -4389,6 +5516,13 @@ impl<'a> Lowerer<'a> {
                         name: name.clone(),
                     }
                 }
+                hir::Binding::Local if self.native_locals.contains_key(name) => {
+                    mir::OperationKind::NativeLocalGet {
+                        dest: self.value(),
+                        index: self.native_locals[name],
+                        name: name.clone(),
+                    }
+                }
                 hir::Binding::Local | hir::Binding::Cell | hir::Binding::Free => {
                     mir::OperationKind::CellGet {
                         dest: self.value(),
@@ -4441,13 +5575,22 @@ impl<'a> Lowerer<'a> {
                 cells,
                 free,
             } => {
+                let contains_async_clause = clauses.iter().any(|clause| clause.is_async);
+                let outer_is_async = clauses.first().is_some_and(|clause| clause.is_async);
                 let outer_iterable = self.expression(outer_iterable)?;
                 let outer_iterator = self.value();
                 self.emit(
                     expression.span,
-                    mir::OperationKind::IteratorNew {
-                        dest: outer_iterator,
-                        value: outer_iterable,
+                    if outer_is_async {
+                        mir::OperationKind::AsyncIteratorNew {
+                            dest: outer_iterator,
+                            value: outer_iterable,
+                        }
+                    } else {
+                        mir::OperationKind::IteratorNew {
+                            dest: outer_iterator,
+                            value: outer_iterable,
+                        }
                     },
                 );
                 let function = self.program.lower_comprehension(
@@ -4481,18 +5624,27 @@ impl<'a> Lowerer<'a> {
                         free_names: free.clone(),
                     },
                 );
-                mir::OperationKind::Call {
-                    dest: self.value(),
+                let result = self.value();
+                let call = mir::OperationKind::Call {
+                    dest: result,
                     callable,
                     positional: vec![outer_iterator],
                     keywords: Vec::new(),
+                };
+                if contains_async_clause && *kind != hir::ComprehensionKind::Generator {
+                    self.emit(expression.span, call);
+                    return self.lower_await_value(expression.span, result);
                 }
+                call
             }
             hir::ExpressionKind::Yield { value } => {
                 return self.lower_yield_expression(expression.span, value.as_deref());
             }
             hir::ExpressionKind::YieldFrom { value } => {
                 return self.lower_yield_from_expression(expression.span, value);
+            }
+            hir::ExpressionKind::Await { value } => {
+                return self.lower_await_expression(expression.span, value);
             }
             hir::ExpressionKind::NamedExpression {
                 name,
@@ -4833,6 +5985,31 @@ impl<'a> Lowerer<'a> {
         id
     }
 
+    fn lower_import(&mut self, span: Span, module: &str) -> (mir::ValueId, mir::ValueId) {
+        let top = self.value();
+        self.emit(
+            span,
+            mir::OperationKind::ImportName {
+                dest: top,
+                name: module.to_owned(),
+            },
+        );
+        let mut leaf = top;
+        for component in module.split('.').skip(1) {
+            let child = self.value();
+            self.emit(
+                span,
+                mir::OperationKind::AttributeGet {
+                    dest: child,
+                    receiver: leaf,
+                    name: component.to_owned(),
+                },
+            );
+            leaf = child;
+        }
+        (top, leaf)
+    }
+
     fn emit(&mut self, span: Span, kind: mir::OperationKind) {
         let block = &mut self.blocks[self.current.0 as usize];
         let operation = block.operations.len();
@@ -4931,6 +6108,83 @@ mod tests {
 
     use super::*;
     use crate::{sema, syntax};
+
+    #[test]
+    fn gate8_context_cleanup_cfg_captures_methods_targets_exception_edges_and_roots() {
+        let path = Path::new("gate8_cleanup_cfg.py");
+        let source = r#"
+def use(first, second, target):
+    with first as value, second as target[0]:
+        return value
+"#;
+        let syntax = syntax::parse(path, source).unwrap();
+        let hir = sema::analyze(path, &syntax).unwrap();
+        let program = lower(&hir).unwrap();
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name == "use")
+            .expect("compiled function should exist");
+        let plan = mir::safepoint_plan(function).unwrap();
+
+        let mut exits = Vec::new();
+        let mut exit_calls = 0;
+        let mut exit_calls_with_cleanup_edges = 0;
+        let mut item_set = None;
+        let mut active_exception = false;
+        let mut type_of = false;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                match &operation.kind {
+                    mir::OperationKind::SpecialMethodGet { dest, name, .. }
+                        if name == "__exit__" =>
+                    {
+                        exits.push(*dest);
+                    }
+                    mir::OperationKind::Call { callable, .. } if exits.contains(callable) => {
+                        exit_calls += 1;
+                        let roots = plan
+                            .operation_roots(block_index, operation_index)
+                            .expect("context exit calls must publish roots");
+                        assert!(roots.contains(callable));
+                        if function
+                            .exception_edges
+                            .contains_key(&(block_index as u32, operation_index as u32))
+                        {
+                            exit_calls_with_cleanup_edges += 1;
+                        }
+                    }
+                    mir::OperationKind::ItemSet { .. } => {
+                        item_set = Some((block_index, operation_index));
+                    }
+                    mir::OperationKind::ExceptionActive { .. } => active_exception = true,
+                    mir::OperationKind::TypeOf { .. } => type_of = true,
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(exits.len(), 2, "each manager captures one exit method");
+        assert!(
+            exit_calls >= 4,
+            "normal and exceptional cleanup must call exits"
+        );
+        assert!(
+            exit_calls_with_cleanup_edges >= 1,
+            "nested exit failures must continue through outer cleanup"
+        );
+        let (block, operation) = item_set.expect("with target must use ordinary item assignment");
+        assert!(
+            function
+                .exception_edges
+                .contains_key(&(block as u32, operation as u32)),
+            "target assignment failure must enter context cleanup"
+        );
+        assert!(
+            active_exception && type_of,
+            "exception triple must be explicit MIR"
+        );
+    }
 
     #[test]
     fn gate4_target_write_planner_evaluates_rhs_receiver_and_index_once_with_exception_edge() {
@@ -6187,19 +7441,18 @@ class C:
             .iter()
             .find(|function| function.name == "outer")
             .expect("outer function");
+        // Ordinary function scope is implicit and its non-captured locals now
+        // live in GC-published native slots. Reflection discovers those slots
+        // lazily instead of paying a scope-configuration FFI call on entry.
+        assert_eq!(outer.native_local_count, 5);
         assert!(
-            outer.blocks[outer.entry.0 as usize]
+            !outer.blocks[outer.entry.0 as usize]
                 .operations
                 .iter()
-                .any(|operation| {
-                    matches!(
-                        operation.kind,
-                        mir::OperationKind::ReflectionScopeConfigure {
-                            namespace: None,
-                            comprehension: false,
-                        }
-                    )
-                })
+                .any(|operation| matches!(
+                    operation.kind,
+                    mir::OperationKind::ReflectionScopeConfigure { .. }
+                ))
         );
         let registered = outer.blocks[outer.entry.0 as usize]
             .operations
@@ -6209,7 +7462,7 @@ class C:
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(registered, ["z", "a", "q", "values", "generated"]);
+        assert!(registered.is_empty());
 
         let list_comp = program
             .functions

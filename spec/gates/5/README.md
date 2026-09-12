@@ -6,10 +6,10 @@ function objects, cells, call binder, exception graph, traceback model, and
 cleanup CFG. It may not introduce a second call path, scope model, unwinder, or
 exception representation.
 
-Gate 6 is closed. Gate 5 Slices 1–5 are complete and **Slice 6 is the sole
-active compatibility slice**. Continue this ledger in numeric order; the Gate 6
-prerequisite repairs already landed do not skip the remaining propagation,
-composition, and final-audit slices.
+Gate 6 is closed and Gate 5 is now closed. All eight slices reached the single
+native function/cell/exception/traceback/cleanup model and public CPython
+3.12.11 proof. Gate 7 consumed this closure as its final prerequisite; Gate 8 is
+the next active compatibility gate.
 
 Every slice must reach the complete native path:
 
@@ -52,9 +52,9 @@ Python source -> owned syntax/HIR -> semantic analysis -> verified MIR
 - [x] Slice 3 — authoritative binding and activation isolation
 - [x] Slice 4 — complete LEGB, cells, and scope interactions
 - [x] Slice 5 — exception objects, hierarchy, normalization, and traceback API
-- [ ] Slice 6 — propagation, chaining, groups, and cleanup completion
-- [ ] Slice 7 — cross-feature composition, GC, and traceback fidelity
-- [ ] Slice 8 — final audit, documentation, and gate closure
+- [x] Slice 6 — propagation, chaining, groups, and cleanup completion
+- [x] Slice 7 — cross-feature composition, GC, and traceback fidelity
+- [x] Slice 8 — final audit, documentation, and gate closure
 
 ## Slice order
 
@@ -67,6 +67,7 @@ Python source -> owned syntax/HIR -> semantic analysis -> verified MIR
 7. [Cross-feature composition, GC, and traceback fidelity](slice-7.md)
 8. [Final audit, documentation, and gate closure](slice-8.md)
 
-Gate 5 closes only when compatibility rows 1–3 can honestly move from
-`Substantial partial` to `Implemented — conformance audit pending`. Reflection
-surfaces beyond the metadata explicitly produced here remain Gate 7-owned.
+Gate 5 is closed. Compatibility rows 1–3 are promoted to
+`Implemented — conformance audit pending`; exhaustive Python 3.12 edge parity
+remains Gate 13 conformance work. Reflection surfaces remain owned by the now
+closed Gate 7 rather than by a duplicate Gate 5 metadata path.

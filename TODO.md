@@ -264,58 +264,173 @@ These checks describe proven slices, not complete Python categories.
     485,176-byte `hello` under the 512 KiB ceiling with a clean forbidden-symbol
     scan.
 
+## Recently completed compatibility gates
+
+- [x] **Gate 5 — functions, LEGB, and structured exceptions closed**
+  - All eight slices are complete on the single binder/cell/exception/traceback/
+    cleanup model. The injected-exception generator-resume liveness prerequisite
+    is repaired in MIR persistence and the final Gate 5 composition/audit is
+    green.
+- [x] **Gate 7 — reflection and introspection closed**
+  - All ten slices are complete. Slice 9 proves mutation invalidation,
+    cross-family composition, GC, and low-heap atomicity; Slice 10 closes the
+    owner/release/forbidden-symbol audit and promotes reflection to
+    `Implemented — conformance audit pending`.
+- [x] **Gate 8 — synchronous context managers closed**
+  - All eight slices are complete on compiler-owned cleanup CFG. Public proof
+    covers descriptor-bound enter/exit, every supported target and completion,
+    exact exceptional triples, suppression/replacement/chaining, suspended and
+    abandoned generators, cross-feature GC, constrained heaps, and native-only
+    artifacts.
+
+- [x] **Gate 9 Slice 1 — ownership, canonical identity, state machine, and oracle matrix**
+  - Extend the existing narrow managed module registry into the one
+    deterministic module identity/state model specified by
+    [`spec/gates/9/README.md`](spec/gates/9/README.md).
+  - Do not claim stdlib or package compatibility from the Gate 7 module shells;
+    this slice owns canonical module identities, graph/state ownership, and the
+    proof matrix that later Gate 9 slices execute.
+
+## Completed Gate 9 discovery and native-module slices
+
+- [x] **Gate 9 Slice 2 — deterministic project discovery, graph edges, and diagnostics**
+  - Discover reachable project-owned source modules without executing them or
+    consulting ambient Python/venv state.
+  - Preserve canonical graph order, import source spans, hashes, and stable
+    no-artifact diagnostics as specified by
+    [`spec/gates/9/slice-2.md`](spec/gates/9/slice-2.md).
+
+- [x] **Gate 9 Slice 3 — per-module MIR/object emission, linking, and native initialization**
+  - Reachable source modules are independently analyzed and lowered, emitted as
+    deterministic native objects, and linked through the documented native
+    initializer ABI. Public chain/diamond proof covers one-time initialization,
+    isolated defining globals, CPython-matched output, and native-only symbols.
+
+## Completed Gate 9 cache and ordinary-import slices
+
+- [x] **Gate 9 Slice 4 — cached identity, initialization cycles, and failure rollback**
+  - The authoritative cache now preserves identity through direct/indirect
+    cycles, exposes partial modules, rolls failed initialization back for retry,
+    retains successful dependencies, and survives constrained heaps.
+- [x] **Gate 9 Slice 5 — plain and dotted imports, aliases, and binding order**
+  - Dotted prefixes initialize in order, ready children publish on parents,
+    explicit aliases bind leaves, unaliased imports bind the top-level module,
+    and imports use normal bindings in module/function/class/control/generator
+    scopes.
+
 ## Active gate
 
-- [ ] **Gate 5 Slice 6 — propagation, chaining, groups, and cleanup completion**
-  - Continue the existing Gate 5 conformance ledger at
-    [`spec/gates/5/README.md`](spec/gates/5/README.md); Slices 1–5 are already
-    complete and Slice 6 is the sole active compatibility slice.
-  - Preserve the single function/cell/exception/traceback/cleanup model and
-    close the remaining propagation/chaining/group/cleanup matrix before moving
-    to Gate 5 Slice 7.
+- [ ] **Gate 11 Slice 1 — modes, code-object contract, capabilities, and oracle matrix**
+
+## Completed Gate 9 package and cache-visibility slices
+
+- [x] **Gate 9 Slice 6 — `from` imports, `__all__`, star imports, and missing names**
+  - Named/aliased/parenthesized imports, statically resolved submodule fallback,
+    sequence-indexed dynamic `__all__`, public-name fallback, partial bindings,
+    managed failures, and illegal-scope no-artifact diagnostics now pass public
+    native differentials under a constrained heap.
+- [x] **Gate 9 Slice 7 — regular packages, `__init__`, relative imports, and metadata**
+  - Regular packages initialize through the authoritative module state machine;
+    level-one/level-two relative imports, parent ordering, reentrant cycles, and
+    managed module/loader/spec metadata match CPython at the public native edge.
+- [x] **Gate 9 Slice 8 — namespace packages, search roots, and parent publication**
+  - Ordered `module_roots` merge namespace portions through one managed module
+    identity, regular packages take Python-compatible precedence, children
+    publish on their parents, and namespace metadata survives constrained-heap
+    native differential proof.
+- [x] **Gate 9 Slice 9 — authoritative `sys.modules`, `__import__`, and cache mutation**
+  - `sys.modules` is the live context-owned cache used by imports; generic
+    `__import__` covers direct/fromlist/relative-level behavior and invalid
+    arguments, supported cache replacement/deletion/`None` entries match
+    CPython, and managed-growth preflight keeps cache mutations atomic when the
+    heap limit rejects an insertion.
+
+## Completed Gate 9 final slices
+
+- [x] **Gate 9 Slice 10 — import hooks, reload, invalidation, and reentrant loading**
+  - Managed `builtins.__import__` hooks, recursive callbacks, reload identity,
+    failure handling, and invalidation remain on the authoritative module state
+    machine and match CPython in the public differential.
+- [x] **Gate 9 Slice 11 — locked dependencies, package data, capabilities, and cache manifests**
+  - Locked resource hashes and deterministic build manifests are reproducible;
+    stale resource inputs fail before artifact publication.
+- [x] **Gate 9 Slice 12 — cross-feature composition, reentrancy, and constrained-heap stress**
+  - Cyclic imports, hooks, generator/context cleanup, repeated reload, and
+    `sys.modules` identity match CPython under a 64 KiB managed heap.
+- [x] **Gate 9 Slice 13 — reproducibility, final audit, documentation, and gate closure**
+  - Final workspace/native/runtime/doc, warning-denied Clippy, formatting/diff,
+    reproducibility, release-size, and forbidden-symbol boundaries are green.
+  - Gate 9 imports/modules/packages is closed as `Implemented — conformance audit pending`.
+
+## Completed Gate 10 foundation slices
+
+- [x] **Gate 10 Slice 1 — ownership, oracle matrix, benchmark harness, and fixed budgets**
+  - CPython 3.12.11 protocol/syntax oracles, target baseline distributions,
+    structural invariants, and fixed measured budgets are frozen and verified.
+- [x] **Gate 10 Slice 2 — async syntax, HIR/MIR suspension, resume, and injection contracts**
+  - `async def`/`await` reach owned syntax/HIR and explicit verified coroutine
+    suspension; invalid async placements match CPython and emit no artifact.
+- [x] **Gate 10 Slice 3 — coroutine objects, lazy calls, direct `await`, and lifecycle**
+  - Lazy native coroutine calls, direct nested await, completion/failure/reuse,
+    reflection, warnings, native-only artifacts, and constrained-heap behavior
+    match CPython through the public protocol fixture.
+
+## Completed Gate 10 executor/protocol slices
+
+- [x] **Gate 10 Slice 4 — executor facade, task identity, local scheduling, and completions**
+- [x] **Gate 10 Slice 5 — timers, wakeups, cancellation delivery, and buffer ownership**
+- [x] **Gate 10 Slice 6 — generic `__await__`, delegation, injected failures, and cleanup**
+- [x] **Gate 10 Slice 7 — async iteration, `async for`, and async comprehensions**
+  - Public/native and runtime acceptance covers the one-root ABI bridge, zero
+    synchronous async/backend reachability, deterministic wakes/timers,
+    cancellation and buffer lifetime, generic awaitable delegation, async
+    iteration/comprehensions/generator expressions, and constrained heaps.
+- [x] **Gate 10 Slice 8 — async generators, `asend`, `athrow`, `aclose`, and finalization**
+  - Public CPython 3.12 differentials now cover lazy async-generator objects,
+    complete operation/reuse/overlap behavior, await/yield interleaving,
+    exception injection, cancellation-style cleanup, reflection/tracebacks,
+    awaited close cleanup, ignored `GeneratorExit`, cyclic abandonment and
+    shutdown finalization, a 5,000-value stream under a 96 KiB managed heap,
+    invalid non-empty return diagnostics, and native-only artifacts.
+- [x] **Gate 10 Slice 9 — `async with`, partial entry, suppression, and suspended cleanup**
+  - Public CPython 3.12 proof covers type-level special lookup, multiple/partial
+    acquisition, target failures, every control transfer, suppression and
+    replacement, suspending/failing entry and exit, cancellation through
+    suspended cleanup, mixed sync/async managers, traceback frames, self-cycles,
+    and a 128 KiB managed-heap differential.
+  - Closure audit adds captured descriptors, custom truth/failure suppression,
+    exact missing-method errors, and cancellation during partial entry and exit.
+- [x] **Gate 10 Slice 10 — Compio adapter, static linking, CLI selection, and diagnostics**
+  - The concrete local Compio adapter directly drives one facade root with zero
+    Rimera wrapper/steady-poll allocation, public async artifacts statically
+    select Compio while sync controls retain zero backend symbols, and CLI/native
+    proof covers auto/explicit/project precedence, stable unavailable-backend
+    no-artifact diagnostics, metadata rendering, and the fixed release-size delta.
+  - Allocation proof includes 1,000 real Compio wake/poll cycles; CLI proof runs
+    produced artifacts and rejects unknown backend values and unsupported targets.
+- [x] **Gate 10 Slice 11 — cross-feature composition, GC, cancellation, and performance stress**
+  - Repeated CPython 3.12.11 public differentials compose the entire async language
+    surface under normal and 512 KiB heaps; race/model stress covers wake,
+    completion, cancellation, timers, shutdown/drop, re-entry, stale handles, and
+    many-root progress; all frozen release performance budgets pass.
+- [x] **Gate 10 Slice 12 — reproducibility, final audit, documentation, and gate closure**
+  - Full workspace/native/runtime/doc tests, warning-denied Clippy, formatting,
+    ABI layout, release-size/forbidden-symbol checks, frozen oracle evidence,
+    refreshed CPython/native distributions, and clean-cache reproducibility are
+    green. Gate 10 async/await/protocols is closed as `Implemented — conformance
+    audit pending` on macOS ARM64 with Compio; `asyncio` remains outside the gate.
+- [x] **Gate 10 Slice 13 — proven-ready AOT collapse and CPython performance lead**
+  - The checked-in release verifier now requires Rimera to beat CPython 3.12.11
+    on every comparable p50 speed/throughput row. Same-source create+immediate-
+    close is 2.34 ns p50 versus 63.94 ns CPython (27.35x faster), the pure-ready
+    million-await workload is 30.90x faster, and rebinding/low-heap/final-local
+    differentials prove the AOT eliminations retain the full semantic fallback.
 
 ## Queued compatibility gates
 
-These remain unchecked until their own end-to-end evidence lands. Gate 5 Slice 6
-is the sole active implementation slice after Gate 6 closure; the areas below
-remain separate compatibility promotions and must not be implied complete.
-- [ ] Reflection and introspection, split into the substantial slices in
-  [`spec/gates/7/README.md`](spec/gates/7/README.md).
-  - [x] Gate 7 Slice 1 — ownership, observability, differential matrix, and the
-    narrow cached managed `inspect`/`weakref` import prerequisite.
-  - [x] Gate 7 Slice 2 — native `globals`/`locals`/`vars`/`dir` namespace views,
-    retained snapshots, comprehension/generator scope semantics, GC, and
-    low-heap failure proof.
-  - [x] Gate 7 Slice 3 — generic-call identity/type relations and reflective
-    attribute helpers, including metaclass hooks, descriptor/custom-hook
-    precedence, aliases/rebinding, stable managed IDs, callback mutation, and
-    forced-GC CPython differential proof.
-  - [x] Gate 7 Slice 4 — managed function/code/cell metadata with stable
-    `__code__`/`__closure__` identity, authoritative signature/source metadata,
-    legal code/cell mutation, retained-metadata GC proof, and atomic low-heap
-    `MemoryError` behavior.
-  - [x] Gate 7 Slice 5 — managed exception/traceback/frame inspection with
-    stable frame identity/order, retained-local GC proof, mutation boundaries,
-    and atomic low-heap `MemoryError` behavior.
-  - [x] Gate 7 Slice 6 — managed generator identity/state/suspension metadata,
-    stable retained frames/locals, delegation transitions, terminal detachment,
-    and atomic low-heap publication proof.
-  - [x] Gate 7 Slice 7 — audited type/class method-table metadata plus owned
-    Python 3.12 PEP 695 function/class/type-alias parameters, managed
-    `__type_params__`, forced-GC proof, `float.fromhex`, and stable deferred
-    lazy-bound diagnostics.
-  - [x] Gate 7 Slice 8 — Python-level PEP 688 `__buffer__`/
-    `__release_buffer__` dispatch over the Gate 3 memoryview core, with shared
-    traced leases, nested-view lifetime proof, callback-error semantics,
-    exporter-cycle collection, and low-heap failed-construction atomicity.
-  - [ ] Gate 7 Slices 9–10 remain queued; the parent Gate 7 promotion stays
-    unchecked until its final Slice 10 audit.
-- [ ] Synchronous context managers, split into the queued substantial slices in
-  [`spec/gates/8/README.md`](spec/gates/8/README.md).
-- [ ] **Gate 9 — imports, packages, modules, and `sys.modules`**, split into
-  eight queued slices in [`spec/gates/9/README.md`](spec/gates/9/README.md).
-- [ ] **Gate 10 — async, await, and asynchronous protocols**, split into eight
-  queued slices in [`spec/gates/10/README.md`](spec/gates/10/README.md).
+These remain unchecked until their own end-to-end evidence lands. Gate 11 Slice 1
+is the sole active compatibility slice; later post-core areas remain separate
+promotions and must not be implied complete.
 - [ ] **Gate 11 — capability-governed `compile`, `eval`, `exec`, and runtime
   native compilation**, split into eight queued slices in
   [`spec/gates/11/README.md`](spec/gates/11/README.md).

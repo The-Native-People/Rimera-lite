@@ -9,10 +9,14 @@ use std::time::Instant;
 use clap::{Parser, Subcommand, ValueEnum};
 use rimera_compiler::BuildProgress;
 use rimera_compiler::core::{BuildProfile, Diagnostic, DiagnosticSet, TargetTriple};
-use rimera_compiler::project::{BuildRequest, CapabilitySet};
+use rimera_compiler::project::{AsyncBackend, BuildRequest, CapabilitySet};
 
 #[derive(Debug, Parser)]
-#[command(name = "rimera", version, about = "Rimera Lite native Python compiler")]
+#[command(
+    name = "rimera-lite",
+    version,
+    about = "Rimera Lite native Python compiler"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -36,9 +40,15 @@ enum Command {
         /// Write a readable MIR dump and print compiler trace details.
         #[arg(long)]
         debug: bool,
+        /// Select the local async executor backend for source-level root execution.
+        #[arg(long = "async", value_enum)]
+        async_backend: Option<AsyncBackendOption>,
         /// Limit managed heap memory for the generated executable.
         #[arg(long, value_name = "BYTES")]
         heap_limit_bytes: Option<u64>,
+        /// Include the native compile/eval/exec service (disabled by default).
+        #[arg(long)]
+        dynamic_compilation: bool,
     },
 }
 
@@ -47,6 +57,26 @@ enum Profile {
     #[default]
     Debug,
     Release,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum AsyncBackendOption {
+    #[default]
+    Auto,
+    Compio,
+    Monoio,
+    Tokio,
+}
+
+impl From<AsyncBackendOption> for AsyncBackend {
+    fn from(value: AsyncBackendOption) -> Self {
+        match value {
+            AsyncBackendOption::Auto => Self::Auto,
+            AsyncBackendOption::Compio => Self::Compio,
+            AsyncBackendOption::Monoio => Self::Monoio,
+            AsyncBackendOption::Tokio => Self::Tokio,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -90,6 +120,17 @@ enum CliFailure {
     Diagnostics(DiagnosticSet),
 }
 
+fn resolve_async_backend(
+    cli: Option<AsyncBackendOption>,
+    configured: Option<AsyncBackendOption>,
+) -> AsyncBackend {
+    cli.or(configured).unwrap_or_default().into()
+}
+
+fn async_backend_metadata(backend: AsyncBackend) -> String {
+    format!("async   {} · experimental", backend.as_str())
+}
+
 fn execute(cli: Cli, color: bool) -> Result<ExitCode, CliFailure> {
     match cli.command {
         Command::Build {
@@ -99,7 +140,9 @@ fn execute(cli: Cli, color: bool) -> Result<ExitCode, CliFailure> {
             target,
             profile,
             debug,
+            async_backend,
             heap_limit_bytes,
+            dynamic_compilation,
         } => {
             let project_root = find_project_root(&entry);
             let config = load_config(&project_root)?;
@@ -115,6 +158,7 @@ fn execute(cli: Cli, color: bool) -> Result<ExitCode, CliFailure> {
             };
             let debug = debug || config.debug.unwrap_or(false);
             let run = run || config.run.unwrap_or(false);
+            let async_backend = resolve_async_backend(async_backend, config.async_backend);
             let output = output
                 .or(config.output.map(|path| if path.is_absolute() { path } else { project_root.join(path) }))
                 .or_else(|| run.then(|| run_output_path(&entry)))
@@ -125,13 +169,15 @@ fn execute(cli: Cli, color: bool) -> Result<ExitCode, CliFailure> {
             let result = rimera_compiler::build_with_progress(
                 BuildRequest {
                     project_root,
+                    module_search_roots: config.module_roots,
                     entry,
                     output,
                     target,
                     profile,
-                    capabilities: CapabilitySet::default(),
+                    capabilities: CapabilitySet::from_names(dynamic_compilation.then(|| "dynamic_compilation".to_owned())),
                     debug,
                     heap_limit_bytes: heap_limit_bytes.or(config.heap_limit_bytes),
+                    async_backend,
                 },
                 |event| progress.render(event),
             );
@@ -203,7 +249,9 @@ struct RimeraConfig {
     profile: Option<Profile>,
     debug: Option<bool>,
     heap_limit_bytes: Option<u64>,
+    async_backend: Option<AsyncBackendOption>,
     run: Option<bool>,
+    module_roots: Vec<PathBuf>,
 }
 
 fn load_config(project_root: &Path) -> Result<RimeraConfig, CliFailure> {
@@ -240,6 +288,19 @@ fn load_config(project_root: &Path) -> Result<RimeraConfig, CliFailure> {
         })
         .transpose()?;
     let debug = rimera.get("debug").and_then(toml::Value::as_bool);
+    let async_backend = rimera
+        .get("async")
+        .and_then(toml::Value::as_str)
+        .map(|value| match value {
+            "auto" => Ok(AsyncBackendOption::Auto),
+            "compio" => Ok(AsyncBackendOption::Compio),
+            "monoio" => Ok(AsyncBackendOption::Monoio),
+            "tokio" => Ok(AsyncBackendOption::Tokio),
+            _ => Err(CliFailure::Message(format!(
+                "tool.rimera.async must be `auto`, `compio`, `monoio`, or `tokio`, not `{value}`"
+            ))),
+        })
+        .transpose()?;
     let heap_limit_bytes = rimera
         .get("heap_limit_bytes")
         .and_then(toml::Value::as_integer)
@@ -250,13 +311,34 @@ fn load_config(project_root: &Path) -> Result<RimeraConfig, CliFailure> {
         })
         .transpose()?;
     let run = rimera.get("run").and_then(toml::Value::as_bool);
+    let module_roots = rimera
+        .get("module_roots")
+        .map(|value| {
+            let values = value.as_array().ok_or_else(|| {
+                CliFailure::Message("tool.rimera.module_roots must be an array of paths".to_owned())
+            })?;
+            values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(PathBuf::from).ok_or_else(|| {
+                        CliFailure::Message(
+                            "every tool.rimera.module_roots entry must be a path string".to_owned(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(RimeraConfig {
         output,
         target,
         profile,
         debug,
         heap_limit_bytes,
+        async_backend,
         run,
+        module_roots,
     })
 }
 
@@ -418,6 +500,12 @@ impl ProgressRenderer {
             .unwrap_or(0);
         if self.color {
             eprintln!();
+            if let Some(backend) = artifact.async_backend {
+                eprintln!(
+                    "  \x1b[2m|-+ async\x1b[0m   \x1b[1m{}\x1b[0m \x1b[2m· experimental\x1b[0m",
+                    backend.as_str()
+                );
+            }
             if let Some(ir_dump) = &artifact.ir_dump {
                 eprintln!("\x1b[1;35mDebug:\x1b[0m");
                 eprintln!("  \x1b[2m-+ cache\x1b[0m  {}", artifact.cache_dir.display());
@@ -435,6 +523,9 @@ impl ProgressRenderer {
                 "\n\x1b[1mDone in {elapsed_seconds:.2}s\x1b[0m \x1b[2m+|+\x1b[0m \x1b[1mSize:\x1b[0m {bytes} bytes."
             );
         } else {
+            if let Some(backend) = artifact.async_backend {
+                eprintln!("  |-+ {}", async_backend_metadata(backend));
+            }
             if let Some(ir_dump) = &artifact.ir_dump {
                 eprintln!("Debug:");
                 eprintln!("  -+ cache  {}", artifact.cache_dir.display());
@@ -807,6 +898,36 @@ mod tests {
     }
 
     #[test]
+    fn async_backend_cli_overrides_project_configuration() {
+        assert_eq!(
+            resolve_async_backend(
+                Some(AsyncBackendOption::Tokio),
+                Some(AsyncBackendOption::Compio),
+            ),
+            AsyncBackend::Tokio
+        );
+        assert_eq!(
+            resolve_async_backend(None, Some(AsyncBackendOption::Compio)),
+            AsyncBackend::Compio
+        );
+        assert_eq!(resolve_async_backend(None, None), AsyncBackend::Auto);
+        assert_eq!(
+            async_backend_metadata(AsyncBackend::Compio),
+            "async   compio · experimental"
+        );
+    }
+
+    #[test]
+    fn build_command_accepts_async_backend_selection() {
+        let cli = Cli::try_parse_from([
+            "rimera", "build", "main.py", "--output", "app", "--async", "tokio",
+        ])
+        .unwrap();
+        let Command::Build { async_backend, .. } = cli.command;
+        assert_eq!(async_backend, Some(AsyncBackendOption::Tokio));
+    }
+
+    #[test]
     fn bare_source_entry_normalizes_to_the_build_command() {
         let cli = Cli::try_parse_from(normalize_arguments([
             OsString::from("rimera"),
@@ -836,15 +957,20 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("pyproject.toml"),
-            "[tool.rimera]\noutput = \"dist/app\"\nprofile = \"release\"\ndebug = true\nheap_limit_bytes = 4096\nrun = true\n",
+            "[tool.rimera]\noutput = \"dist/app\"\nprofile = \"release\"\ndebug = true\nasync = \"compio\"\nheap_limit_bytes = 4096\nrun = true\nmodule_roots = [\"src\", \"vendor\"]\n",
         )
         .unwrap();
         let config = load_config(&root).unwrap();
         assert_eq!(config.output, Some(PathBuf::from("dist/app")));
         assert_eq!(config.profile, Some(Profile::Release));
         assert_eq!(config.debug, Some(true));
+        assert_eq!(config.async_backend, Some(AsyncBackendOption::Compio));
         assert_eq!(config.heap_limit_bytes, Some(4096));
         assert_eq!(config.run, Some(true));
+        assert_eq!(
+            config.module_roots,
+            [PathBuf::from("src"), PathBuf::from("vendor")]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

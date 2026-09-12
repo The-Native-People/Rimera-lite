@@ -50,6 +50,8 @@ kernel and the Gate 5 contract before changing representations.
 - Focused ownership proof: `cargo test -p rimera-compiler --lib gate5_function -- --nocapture` -> 3 passed, 0 failed.
 - Public Slice 1 proof: both `gate5_slice1_*` tests pass, including CPython differentials, stable diagnostic spans/codes, native-only artifact assertions, and no-artifact later-gate failures.
 - Integration boundary: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, `cargo test --doc --workspace`, and `git diff --check` all pass. The workspace suite totals 257 tests: 3 ABI + 8 CLI + 40 compiler unit + 149 public native-pipeline + 57 runtime; 0 failed and 0 ignored.
-- Gate 5 is not promoted and `TODO.md`/`spec/compatibility.md` remain unchanged; Gate 6 stays the sole active tracker as required until Slice 8 performs the single Gate 5 promotion.
+- At this Slice 1 boundary Gate 5 was intentionally not promoted; the later
+  Slice 8 final audit performed the single Gate 5 promotion. Gates 7 and 8 have
+  also closed, Gate 9 Slice 1 has since closed, and Gate 9 Slice 2 is active.
 
 ## DONE BY CHATGPT

@@ -17,7 +17,7 @@ Build the compiler and runtime, then compile a source file:
 
 ```shell
 cargo build -p rimera-runtime -p rimera-cli
-target/debug/rimera build tests/fixtures/basic/core.py -o dist/core
+target/debug/rimera-lite build tests/fixtures/basic/core.py -o dist/core
 ./dist/core
 ```
 
@@ -27,7 +27,7 @@ Rimera writes this temporary executable under that source directory's
 
 ```shell
 cargo run tests/fixtures/basic/core.py --run
-# equivalently: target/debug/rimera tests/fixtures/basic/core.py --run
+# equivalently: target/debug/rimera-lite tests/fixtures/basic/core.py --run
 ```
 
 `cargo run -- tests/fixtures/basic/core.py --run` is also accepted when you
@@ -35,21 +35,21 @@ prefer Cargo's explicit argument separator.
 An explicit artifact path remains available when you want to keep the binary:
 
 ```shell
-target/debug/rimera build tests/fixtures/basic/core.py -o dist/core --run
+target/debug/rimera-lite build tests/fixtures/basic/core.py -o dist/core --run
 ```
 
 Use `--debug` to print the native build trace and write a readable `.ir.py`
 representation under `.rimera/ir/`:
 
 ```shell
-target/debug/rimera build tests/fixtures/basic/core.py -o dist/core --debug
+target/debug/rimera-lite build tests/fixtures/basic/core.py -o dist/core --debug
 ```
 
 Use `--heap-limit-bytes` to embed an optional managed-memory budget. Zero or an
 omitted option leaves the context unlimited:
 
 ```shell
-target/debug/rimera build tests/fixtures/basic/core.py -o dist/core --heap-limit-bytes 1048576
+target/debug/rimera-lite build tests/fixtures/basic/core.py -o dist/core --heap-limit-bytes 1048576
 ```
 
 To make a real, machine-calibrated Python source fixture for manually checking
@@ -57,7 +57,7 @@ the build loader, generate the approximately 20-second compile stress input:
 
 ```shell
 python3 scripts/generate_compile_stress.py --target-seconds 20
-target/debug/rimera build tests/fixtures/stress/compile_stress.py -o /tmp/rimera-stress --debug
+target/debug/rimera-lite build tests/fixtures/stress/compile_stress.py -o /tmp/rimera-stress --debug
 ```
 
 The generated stress source is intentionally ignored by Git; it is not part of

@@ -18,6 +18,11 @@ published target and compatibility matrix. None of those claims implies
 untested operating systems, undocumented CPython internals, or incompatible
 native extensions.
 
+The minimum Gate 16/17 flagship matrix includes pinned Flask, FastAPI,
+discord.py, and Pycord application profiles. Their base and optional dependency
+tiers are qualified separately; a successful import or toy route is not a
+package compatibility claim.
+
 ## Current position
 
 The native compiler foundation is established: Python source flows through
@@ -26,39 +31,44 @@ runtime linking.  It does not generate C, embed CPython, execute Python
 bytecode, or use host unwinding for Python exceptions.
 
 The execution kernel supports a meaningful but still bounded single-module
-subset. Functions, lexical scopes, structured exceptions, tracing GC, the
-Gate 1 class/object model, Gate 2 generic protocol dispatch, Gate 3 managed
-builtin values/collections, Gate 4 unpacking/comprehension/remaining synchronous
-source forms, and Gate 6 native synchronous generators are proven through the
-native pipeline. Gate 7 Slices 1–8 additionally prove the owned reflection
-matrix, `globals`/`locals`/`vars`/`dir` namespace views, the narrow cached managed
-`inspect`/`weakref` module-shell prerequisite, generic identity/type/attribute
-reflection, managed function/closure/signature/code metadata, managed
+subset. Gates 1–8 are closed through the native pipeline: functions, lexical
+scopes, structured exceptions, tracing GC, the class/object model, generic
+protocol dispatch, managed builtin values/collections, unpacking/comprehensions,
+synchronous generators, and reflection/introspection all have public CPython
+3.12.11 proof within their documented boundaries. Gate 7 includes namespace
+views, the narrow cached managed `inspect`/`weakref` module-shell prerequisite,
+generic identity/type/attribute reflection, managed function/code/cell,
 exception/traceback/frame and generator metadata, audited class/type method
-tables, Python 3.12 generic-declaration `__type_params__`, and Python-level PEP
-688 buffer-provider dispatch over the Gate 3 memoryview core. Gate 5's remaining
-function/LEGB/exception conformance slices, Gate 7 integration/final audit, the
-general import/package system, standard library, and ecosystem compatibility are
-not yet established.
+tables, Python 3.12 generic-declaration `__type_params__`, Python-level PEP 688
+buffer providers, mutation invalidation, cross-family GC composition, and
+low-heap atomicity. Gate 8 closes synchronous context managers through
+compiler-planned cleanup: manager lookup/entry/targets, multiple acquisition,
+all completion paths, exact exceptional triples, generic suppression,
+replacement/chaining, generator suspension/throw/close/abandonment, cross-core
+composition, GC, and low-heap proof. Gate 9 now closes the deterministic
+import/package system through hooks/reload, locked resources/manifests,
+cross-feature stress, and final reproducibility audit. The standard library,
+native-extension ABI, conformance corpus, and ecosystem compatibility remain
+separate later-gate work.
 
 | # | Compatibility area | Status | Proven scope |
 |---:|---|---|---|
-| 1 | Exceptions and errors | Substantial partial | Typed and tuple handlers, bindings, bare reraising, causes, context and suppression, `else`, `finally`, cleanup completion, native tracebacks, exception groups, and `except*` |
-| 2 | Function calling | Substantial partial | Native functions, recursion, lambdas, positional-only and keyword-only parameters, defaults, `*args`, `**kwargs`, and binding failures |
-| 3 | LEGB, scopes, and closures | Substantial partial | Compile-time locals, module globals, builtins fallback, `global`, `nonlocal`, mutable cells, and unbound-name errors |
+| 1 | Exceptions and errors | Implemented — conformance audit pending | Managed exception hierarchy/instances, normalization, traceback/cause/context/suppression, typed/tuple handlers, bare reraising, `else`/`finally`, cleanup completion, exception groups/`except*`, injected generator-handler resume state, GC, and low-heap failure atomicity within the Gate 5 contract |
+| 2 | Function calling | Implemented — conformance audit pending | Native functions/lambdas, recursion/reentrancy, all supported Python parameter kinds, defaults/keyword defaults/annotations/decorators, expanded-call binding, live function/code metadata, and binding failures through one authoritative binder |
+| 3 | LEGB, scopes, and closures | Implemented — conformance audit pending | Compile-time locals, globals/builtins fallback, `global`/`nonlocal`, mutable closure cells, class/comprehension interactions, deletion/unbound-name behavior, independent activations, and GC/lifetime proof through the Gate 5 scope model |
 | 4 | Core object model | Implemented — conformance audit pending | Lazy GC-rooted builtin types, compiled prepared-namespace class bodies, classes/instances, C3 MRO with atomic descendant `__bases__` planning, descriptor-aware attributes, supported slots, class cells, both supported `super` forms, metaclass selection/hooks, `__mro_entries__`, custom attribute hooks, traced list/tuple/dict/set subclass payloads, custom prepared mappings through item protocols, and source-ordered class-keyword forwarding |
 | 5 | Core builtin types | Implemented — conformance audit pending | Gate 3 managed `float`, `complex`, `bytes`, `bytearray`, `frozenset`, `slice`, dictionary views, and native-exporter `memoryview`; generic-call constructors, exact type identity, tracing/managed-size accounting, conversion, mutation/slicing, representation/formatting, iteration, and generic hash/equality collections within the documented boundaries |
 | 6 | Operators and dunder dispatch | Implemented — conformance audit pending | Shared ABI operator discriminants, direct/reflected/in-place dispatch including `@`, strict-subclass priority, rooted `NotImplemented`, identity comparisons, truth/length/hash/item/call/iteration/conversion/representation/formatting protocols, target-aware augmented assignment, and item deletion all reach the native pipeline. Exhaustive CPython edge-case parity remains a conformance audit. |
 | 7 | Iterators | Implemented — conformance audit pending | Native range, list, tuple, string, dictionary, set, generator-foundation, validated user `__iter__`/`__next__`, legacy `__getitem__` sequence fallback, containment fallback, and reverse iteration through `__reversed__` or `__len__`/`__getitem__` all reach `for` and public native fixtures. |
-| 8 | Generators | Implemented — conformance audit pending | Gate 4 generator expressions and Gate 6 source generators share one traced generator object/resume ABI. Source `yield`, resume values, lazy construction, `iter`/`next`/`send`/`throw`/`close`, return/`StopIteration.value`, GeneratorExit, PEP 479, suspension through handlers/finally, and generic nested `yield from` delegation are proven against CPython 3.12.11 under constrained heaps. Async generators/async iteration remain later async-gate work. |
+| 8 | Generators | Implemented — conformance audit pending | Gate 4 generator expressions, Gate 6 source generators, and Gate 10 Slice 8 async generators share the traced suspension/resume core. Synchronous `yield`/`send`/`throw`/`close`/`yield from` plus async-generator `__aiter__`/`__anext__`/`asend`/`athrow`/`aclose`, await/yield interleaving, GeneratorExit/finalization, reflection, cleanup, cycles, and constrained-heap long streams are proven against CPython 3.12.11 within their gate boundaries. |
 | 9 | Classes, inheritance, and MRO | Implemented — conformance audit pending | Compiled prepared-namespace class bodies, single/multiple inheritance, C3, atomic descendant `__bases__` planning, metaclass selection/hooks, builtin-storage subclasses, decorators, and supported explicit/zero-argument `super` |
 | 10 | Descriptors | Implemented — conformance audit pending | Data/non-data precedence across instances/classes/metaclasses, native property/static/class methods, custom `__get__`/`__set__`/`__delete__`, traced member descriptors, slots, and compiled class cells |
-| 11 | Context managers | Not started | No `with` or async context protocol |
-| 12 | Imports, modules, and `sys.modules` | Not started | The general loader/package/`sys.modules` system is not started. Gate 7 Slices 1–2 pull forward only `import name` / `import name as alias` for registered managed `inspect` and `weakref` module shells, with cached identity and live traced namespaces; this is infrastructure, not an import-system compatibility claim. |
+| 11 | Context managers | Implemented — conformance audit pending | Gate 8 synchronous `with` and Gate 10 Slice 9 `async with` share compiler-owned cleanup actions and type/MRO special-method lookup. Proven behavior covers supported targets, left-to-right acquisition/right-to-left exit, partial-entry unwind, normal/control/exception completion, exact exception triples, generic truth suppression, replacement/chaining, suspending/failing async entry and exit, cancellation through suspended cleanup, mixed sync/async nesting, traceback state, cycles, constrained heaps, and native-only artifacts. Stdlib `contextlib` remains later-gate work. |
+| 12 | Imports, modules, and `sys.modules` | Implemented — conformance audit pending | Gate 9 proves deterministic discovery, per-module native objects/initialization, cycles and rollback/retry, ordinary/dotted/`from` imports, regular and namespace packages, relative levels, managed metadata/parent publication, authoritative live `sys.modules`, Python-visible `__import__`, hook rebinding/reentrant imports, reload/invalidation, locked resources/manifests, constrained-heap cross-feature stress, reproducibility, and no-artifact failure boundaries within declared compiled roots. Stdlib import breadth, native extensions, wheels, and arbitrary PyPI remain later-gate work. |
 | 13 | Builtins | Implemented — conformance audit pending | Gate 3 audits the complete 57-name synchronous builtin/type namespace owned by the finished core as lazy, first-class, aliasable, and rebindable, including constructors, numeric/collection/iteration helpers, predicates, sorting/reduction, formatting/representation, and supported attribute helpers. Imports, dynamic compilation, async helpers, broad reflection method tables, and stdlib-dependent behavior remain explicitly later-gate owned. |
 | 14 | Comprehensions and unpacking | Implemented — conformance audit pending | Recursive exact/starred/chained targets across normal and class-body execution, `for`/comprehension destructuring, dictionary unpacking, expanded calls, list/set/dict comprehensions, and executable generator expressions with CPython 3.12.11 differential, GC, failure-atomicity, and release-artifact proof |
-| 15 | Reflection and introspection | Small partial | Gate 7 Slices 1–8 now prove the single-owner reflection matrix; native `globals`, `locals`, `vars`, and `dir` namespace semantics; narrow managed module-shell composition; generic identity/type/attribute reflection; managed function/code/cell, exception/traceback/frame, and generator metadata; audited class `__dict__`/`__bases__`/`__mro__`/`__name__`/`__qualname__`/`__module__` behavior; normal class-level `float.fromhex`; Python 3.12 `T`/`*Ts`/`**P` function/class/type-alias parameters with managed `__type_params__`; and Python-level PEP 688 `__buffer__`/`__release_buffer__` providers with shared traced leases. Retained metadata/provider graphs survive forced GC, final buffer release is exactly-once across derived views/failure/cycles, and low-heap publication/construction is atomic. Lazy PEP 695 bounds/constraints remain a stable `RIM-CAP-G7-03` boundary; mutation/composition integration and final audit remain Slices 9–10. |
-| 16 | Async and await | Not started | Syntax and execution are deferred |
+| 15 | Reflection and introspection | Implemented — conformance audit pending | Gate 7 Slices 1–10 prove the single-owner reflection matrix: native `globals`/`locals`/`vars`/`dir`; narrow managed module-shell composition; generic identity/type/attribute helpers; managed function/code/cell, exception/traceback/frame, generator, class/type, and Python 3.12 type-parameter metadata; Python-level PEP 688 providers with shared traced leases; descendant/metaclass observer invalidation; reflective mutation/base-change atomicity; and cross-family GC/reentrancy composition. Lazy PEP 695 bounds/constraints remain `RIM-CAP-G7-03`; general imports, dynamic compilation, weakrefs, async reflection, and the `inspect` stdlib API remain later-gate boundaries. |
+| 16 | Async and await | Implemented — conformance audit pending | Gate 10 closes the owned Python 3.12 async language/protocol surface on macOS ARM64 with the Compio backend: async syntax/MIR, lazy native coroutines, direct/generic awaitables, async iteration/comprehensions, async generators/finalization, `async with`, cancellation/cleanup, managed buffer lifetime, and the one-root execution boundary. Slice 13 additionally qualifies guarded AOT ready-await and nonescaping create/close elimination: every comparable checked-in p50 speed/throughput row beats CPython 3.12.11, same-source create+close is 2.34 ns effective p50 (27.35x faster), and the pure-ready million-await workload is 30.90x faster, while materialized lifecycle cost remains a separate diagnostic and rebinding/low-heap cases retain the generic path. `--async`/`tool.rimera.async` provide auto/compio selection plus stable unavailable Monoio/Tokio diagnostics, while synchronous artifacts retain zero backend reachability. Constrained-heap composition, race/model stress, zero steady-state adapter allocation, fixed latency/memory/throughput/size budgets, reproducibility, ABI/workspace/release audits, and native-only artifacts are green. This does not implement stdlib `asyncio`, networking, subprocesses, framework compatibility, or cross-thread task guarantees. |
 | 17 | `eval`, `exec`, and runtime compilation | Not started | No dynamic-code pipeline |
 | 18 | Weak references and finalizers | Phase reserved only | GC has a lifecycle phase boundary but exposes neither behavior |
 | 19 | Python 3.12 edge semantics | Narrow partial | Selected floor arithmetic, call binding, exception cleanup, and traceback behavior |
@@ -105,14 +115,17 @@ These are defects or deliberate boundaries, not completed architecture:
   class-body targets, and generic single-pass iterators. Extended unpacking
   preserves CPython's observable second `iter()` callback on the current
   iterator before draining the starred remainder, without source re-evaluation
-  or rewind.
+  or rewind. Sequence-display unpacking such as `[*items]`, `(*items,)`, and
+  `{*items}` is still rejected because the syntax converter does not yet own a
+  starred display element. That is a remaining language-conformance gap for the
+  Gate 13 syntax/container inventory, not evidence that Gate 10 async is open.
 - Gate 3's owned builtin namespace, managed conversions, collection protocols,
   normalized builtin slicing, and forward/reverse iterator helpers are complete
   within their documented boundaries. Gate 6 synchronous generator lifecycle is
-  now complete through the permanent native resume ABI. Remaining gaps are owned
-  explicitly by later work: Gate 7 mutation/composition/final-audit reflection,
-  async generators/iteration, and the final Unicode/codec corpus for
-  surrogate-preserving Python string behavior.
+  complete through the permanent native resume ABI, and Gate 10 Slices 7–8 now
+  close the owned async-iteration and async-generator protocol boundaries. Gate
+  7's reflection integration/final audit is also closed. The remaining string
+  gap is the later Unicode/codec corpus for surrogate-preserving Python behavior.
 - Class inheritance accepts Rimera user classes, `object`, and the supported
   list/tuple/dict/set/float/complex/bytes/bytearray/frozenset storage layouts.
   Those subclasses share builtin construction semantics, keep native payloads
@@ -250,32 +263,35 @@ These are defects or deliberate boundaries, not completed architecture:
 - Gate 6 completes synchronous generator allocation/resumption on the documented
   native ABI with exact GC ownership: source `yield`, suspension-aware MIR/codegen,
   `StopIteration.value`, `send`, `throw`, `close`, PEP 479, cleanup suspension,
-  and generic `yield from` delegation are all public native behavior. Async
-  generators and async iteration remain separate later-gate boundaries.
+  and generic `yield from` delegation are all public native behavior. Gate 10
+  Slices 7–8 extend that suspension foundation with the separately proven async
+  iteration and async-generator protocol/finalization boundaries.
 
 ## Active dependency order
 
-Gates 1–4 and Gate 6 are closed. The resume board's sole active compatibility
-slice is **Gate 5 Slice 6 — propagation, chaining, groups, and cleanup completion**:
+The Slice 9/10 closure audit expands public proof with descriptor capture across
+entry suspension/class mutation, custom suppression truth failures, exact async
+manager missing-method errors, and cancellation during partial entry and exit
+at normal and 128 KiB heap limits. Compio's actual backend wake/poll path has
+zero measured allocations over 1,000 warmed cycles. CLI proof executes produced
+artifacts and covers invalid backend/target no-artifact boundaries. The parallel
+native suite also verifies the repaired per-process manifest-publication race.
 
-1. Gate 5 Slice 6 — continue the existing function/LEGB/structured-exception
-   closure on the one binder/cell/exception/traceback/cleanup model. Slices 1–5
-   are complete; then execute Gate 5 Slices 7–8 in numeric order from
-   [`spec/gates/5/README.md`](gates/5/README.md).
-2. Gate 7 Slices 1–8 are closed as deliberately pulled-forward ownership,
-   namespace, identity, function-metadata, traceback/frame, generator-metadata,
-   type-metadata, and Python-level buffer-provider prerequisites without
-   promoting the Gate 7 compatibility row. Gate 7 Slices 9–10 and Gate 8
-   synchronous context managers remain queued in
-   [`spec/gates/7/README.md`](gates/7/README.md) and
-   [`spec/gates/8/README.md`](gates/8/README.md); earlier gates do not imply
-   their completion.
-3. After Gates 5, 7, and 8 close, execute the queued post-core gates in numeric
-   order: [Gate 9 imports/modules](gates/9/README.md),
-   [Gate 10 async](gates/10/README.md),
-   [Gate 11 dynamic compilation](gates/11/README.md), and
+Gates 1–10 are closed. Gate 9's deterministic module graph and Gate 10's native
+async language/protocol stack are both proven against CPython 3.12.11 within
+their published boundaries, including Slice 13's all-comparable-row performance
+qualification, constrained-heap composition, and final artifact/reproducibility
+audits. The resume board's sole active compatibility
+slice is **Gate 11 Slice 1 — modes, code-object contract, capabilities, and
+oracle matrix**.
+
+1. Gate 11 now executes in numeric order from
+   [`spec/gates/11/README.md`](gates/11/README.md), extending Rimera's existing
+   parser/sema/MIR/Cranelift path without introducing Python bytecode or an
+   interpreter.
+2. Continue later post-core gates in numeric order after Gate 11 with
    [Gate 12 weak references/finalizers](gates/12/README.md).
-4. Then run [Gate 13 language/runtime conformance](gates/13/README.md),
+3. Then run [Gate 13 language/runtime conformance](gates/13/README.md),
    [Gate 14 standard library](gates/14/README.md),
    [Gate 15 native extensions/platform ABI](gates/15/README.md),
    [Gate 16 packaging/ecosystem compatibility](gates/16/README.md), and

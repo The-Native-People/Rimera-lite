@@ -31,6 +31,8 @@ stdlib, or PyPI compatibility.
 - Final boundary is green: `cargo fmt --check`; `cargo clippy --workspace -- -D warnings`; `cargo test --workspace` with 3 ABI + 8 CLI + 40 compiler + 159 public native-pipeline + 59 runtime = **269 passed, 0 failed, 0 ignored**; explicit workspace doc tests; and `git diff --check`.
 - `/opt/homebrew/bin/python3.12` is Python 3.12.11. `scripts/verify_release.sh` executes `hello`, reports **485,176 bytes** (≤524,288), and passes its forbidden `rv_`/`Py_`/`PyObject`/`setjmp`/`longjmp` symbol scan.
 - The audit also repaired inherited Gate 5 release reachability debt: exception-class normalization moved from core `raise_value` to the source-level `rimera_raise` boundary, retaining user-exception construction semantics while restoring dead stripping from 818,536 bytes to the accepted release size.
-- Gate 6 is closed. Gate 5 is not promoted complete: Slices 1–5 remain done and **Gate 5 Slice 6** becomes the sole active compatibility slice.
+- Gate 6 is closed. Subsequent work has also closed Gates 5, 7, and 8; Gate 9
+  Slice 1 is now the sole active compatibility slice. The historical Gate 6
+  evidence and counts above remain the acceptance record for this slice.
 
 ## DONE BY CHATGPT

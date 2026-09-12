@@ -24,3 +24,20 @@ native synchronous core rather than passing isolated fixtures.
 
 A compact composition corpus matches CPython 3.12.11 stdout, stderr, status,
 traceback shape, and side-effect order under normal and constrained heaps.
+
+## Acceptance evidence — 2026-09-04
+
+- `gate5_slice7_cross_feature_composition_matches_cpython_312_under_gc_pressure`
+  reuses the established Gate 4/Gate 5/Gate 6 composition corpus under a
+  160,000-byte heap limit, covering class/descriptors, comprehensions, expanded
+  calls, scopes/cells, defaults/metadata cycles, generators, cleanup, and
+  callbacks through the public build path.
+- `gate5_exception_graphs_survive_low_heap_collection_and_failed_metadata_is_atomic`
+  remains green for rooted exception graphs, collection, and failed metadata
+  publication.
+- The final audit finds one authoritative binder, `CellObject`,
+  `ExceptionObject`, `TracebackObject`, and compiler `CleanupAction` model; no
+  Gate 5 ignored tests, `todo!`, `unimplemented!`, or host-unwind escape path is
+  present.
+
+## DONE BY CHATGPT

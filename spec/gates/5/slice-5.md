@@ -37,6 +37,8 @@ Complete the managed Python exception value model used by all native failures.
 - `spec/abi-v1.md` documents traced exception dictionaries/metadata, class normalization through the generic call path, same-function raise-site traceback attachment, and traceback attribute behavior.
 - Integration boundary: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, `cargo test --doc --workspace`, and `git diff --check` all pass.
 - Full workspace test total: 262 passed, 0 failed, 0 ignored (3 ABI + 8 CLI + 40 compiler unit + 153 public native-pipeline + 58 runtime).
-- Gate 5 is not promoted; compatibility/TODO promotion remains Slice 8-owned and Gate 6 remains the sole active implementation tracker.
+- At this Slice 5 boundary promotion remained Slice 8-owned; the later Slice 8
+  audit closed Gate 5. Gates 7, 8, and Gate 9 Slice 1 have also closed; Slice 2 is the
+  current active implementation tracker.
 
 ## DONE BY CHATGPT

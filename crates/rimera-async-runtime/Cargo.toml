@@ -1,0 +1,15 @@
+[package]
+name = "rimera-async-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Compio 0.17 is the newest line compatible with Rimera's pinned Rust 1.92
+# toolchain; newer releases currently require std APIs stabilized later.
+compio = { version = "=0.17.0", default-features = false, features = ["runtime", "time", "polling"] }
+rimera-abi = { path = "../rimera-abi" }
+
+[lints]
+workspace = true

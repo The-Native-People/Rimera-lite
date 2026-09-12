@@ -25,3 +25,12 @@ adding execution behavior.
 Syntax/HIR/MIR ownership and verifier tests are green, public negative fixtures
 have stable spans/codes, and every synchronous `with` outcome has one planned
 cleanup path and later slice.
+
+## Status
+
+Complete. Rimera-owned syntax and HIR preserve ordered items, assignment
+targets, bodies, and source spans; `async with` remains the stable
+`RIM-CAP-G8-01` no-artifact boundary. MIR owns captured special methods,
+exception-state operations, and `ContextExit` cleanup actions. The lowering
+verifier/root test proves target failures enter cleanup and captured exits stay
+live across normal and exceptional call safepoints.

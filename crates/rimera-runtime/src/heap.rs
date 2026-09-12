@@ -6,6 +6,20 @@ pub(crate) const MIN_COLLECTION_THRESHOLD: usize = 64 * 1024;
 
 pub(crate) type HeapObject = ManagedObject;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifecycleAction {
+    FinalizeBufferLease(RValue),
+    CloseGenerator(RValue),
+}
+
+impl LifecycleAction {
+    fn value(self) -> RValue {
+        match self {
+            Self::FinalizeBufferLease(value) | Self::CloseGenerator(value) => value,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Slot {
     generation: u32,
@@ -72,7 +86,14 @@ impl Heap {
     }
 
     pub(crate) fn allocate(&mut self, object: HeapObject) -> RValue {
-        self.refresh_managed_bytes();
+        self.allocate_cached(object)
+    }
+
+    /// Allocate using the byte total maintained by the heap itself instead of
+    /// rescanning every live object first. Callers may use this only when
+    /// mutable managed growth does not need an exact heap-limit check at this
+    /// boundary; a collection refreshes the total before tracing/sweeping.
+    pub(crate) fn allocate_cached(&mut self, object: HeapObject) -> RValue {
         let size = object.managed_size();
         let value = if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
@@ -128,7 +149,10 @@ impl Heap {
             .collect()
     }
 
-    pub(crate) fn collect(&mut self, roots: impl IntoIterator<Item = RValue>) -> Vec<RValue> {
+    pub(crate) fn collect(
+        &mut self,
+        roots: impl IntoIterator<Item = RValue>,
+    ) -> Vec<LifecycleAction> {
         debug_assert_eq!(self.phase, CollectionPhase::Idle);
         self.refresh_managed_bytes();
         self.collections += 1;
@@ -137,11 +161,11 @@ impl Heap {
         self.mark_values(worklist);
 
         self.phase = CollectionPhase::Lifecycle;
-        let finalizers = self.process_lifecycle_hooks();
+        let lifecycle_actions = self.process_lifecycle_hooks();
         self.phase = CollectionPhase::Sweep;
         self.sweep();
         self.phase = CollectionPhase::Idle;
-        finalizers
+        lifecycle_actions
     }
 
     fn mark_values(&mut self, mut worklist: Vec<RValue>) {
@@ -163,7 +187,7 @@ impl Heap {
         }
     }
 
-    fn process_lifecycle_hooks(&mut self) -> Vec<RValue> {
+    fn process_lifecycle_hooks(&mut self) -> Vec<LifecycleAction> {
         // First remove dead user-visible views from their shared PEP 688 lease.
         // A still-marked lease means another derived view remains alive.
         let leases_from_dead_views = self
@@ -189,7 +213,7 @@ impl Heap {
         // phase. Preserve each unreachable provider lease and its traced graph
         // for one turn; RimeraContext runs __release_buffer__, then collects
         // again to reclaim the now-finalized cycle.
-        let finalizers = self
+        let mut lifecycle_actions = self
             .slots
             .iter()
             .enumerate()
@@ -199,16 +223,43 @@ impl Heap {
                 }
                 match slot.object.as_ref() {
                     Some(HeapObject::BufferLease(lease)) if !lease.released => {
-                        Some(RValue::handle(
+                        Some(LifecycleAction::FinalizeBufferLease(RValue::handle(
                             u32::try_from(index).expect("heap slot index must fit the handle ABI"),
                             slot.generation,
-                        ))
+                        )))
                     }
                     _ => None,
                 }
             })
             .collect::<Vec<_>>();
-        self.mark_values(finalizers.clone());
+        lifecycle_actions.extend(self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            if slot.marked {
+                return None;
+            }
+            match slot.object.as_ref() {
+                Some(HeapObject::Generator(generator))
+                    if !generator.running
+                        && !generator.closed
+                        && !generator.completed
+                        && !generator.finalizer_ran
+                        && (generator.started
+                            || generator.kind == crate::object::SuspendedKind::Coroutine) =>
+                {
+                    Some(LifecycleAction::CloseGenerator(RValue::handle(
+                        u32::try_from(index).expect("heap slot index must fit the handle ABI"),
+                        slot.generation,
+                    )))
+                }
+                _ => None,
+            }
+        }));
+        self.mark_values(
+            lifecycle_actions
+                .iter()
+                .copied()
+                .map(LifecycleAction::value)
+                .collect(),
+        );
 
         // Native bytearray export counting remains one obligation per native
         // memoryview. Provider-derived views carry a lease instead and do not
@@ -233,7 +284,7 @@ impl Heap {
                 bytes.exports = bytes.exports.saturating_sub(1);
             }
         }
-        finalizers
+        lifecycle_actions
     }
 
     fn sweep(&mut self) {
@@ -257,6 +308,10 @@ impl Heap {
                 );
             }
         }
+    }
+
+    pub(crate) const fn cached_live_bytes(&self) -> usize {
+        self.live_bytes
     }
 
     pub(crate) fn live_bytes(&self) -> usize {

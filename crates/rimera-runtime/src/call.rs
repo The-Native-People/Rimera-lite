@@ -12,9 +12,198 @@ use crate::ParameterKind;
 use crate::RimeraContext;
 use crate::heap::HeapObject;
 use crate::object::{
+    AsyncGeneratorOperationKind, AsyncGeneratorOperationObject, AsyncNextAwaitableObject,
     BuiltinFunctionKind, CallArgumentsObject, CodeObject, DictionaryObject, FunctionObject,
     TYPE_FLAG_BUILTIN, TypeLayout,
 };
+
+fn exact_positional_target(
+    context: &RimeraContext,
+    callable: RValue,
+    positional_len: usize,
+) -> Option<(RValue, crate::object::FunctionKind, usize, u32)> {
+    let HeapObject::Function(function) = context.heap.get(callable)? else {
+        return None;
+    };
+    (function.fast_call.positional_arity() == Some(positional_len)).then_some((
+        function.globals,
+        function.fast_call.kind(),
+        function.fast_call.code_address,
+        function.fast_call.first_line,
+    ))
+}
+
+fn invoke_native_entry_rooted(
+    context: &mut RimeraContext,
+    callable: RValue,
+    positional: &[RValue],
+    globals: RValue,
+    code_address: usize,
+) -> Result<RValue, String> {
+    let mut output = RValue::NONE;
+    // SAFETY: code objects hold stable native function addresses emitted for
+    // the current executable. Ready-coroutine entries use this same ordinary
+    // five-argument native ABI by construction.
+    let native: RNativeFunction = unsafe { std::mem::transmute(code_address) };
+    context.push_active_call(callable, positional.first().copied());
+    let switched_globals = context.globals() != Some(globals);
+    if switched_globals {
+        context.push_module_namespace(globals);
+    }
+    // SAFETY: callers guarantee that `callable` and the borrowed positional
+    // slice stay rooted for the complete native activation. Generated callers
+    // publish them in the caller root frame before entering this helper.
+    let status = unsafe {
+        native(
+            std::ptr::from_mut(context).cast::<c_void>(),
+            &raw const callable,
+            positional.as_ptr(),
+            positional.len(),
+            &raw mut output,
+        )
+    };
+    if switched_globals {
+        context.pop_module_namespace(globals);
+    }
+    context.pop_active_call();
+    match status {
+        RStatus::Ok => Ok(output),
+        RStatus::Exception => Err("called function raised an exception".to_owned()),
+        RStatus::InvalidArgument => Err("called function rejected its bound arguments".to_owned()),
+        RStatus::AbiMismatch => Err("called function uses an incompatible Rimera ABI".to_owned()),
+    }
+}
+
+fn invoke_exact_positional_rooted(
+    context: &mut RimeraContext,
+    callable: RValue,
+    positional: &[RValue],
+    globals: RValue,
+    kind: crate::object::FunctionKind,
+    code_address: usize,
+    first_line: u32,
+) -> Result<RValue, String> {
+    match kind {
+        crate::object::FunctionKind::Generator { .. } => {
+            context.new_generator_rooted(callable, positional)
+        }
+        crate::object::FunctionKind::Coroutine {
+            persistent_slot_count,
+        } => context.new_coroutine_known_rooted(
+            callable,
+            positional,
+            code_address,
+            persistent_slot_count,
+            first_line,
+        ),
+        crate::object::FunctionKind::AsyncGenerator { .. } => {
+            context.new_async_generator_rooted(callable, positional)
+        }
+        crate::object::FunctionKind::Normal => {
+            invoke_native_entry_rooted(context, callable, positional, globals, code_address)
+        }
+    }
+}
+
+/// Attempts the Gate 10 Slice 13 allocation-free `await f(args)` lane.
+///
+/// A match is possible only for an exact managed Rimera coroutine function
+/// whose compiler-created metadata advertises an ordinary-call entry proven
+/// incapable of suspension and whose positional shape can bypass the generic
+/// binder. A miss is side-effect free: the caller may immediately perform the
+/// ordinary lazy coroutine call using the same already-evaluated values.
+pub(crate) fn invoke_ready_coroutine_rooted(
+    context: &mut RimeraContext,
+    callable: RValue,
+    positional: &[RValue],
+    pure_only: bool,
+) -> Result<Option<RValue>, String> {
+    let Some(HeapObject::Function(function)) = context.heap.get(callable) else {
+        return Ok(None);
+    };
+    let metadata = function.fast_call;
+    let globals = function.globals;
+    if metadata.positional_arity() != Some(positional.len())
+        || !matches!(metadata.kind(), crate::object::FunctionKind::Coroutine { .. })
+        || (pure_only && !metadata.ready_coroutine_repeat_pure)
+    {
+        return Ok(None);
+    }
+    let Some(code_address) = metadata.ready_coroutine_code_address() else {
+        return Ok(None);
+    };
+    invoke_native_entry_rooted(context, callable, positional, globals, code_address).map(Some)
+}
+
+/// Probes an exact managed `range` for Slice 13 loop collapse without
+/// allocating an iterator or Python integers. Values outside the immediate
+/// i64 representation deliberately miss and preserve the generic path.
+pub(crate) fn coroutine_close_elide_probe(context: &RimeraContext, callable: RValue) -> bool {
+    if !context.heap_limit_is_unbounded() {
+        return false;
+    }
+    let Some(HeapObject::Function(function)) = context.heap.get(callable) else {
+        return false;
+    };
+    function.fast_call.positional_arity() == Some(0)
+        && matches!(
+            function.fast_call.kind(),
+            crate::object::FunctionKind::Coroutine { .. }
+        )
+}
+
+pub(crate) fn range_collapse_probe(
+    context: &RimeraContext,
+    value: RValue,
+) -> Option<(RValue, RValue, bool)> {
+    let HeapObject::Range(range) = context.heap.get(value)? else {
+        return None;
+    };
+    let start = range.start.to_i64()?;
+    let stop = range.stop.to_i64()?;
+    let step = range.step.to_i64()?;
+    if step == 0 {
+        return None;
+    }
+    let nonempty = if step > 0 { start < stop } else { start > stop };
+    if !nonempty {
+        return Some((RValue::NONE, RValue::NONE, false));
+    }
+    let start_i = i128::from(start);
+    let stop_i = i128::from(stop);
+    let step_i = i128::from(step);
+    let count_minus_one = if step_i > 0 {
+        (stop_i - 1 - start_i) / step_i
+    } else {
+        (start_i - 1 - stop_i) / -step_i
+    };
+    let last = i64::try_from(start_i + count_minus_one * step_i).ok()?;
+    Some((RValue::small_int(start), RValue::small_int(last), true))
+}
+
+/// Fast lane for generated positional calls whose callable and argument values
+/// are already published in the caller's GC root frame. Dynamic callables still
+/// fall through to the full Python dispatcher.
+pub(crate) fn invoke_rooted_positional(
+    context: &mut RimeraContext,
+    callable: RValue,
+    positional: &[RValue],
+) -> Result<RValue, String> {
+    if let Some((globals, kind, code_address, first_line)) =
+        exact_positional_target(context, callable, positional.len())
+    {
+        return invoke_exact_positional_rooted(
+            context,
+            callable,
+            positional,
+            globals,
+            kind,
+            code_address,
+            first_line,
+        );
+    }
+    invoke(context, callable, positional, &[])
+}
 
 pub(crate) fn invoke(
     context: &mut RimeraContext,
@@ -155,6 +344,38 @@ pub(crate) fn invoke(
             BuiltinFunctionKind::IsSubclass => invoke_issubclass(context, positional, keywords),
             BuiltinFunctionKind::Iter => invoke_iter(context, positional, keywords),
             BuiltinFunctionKind::Next => invoke_next(context, positional, keywords),
+            BuiltinFunctionKind::AIter => invoke_aiter(context, positional, keywords),
+            BuiltinFunctionKind::ANext => invoke_anext(context, positional, keywords),
+            BuiltinFunctionKind::AsyncRuntimeRun => {
+                invoke_async_runtime_run(context, positional, keywords)
+            }
+            BuiltinFunctionKind::AsyncGeneratorIter => {
+                invoke_async_generator_iter(context, positional, keywords)
+            }
+            BuiltinFunctionKind::AsyncGeneratorNext => {
+                invoke_async_generator_next(context, positional, keywords)
+            }
+            BuiltinFunctionKind::AsyncGeneratorSend => {
+                invoke_async_generator_send(context, positional, keywords)
+            }
+            BuiltinFunctionKind::AsyncGeneratorThrow => {
+                invoke_async_generator_throw(context, positional, keywords)
+            }
+            BuiltinFunctionKind::AsyncGeneratorClose => {
+                invoke_async_generator_close(context, positional, keywords)
+            }
+            BuiltinFunctionKind::AsyncGeneratorOperationNext => {
+                invoke_async_generator_operation_next(context, positional, keywords)
+            }
+            BuiltinFunctionKind::AsyncGeneratorOperationSend => {
+                invoke_async_generator_operation_send(context, positional, keywords)
+            }
+            BuiltinFunctionKind::AsyncGeneratorOperationThrow => {
+                invoke_async_generator_operation_throw(context, positional, keywords)
+            }
+            BuiltinFunctionKind::AsyncGeneratorOperationClose => {
+                invoke_async_generator_operation_close(context, positional, keywords)
+            }
             BuiltinFunctionKind::TypePrepare => invoke_type_prepare(context, positional, keywords),
             BuiltinFunctionKind::Property => invoke_property(context, positional, keywords),
             BuiltinFunctionKind::StaticMethod => {
@@ -174,6 +395,17 @@ pub(crate) fn invoke(
             BuiltinFunctionKind::Vars => invoke_vars(context, positional, keywords),
             BuiltinFunctionKind::Globals => invoke_globals(context, positional, keywords),
             BuiltinFunctionKind::Locals => invoke_locals(context, positional, keywords),
+            BuiltinFunctionKind::Import => invoke_import(context, positional, keywords),
+            BuiltinFunctionKind::Reload => invoke_reload(context, positional, keywords),
+            BuiltinFunctionKind::InvalidateImportCaches => {
+                invoke_invalidate_import_caches(positional, keywords)
+            }
+            BuiltinFunctionKind::ReadBinaryResource => {
+                invoke_read_binary_resource(context, positional, keywords)
+            }
+            BuiltinFunctionKind::Compile => crate::dynamic::compile(context, positional, keywords),
+            BuiltinFunctionKind::Eval => crate::dynamic::execute(context, positional, keywords, true),
+            BuiltinFunctionKind::Exec => crate::dynamic::execute(context, positional, keywords, false),
             BuiltinFunctionKind::FloatConjugate => {
                 invoke_float_conjugate(context, positional, keywords)
             }
@@ -360,6 +592,26 @@ pub(crate) fn invoke(
             invoke(context, method, positional, keywords)
         });
     }
+
+    if keywords.is_empty()
+        && let Some((globals, kind, code_address, first_line)) =
+            exact_positional_target(context, callable, positional.len())
+    {
+        return context.with_temporary_roots(&[callable], |context| {
+            context.with_temporary_roots(positional, |context| {
+                invoke_exact_positional_rooted(
+                    context,
+                    callable,
+                    positional,
+                    globals,
+                    kind,
+                    code_address,
+                    first_line,
+                )
+            })
+        });
+    }
+
     let function = match context.heap.get(callable) {
         Some(HeapObject::Function(function)) => function.clone(),
         _ => return Err("object is not callable".to_owned()),
@@ -369,7 +621,7 @@ pub(crate) fn invoke(
         _ => return Err("function has an invalid code object".to_owned()),
     };
     let mut roots = Vec::with_capacity(positional.len() + keywords.len() + 7);
-    roots.extend([callable, function.code]);
+    roots.extend([callable, function.code, function.globals]);
     roots.extend_from_slice(positional);
     roots.extend(keywords.iter().map(|(_, value)| *value));
     function
@@ -391,8 +643,17 @@ pub(crate) fn invoke(
     context.with_temporary_roots(&roots, |context| {
         let bound = bind(context, &function, &code, positional, keywords)?;
         context.with_temporary_roots(&bound, |context| {
-            if matches!(code.kind, crate::object::FunctionKind::Generator { .. }) {
-                return context.new_generator(callable, &bound);
+            match code.kind {
+                crate::object::FunctionKind::Generator { .. } => {
+                    return context.new_generator(callable, &bound);
+                }
+                crate::object::FunctionKind::Coroutine { .. } => {
+                    return context.new_coroutine(callable, &bound);
+                }
+                crate::object::FunctionKind::AsyncGenerator { .. } => {
+                    return context.new_async_generator(callable, &bound);
+                }
+                crate::object::FunctionKind::Normal => {}
             }
             let mut output = RValue::NONE;
             // SAFETY: code objects are created only from code addresses using
@@ -401,6 +662,10 @@ pub(crate) fn invoke(
             // SAFETY: all pointers describe live storage for the duration of the
             // call, and the context pointer uses the ABI's opaque representation.
             context.push_active_call(callable, bound.first().copied());
+            let switched_globals = context.globals() != Some(function.globals);
+            if switched_globals {
+                context.push_module_namespace(function.globals);
+            }
             let status = unsafe {
                 native(
                     std::ptr::from_mut(context).cast::<c_void>(),
@@ -410,6 +675,9 @@ pub(crate) fn invoke(
                     &raw mut output,
                 )
             };
+            if switched_globals {
+                context.pop_module_namespace(function.globals);
+            }
             context.pop_active_call();
             match status {
                 RStatus::Ok => Ok(output),
@@ -596,15 +864,200 @@ fn take_stop_iteration_value(context: &mut RimeraContext) -> Option<RValue> {
     Some(value)
 }
 
+fn take_stop_iteration_value_preserving(
+    context: &mut RimeraContext,
+    ambient_raised: Option<RValue>,
+    ambient_exception: Option<String>,
+) -> Option<RValue> {
+    let value = take_stop_iteration_value(context)?;
+    context.raised = ambient_raised;
+    context.exception = ambient_exception;
+    Some(value)
+}
+
+fn take_stop_async_iteration(context: &mut RimeraContext) -> bool {
+    let Some(exception) = context.raised else {
+        return false;
+    };
+    if context.exception_type_name(exception) != Some("StopAsyncIteration") {
+        return false;
+    }
+    let _ = context.consume_exception_type("StopAsyncIteration");
+    true
+}
+
+fn finish_async_next_awaitable(
+    context: &mut RimeraContext,
+    wrapper: RValue,
+    terminal: bool,
+) -> Result<(), String> {
+    let Some(HeapObject::AsyncNextAwaitable(object)) = context.heap.get_mut(wrapper) else {
+        return Err("anext awaitable is invalid".to_owned());
+    };
+    object.running = false;
+    if terminal {
+        object.completed = true;
+        object.owner = RValue::NONE;
+        object.awaitable = RValue::NONE;
+        object.default = RValue::NONE;
+        object.iterator = None;
+    }
+    Ok(())
+}
+
+fn async_next_awaitable_start(
+    context: &mut RimeraContext,
+    wrapper: RValue,
+) -> Result<(RValue, RGeneratorDelegateOutcome), String> {
+    let (awaitable, default, iterator, running, completed) = match context.heap.get(wrapper) {
+        Some(HeapObject::AsyncNextAwaitable(object)) => (
+            object.awaitable,
+            object.default,
+            object.iterator,
+            object.running,
+            object.completed,
+        ),
+        _ => return Err("anext awaitable is invalid".to_owned()),
+    };
+    if completed {
+        return context.raise_error("RuntimeError", "cannot reuse already awaited coroutine");
+    }
+    if running {
+        return context.raise_error("ValueError", "coroutine already executing");
+    }
+    if let Some(HeapObject::AsyncNextAwaitable(object)) = context.heap.get_mut(wrapper) {
+        object.running = true;
+        object.started = true;
+    }
+
+    let result = context.with_temporary_roots(&[wrapper, awaitable, default], |context| {
+        let iterator = if let Some(iterator) = iterator {
+            iterator
+        } else {
+            let iterator = crate::operations::await_iterator(context, awaitable)?;
+            let Some(HeapObject::AsyncNextAwaitable(object)) = context.heap.get_mut(wrapper) else {
+                return Err("anext awaitable disappeared during __await__ resolution".to_owned());
+            };
+            object.iterator = Some(iterator);
+            iterator
+        };
+        context.with_temporary_roots(&[wrapper, iterator, default], |context| {
+            generator_delegate_start(context, iterator)
+        })
+    });
+
+    match result {
+        Ok((value, outcome)) => {
+            let terminal = outcome != RGeneratorDelegateOutcome::Yielded;
+            finish_async_next_awaitable(context, wrapper, terminal)?;
+            Ok((value, outcome))
+        }
+        Err(error) if take_stop_async_iteration(context) => {
+            finish_async_next_awaitable(context, wrapper, true)?;
+            Ok((default, RGeneratorDelegateOutcome::Completed))
+        }
+        Err(error) => {
+            finish_async_next_awaitable(context, wrapper, true)?;
+            Err(error)
+        }
+    }
+}
+
+fn async_next_awaitable_resume(
+    context: &mut RimeraContext,
+    wrapper: RValue,
+    operation: RGeneratorOperation,
+    input: RValue,
+) -> Result<(RValue, RGeneratorDelegateOutcome), String> {
+    if matches!(operation, RGeneratorOperation::Next)
+        || (matches!(operation, RGeneratorOperation::Send) && input == RValue::NONE)
+    {
+        return async_next_awaitable_start(context, wrapper);
+    }
+
+    let (default, iterator, running, completed) = match context.heap.get(wrapper) {
+        Some(HeapObject::AsyncNextAwaitable(object)) => (
+            object.default,
+            object.iterator,
+            object.running,
+            object.completed,
+        ),
+        _ => return Err("anext awaitable is invalid".to_owned()),
+    };
+    if completed {
+        return context.raise_error("RuntimeError", "cannot reuse already awaited coroutine");
+    }
+    if running {
+        return context.raise_error("ValueError", "coroutine already executing");
+    }
+    let Some(iterator) = iterator else {
+        return context.raise_error(
+            "TypeError",
+            "can't send non-None value to a just-started coroutine",
+        );
+    };
+    if let Some(HeapObject::AsyncNextAwaitable(object)) = context.heap.get_mut(wrapper) {
+        object.running = true;
+    }
+    let result = context.with_temporary_roots(&[wrapper, iterator, default, input], |context| {
+        generator_delegate_resume(context, iterator, operation, input)
+    });
+    match result {
+        Ok((value, outcome)) => {
+            let terminal = outcome != RGeneratorDelegateOutcome::Yielded;
+            finish_async_next_awaitable(context, wrapper, terminal)?;
+            Ok((value, outcome))
+        }
+        Err(error)
+            if matches!(
+                operation,
+                RGeneratorOperation::Next | RGeneratorOperation::Send
+            ) && take_stop_async_iteration(context) =>
+        {
+            finish_async_next_awaitable(context, wrapper, true)?;
+            Ok((default, RGeneratorDelegateOutcome::Completed))
+        }
+        Err(error) => {
+            finish_async_next_awaitable(context, wrapper, true)?;
+            Err(error)
+        }
+    }
+}
+
 pub(crate) fn generator_delegate_start(
     context: &mut RimeraContext,
     iterator: RValue,
 ) -> Result<(RValue, RGeneratorDelegateOutcome), String> {
+    if matches!(
+        context.heap.get(iterator),
+        Some(HeapObject::AsyncNextAwaitable(_))
+    ) {
+        return async_next_awaitable_start(context, iterator);
+    }
+    if matches!(
+        context.heap.get(iterator),
+        Some(HeapObject::AsyncGeneratorOperation(_))
+    ) {
+        let ambient_raised = context.raised;
+        let ambient_exception = context.exception.clone();
+        return match resume_async_generator_operation(context, iterator, None) {
+            Ok(value) => Ok((value, RGeneratorDelegateOutcome::Yielded)),
+            Err(error) => {
+                if let Some(value) =
+                    take_stop_iteration_value_preserving(context, ambient_raised, ambient_exception)
+                {
+                    Ok((value, RGeneratorDelegateOutcome::Completed))
+                } else {
+                    Err(error)
+                }
+            }
+        };
+    }
     if matches!(context.heap.get(iterator), Some(HeapObject::Generator(_))) {
         return match context.resume_generator(iterator, RGeneratorOperation::Next, RValue::NONE)? {
             crate::context::GeneratorResume {
                 value,
-                outcome: RGeneratorOutcome::Yielded,
+                outcome: RGeneratorOutcome::Yielded | RGeneratorOutcome::Suspended,
             } => Ok((value, RGeneratorDelegateOutcome::Yielded)),
             crate::context::GeneratorResume {
                 value,
@@ -618,11 +1071,15 @@ pub(crate) fn generator_delegate_start(
             None => Ok((RValue::NONE, RGeneratorDelegateOutcome::Completed)),
         };
     }
+    let ambient_raised = context.raised;
+    let ambient_exception = context.exception.clone();
     match context.invoke_special_method(iterator, "__next__", &[]) {
         Ok(Some(value)) => Ok((value, RGeneratorDelegateOutcome::Yielded)),
         Ok(None) => context.raise_error("TypeError", "object is not an iterator"),
         Err(error) => {
-            if let Some(value) = take_stop_iteration_value(context) {
+            if let Some(value) =
+                take_stop_iteration_value_preserving(context, ambient_raised, ambient_exception)
+            {
                 Ok((value, RGeneratorDelegateOutcome::Completed))
             } else {
                 Err(error)
@@ -655,10 +1112,25 @@ pub(crate) fn generator_delegate_resume(
     operation: RGeneratorOperation,
     input: RValue,
 ) -> Result<(RValue, RGeneratorDelegateOutcome), String> {
+    if matches!(
+        context.heap.get(iterator),
+        Some(HeapObject::AsyncNextAwaitable(_))
+    ) {
+        return async_next_awaitable_resume(context, iterator, operation, input);
+    }
     if matches!(operation, RGeneratorOperation::Next)
         || (matches!(operation, RGeneratorOperation::Send) && input == RValue::NONE)
     {
-        return generator_delegate_start(context, iterator);
+        return match generator_delegate_start(context, iterator) {
+            Ok(result) => Ok(result),
+            // A delegated managed exception is a language-level propagation
+            // outcome, not an ABI/runtime failure. Returning Propagate lets the
+            // compiled suspension dispatch to its recorded exception target.
+            Err(_) if context.raised.is_some() => {
+                Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate))
+            }
+            Err(error) => Err(error),
+        };
     }
 
     let injected = if matches!(
@@ -672,60 +1144,79 @@ pub(crate) fn generator_delegate_resume(
         None
     };
 
-    let result = match operation {
-        RGeneratorOperation::Send => {
-            let method = delegate_method(context, iterator, "send")?
-                .ok_or_else(|| "delegate has no send method".to_owned())?;
-            context.with_temporary_roots(&[iterator, method, input], |context| {
-                invoke(context, method, &[input], &[])
-            })
-        }
-        RGeneratorOperation::Throw => {
-            let Some(method) = delegate_method(context, iterator, "throw")? else {
-                if let Some(injected) = injected {
-                    context.raise_value(injected, None, false)?;
-                }
-                return Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate));
-            };
-            context.with_temporary_roots(&[iterator, method, input], |context| {
-                invoke(context, method, &[input], &[])
-            })
-        }
-        RGeneratorOperation::Close => {
-            let Some(method) = delegate_method(context, iterator, "close")? else {
-                if let Some(injected) = injected {
-                    context.raise_value(injected, None, false)?;
-                }
-                return Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate));
-            };
-            let close_result = context.with_temporary_roots(&[iterator, method], |context| {
-                invoke(context, method, &[], &[])
-            });
-            match close_result {
-                Ok(_) => {
+    // Throw/close temporarily remove the injected exception from the context's
+    // raised slot. Delegate lookup and invocation can allocate or trigger GC,
+    // so keep that exception explicitly rooted until it is consumed by the
+    // delegate or re-raised into the outer generator.
+    let injected_roots = injected.iter().copied().collect::<Vec<_>>();
+    context.with_temporary_roots(&injected_roots, |context| {
+        let ambient_raised = context.raised;
+        let ambient_exception = context.exception.clone();
+        let result = match operation {
+            RGeneratorOperation::Send => {
+                let method = delegate_method(context, iterator, "send")?
+                    .ok_or_else(|| "delegate has no send method".to_owned())?;
+                context.with_temporary_roots(&[iterator, method, input], |context| {
+                    invoke(context, method, &[input], &[])
+                })
+            }
+            RGeneratorOperation::Throw => {
+                let Some(method) = delegate_method(context, iterator, "throw")? else {
                     if let Some(injected) = injected {
                         context.raise_value(injected, None, false)?;
                     }
                     return Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate));
+                };
+                context.with_temporary_roots(&[iterator, method, input], |context| {
+                    invoke(context, method, &[input], &[])
+                })
+            }
+            RGeneratorOperation::Close => {
+                let Some(method) = delegate_method(context, iterator, "close")? else {
+                    if let Some(injected) = injected {
+                        context.raise_value(injected, None, false)?;
+                    }
+                    return Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate));
+                };
+                let close_result = context.with_temporary_roots(
+                    &[iterator, method],
+                    |context| invoke(context, method, &[], &[]),
+                );
+                match close_result {
+                    Ok(_) => {
+                        if let Some(injected) = injected {
+                            context.raise_value(injected, None, false)?;
+                        }
+                        return Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate));
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
-        }
-        RGeneratorOperation::Next => unreachable!("next delegation returned early"),
-    };
+            RGeneratorOperation::Next => unreachable!("next delegation returned early"),
+        };
 
-    match result {
-        Ok(value) => Ok((value, RGeneratorDelegateOutcome::Yielded)),
-        Err(error) => {
-            if let Some(value) = take_stop_iteration_value(context) {
-                Ok((value, RGeneratorDelegateOutcome::Completed))
-            } else if context.raised.is_some() {
-                Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate))
-            } else {
-                Err(error)
+        match result {
+            Ok(value) => Ok((value, RGeneratorDelegateOutcome::Yielded)),
+            Err(error) => {
+                let stop_value = if matches!(operation, RGeneratorOperation::Send) {
+                    take_stop_iteration_value_preserving(
+                        context,
+                        ambient_raised,
+                        ambient_exception,
+                    )
+                } else {
+                    take_stop_iteration_value(context)
+                };
+                if let Some(value) = stop_value {
+                    Ok((value, RGeneratorDelegateOutcome::Completed))
+                } else if context.raised.is_some() {
+                    Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate))
+                } else {
+                    Err(error)
+                }
             }
         }
-    }
+    })
 }
 
 fn generator_resume_value(
@@ -737,7 +1228,8 @@ fn generator_resume_value(
     match context.resume_generator(generator, operation, input)? {
         crate::context::GeneratorResume {
             value,
-            outcome: rimera_abi::RGeneratorOutcome::Yielded,
+            outcome:
+                rimera_abi::RGeneratorOutcome::Yielded | rimera_abi::RGeneratorOutcome::Suspended,
         } => Ok(value),
         crate::context::GeneratorResume {
             value,
@@ -878,7 +1370,8 @@ fn invoke_generator_close(
         RValue::NONE,
     )? {
         crate::context::GeneratorResume {
-            outcome: rimera_abi::RGeneratorOutcome::Yielded,
+            outcome:
+                rimera_abi::RGeneratorOutcome::Yielded | rimera_abi::RGeneratorOutcome::Suspended,
             ..
         } => context.raise_error("RuntimeError", "generator ignored GeneratorExit"),
         crate::context::GeneratorResume {
@@ -886,6 +1379,379 @@ fn invoke_generator_close(
             ..
         } => Ok(RValue::NONE),
     }
+}
+
+fn new_async_generator_operation(
+    context: &mut RimeraContext,
+    generator: RValue,
+    kind: AsyncGeneratorOperationKind,
+    input: RValue,
+) -> Result<RValue, String> {
+    if !matches!(
+        context.heap.get(generator),
+        Some(HeapObject::Generator(object)) if object.kind == crate::object::SuspendedKind::AsyncGenerator
+    ) {
+        return Err("async generator operation receiver is invalid".to_owned());
+    }
+    context.with_temporary_roots(&[generator, input], |context| {
+        context.allocate(HeapObject::AsyncGeneratorOperation(
+            AsyncGeneratorOperationObject {
+                generator,
+                input,
+                kind,
+                started: false,
+                running: false,
+                completed: false,
+            },
+        ))
+    })
+}
+
+fn async_generator_operation_name(kind: AsyncGeneratorOperationKind) -> &'static str {
+    match kind {
+        AsyncGeneratorOperationKind::Next => "anext",
+        AsyncGeneratorOperationKind::Send => "asend",
+        AsyncGeneratorOperationKind::Throw => "athrow",
+        AsyncGeneratorOperationKind::Close => "aclose",
+    }
+}
+
+fn consume_async_generator_operation(
+    context: &mut RimeraContext,
+    operation: RValue,
+) -> Result<(), String> {
+    let Some(HeapObject::AsyncGeneratorOperation(object)) = context.heap.get_mut(operation) else {
+        return Err("async generator operation is invalid".to_owned());
+    };
+    object.running = false;
+    object.completed = true;
+    object.input = RValue::NONE;
+    Ok(())
+}
+
+fn finish_async_generator_operation(
+    context: &mut RimeraContext,
+    operation: RValue,
+) -> Result<(), String> {
+    let generator = match context.heap.get(operation) {
+        Some(HeapObject::AsyncGeneratorOperation(object)) => object.generator,
+        _ => return Err("async generator operation is invalid".to_owned()),
+    };
+    consume_async_generator_operation(context, operation)?;
+    if let Some(HeapObject::Generator(generator)) = context.heap.get_mut(generator) {
+        generator.async_operation_active = false;
+    }
+    Ok(())
+}
+
+fn raise_stop_async_iteration(context: &mut RimeraContext) -> Result<RValue, String> {
+    let exception = context.new_builtin_exception("StopAsyncIteration", &[])?;
+    context.raise_value(exception, None, false)?;
+    Ok(exception)
+}
+
+fn resume_async_generator_operation(
+    context: &mut RimeraContext,
+    operation: RValue,
+    requested: Option<(RGeneratorOperation, RValue)>,
+) -> Result<RValue, String> {
+    let (generator, input, kind, started, running, completed) = match context.heap.get(operation) {
+        Some(HeapObject::AsyncGeneratorOperation(object)) => (
+            object.generator,
+            object.input,
+            object.kind,
+            object.started,
+            object.running,
+            object.completed,
+        ),
+        _ => return Err("async generator operation is invalid".to_owned()),
+    };
+    if completed {
+        return context.raise_error(
+            "RuntimeError",
+            match kind {
+                AsyncGeneratorOperationKind::Next | AsyncGeneratorOperationKind::Send => {
+                    "cannot reuse already awaited __anext__()/asend()"
+                }
+                AsyncGeneratorOperationKind::Throw | AsyncGeneratorOperationKind::Close => {
+                    "cannot reuse already awaited aclose()/athrow()"
+                }
+            },
+        );
+    }
+    if running {
+        return context.raise_error(
+            "RuntimeError",
+            "async generator operation is already running",
+        );
+    }
+
+    let first = !started;
+    if first {
+        let active = matches!(
+            context.heap.get(generator),
+            Some(HeapObject::Generator(generator)) if generator.async_operation_active
+        );
+        if active {
+            // CPython consumes the colliding operation wrapper even though it
+            // never acquired the generator's resume right. Keep the current
+            // owner active, but make this wrapper permanently non-reusable.
+            consume_async_generator_operation(context, operation)?;
+            return context.raise_error(
+                "RuntimeError",
+                format!(
+                    "{}(): asynchronous generator is already running",
+                    async_generator_operation_name(kind)
+                ),
+            );
+        }
+        if let Some(HeapObject::Generator(generator)) = context.heap.get_mut(generator) {
+            generator.async_operation_active = true;
+        }
+        if let Some(HeapObject::AsyncGeneratorOperation(object)) = context.heap.get_mut(operation) {
+            object.started = true;
+        }
+    }
+    if let Some(HeapObject::AsyncGeneratorOperation(object)) = context.heap.get_mut(operation) {
+        object.running = true;
+    }
+
+    let (resume_operation, resume_input) = if let Some(requested) = requested {
+        requested
+    } else if first {
+        match kind {
+            AsyncGeneratorOperationKind::Next => (RGeneratorOperation::Next, RValue::NONE),
+            AsyncGeneratorOperationKind::Send => (RGeneratorOperation::Send, input),
+            AsyncGeneratorOperationKind::Throw => (RGeneratorOperation::Throw, input),
+            AsyncGeneratorOperationKind::Close => (RGeneratorOperation::Close, RValue::NONE),
+        }
+    } else {
+        (RGeneratorOperation::Send, RValue::NONE)
+    };
+
+    let result = context.with_temporary_roots(&[operation, generator, resume_input], |context| {
+        context.resume_generator(generator, resume_operation, resume_input)
+    });
+    if let Some(HeapObject::AsyncGeneratorOperation(object)) = context.heap.get_mut(operation) {
+        object.running = false;
+    }
+    match result {
+        Ok(crate::context::GeneratorResume {
+            value,
+            outcome: RGeneratorOutcome::Suspended,
+        }) => Ok(value),
+        Ok(crate::context::GeneratorResume {
+            value,
+            outcome: RGeneratorOutcome::Yielded,
+        }) => {
+            finish_async_generator_operation(context, operation)?;
+            if kind == AsyncGeneratorOperationKind::Close {
+                return context
+                    .raise_error("RuntimeError", "async generator ignored GeneratorExit");
+            }
+            context.raise_stop_iteration(value)?;
+            Err("async generator operation produced a value".to_owned())
+        }
+        Ok(crate::context::GeneratorResume {
+            outcome: RGeneratorOutcome::Returned,
+            ..
+        }) => {
+            finish_async_generator_operation(context, operation)?;
+            if kind == AsyncGeneratorOperationKind::Close {
+                context.raise_stop_iteration(RValue::NONE)?;
+                Err("async generator close completed".to_owned())
+            } else {
+                raise_stop_async_iteration(context)?;
+                Err("async generator exhausted".to_owned())
+            }
+        }
+        Err(error) => {
+            finish_async_generator_operation(context, operation)?;
+            if kind == AsyncGeneratorOperationKind::Close
+                && context.consume_exception_type("GeneratorExit")
+            {
+                context.raise_stop_iteration(RValue::NONE)?;
+                return Err("async generator close completed".to_owned());
+            }
+            let escaped_iteration = context.raised.and_then(|exception| {
+                let kind = context.exception_type_name(exception)?;
+                matches!(kind, "StopIteration" | "StopAsyncIteration")
+                    .then_some((exception, kind.to_owned()))
+            });
+            if let Some((cause, kind)) = escaped_iteration {
+                let message = format!("async generator raised {kind}");
+                return context.with_temporary_roots(&[cause], |context| {
+                    let text = context.allocate(HeapObject::String(message.clone()))?;
+                    context.with_temporary_roots(&[cause, text], |context| {
+                        let exception = context.new_builtin_exception("RuntimeError", &[text])?;
+                        context.raise_value(exception, Some(cause), true)?;
+                        Err(message)
+                    })
+                });
+            }
+            Err(error)
+        }
+    }
+}
+
+fn invoke_async_generator_iter(
+    _context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err("async_generator.__aiter__() takes no arguments".to_owned());
+    }
+    Ok(positional[0])
+}
+
+fn invoke_async_generator_next(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err("async_generator.__anext__() takes no arguments".to_owned());
+    }
+    new_async_generator_operation(
+        context,
+        positional[0],
+        AsyncGeneratorOperationKind::Next,
+        RValue::NONE,
+    )
+}
+
+fn invoke_async_generator_send(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 2 {
+        return Err("async_generator.asend() takes exactly one argument".to_owned());
+    }
+    new_async_generator_operation(
+        context,
+        positional[0],
+        AsyncGeneratorOperationKind::Send,
+        positional[1],
+    )
+}
+
+fn invoke_async_generator_throw(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || !(2..=4).contains(&positional.len()) {
+        return Err("async_generator.athrow() takes 1 to 3 arguments".to_owned());
+    }
+    let generator = positional[0];
+    let exception = context.with_temporary_roots(&[generator], |context| {
+        normalize_generator_throw(context, &positional[1..])
+    })?;
+    new_async_generator_operation(
+        context,
+        generator,
+        AsyncGeneratorOperationKind::Throw,
+        exception,
+    )
+}
+
+fn invoke_async_generator_close(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err("async_generator.aclose() takes no arguments".to_owned());
+    }
+    new_async_generator_operation(
+        context,
+        positional[0],
+        AsyncGeneratorOperationKind::Close,
+        RValue::NONE,
+    )
+}
+
+fn invoke_async_generator_operation_next(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err("async generator operation __next__() takes no arguments".to_owned());
+    }
+    resume_async_generator_operation(context, positional[0], None)
+}
+
+fn invoke_async_generator_operation_send(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 2 {
+        return Err("async generator operation send() takes exactly one argument".to_owned());
+    }
+    let operation = positional[0];
+    let started = matches!(
+        context.heap.get(operation),
+        Some(HeapObject::AsyncGeneratorOperation(object)) if object.started
+    );
+    if !started && positional[1] != RValue::NONE {
+        // CPython consumes the operation wrapper even though the invalid first
+        // send never acquires the generator's resume right. Do not call the
+        // normal finish helper here: another operation may already own that
+        // generator, and clearing its active flag would violate overlap rules.
+        consume_async_generator_operation(context, operation)?;
+        return context.raise_error(
+            "TypeError",
+            "can't send non-None value to a just-started async generator",
+        );
+    }
+    let requested = started.then_some((RGeneratorOperation::Send, positional[1]));
+    resume_async_generator_operation(context, operation, requested)
+}
+
+fn invoke_async_generator_operation_throw(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || !(2..=4).contains(&positional.len()) {
+        return Err("async generator operation throw() takes 1 to 3 arguments".to_owned());
+    }
+    let operation = positional[0];
+    let exception = context.with_temporary_roots(&[operation], |context| {
+        normalize_generator_throw(context, &positional[1..])
+    })?;
+    resume_async_generator_operation(
+        context,
+        operation,
+        Some((RGeneratorOperation::Throw, exception)),
+    )
+}
+
+fn invoke_async_generator_operation_close(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err("async generator operation close() takes no arguments".to_owned());
+    }
+    let operation = positional[0];
+    let completed = matches!(
+        context.heap.get(operation),
+        Some(HeapObject::AsyncGeneratorOperation(object)) if object.completed
+    );
+    if !completed {
+        // Closing the awaitable wrapper consumes only the wrapper. If it had
+        // already suspended the async generator in an internal await, CPython
+        // deliberately leaves the generator's running ownership set; another
+        // protocol operation must still observe the overlap error.
+        consume_async_generator_operation(context, operation)?;
+    }
+    Ok(RValue::NONE)
 }
 
 fn invoke_exception_with_traceback(
@@ -4443,6 +5309,119 @@ fn invoke_ascii(
     }
     crate::operations::ascii(context, positional[0])
 }
+
+fn invoke_import(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    const NAMES: [&str; 5] = ["name", "globals", "locals", "fromlist", "level"];
+    if positional.len() > NAMES.len() {
+        return Err(format!(
+            "__import__() takes at most 5 arguments ({} given)",
+            positional.len()
+        ));
+    }
+    let mut values = [None; 5];
+    for (index, value) in positional.iter().copied().enumerate() {
+        values[index] = Some(value);
+    }
+    for (name, value) in keywords {
+        let Some(index) = NAMES.iter().position(|candidate| candidate == name) else {
+            return Err(format!(
+                "__import__() got an unexpected keyword argument '{name}'"
+            ));
+        };
+        if values[index].replace(*value).is_some() {
+            return Err(format!(
+                "__import__() got multiple values for argument '{name}'"
+            ));
+        }
+    }
+    let name_value = values[0]
+        .ok_or_else(|| "__import__() missing required argument 'name' (pos 1)".to_owned())?;
+    let name = crate::operations::string_value(context, name_value)
+        .ok_or_else(|| "module name must be a string".to_owned())?
+        .to_owned();
+    let globals = values[1].unwrap_or(RValue::NONE);
+    let _locals = values[2].unwrap_or(RValue::NONE);
+    let fromlist = values[3].unwrap_or(RValue::NONE);
+    let level_value = values[4].unwrap_or_else(|| RValue::small_int(0));
+    let level_integer = crate::operations::index_integer(context, level_value)?;
+    if level_integer.is_negative() {
+        return context.raise_error("ValueError", "level must be >= 0");
+    }
+    if level_integer > BigInt::from(i32::MAX) {
+        return context.raise_error("OverflowError", "Python int too large to convert to C int");
+    }
+    let level = level_integer
+        .to_usize()
+        .expect("non-negative import level within i32 range fits usize");
+    let fromlist_is_empty = !crate::operations::truthy(context, fromlist)?;
+    let (absolute, imported) =
+        context.import_builtin_target(&name, globals, fromlist_is_empty, level)?;
+    if fromlist_is_empty || !context.module_has_path(imported) {
+        return Ok(imported);
+    }
+
+    context.with_temporary_roots(&[imported, fromlist], |context| {
+        let iterator = crate::operations::iterator_new(context, fromlist)?;
+        context.with_temporary_roots(&[imported, fromlist, iterator], |context| {
+            while let Some(item) = crate::operations::iterator_next(context, iterator)? {
+                let requested = crate::operations::string_value(context, item)
+                    .ok_or_else(|| "Item in from list must be str".to_owned())?
+                    .to_owned();
+                if requested == "*" {
+                    continue;
+                }
+                let child = format!("{absolute}.{requested}");
+                if context.has_module_definition(&child) {
+                    context.import_registered(&child)?;
+                }
+            }
+            Ok(imported)
+        })
+    })
+}
+
+fn invoke_reload(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err("reload() takes exactly one argument".to_owned());
+    }
+    context.reload_module(positional[0])
+}
+
+fn invoke_invalidate_import_caches(
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || !positional.is_empty() {
+        return Err("invalidate_caches() takes no arguments".to_owned());
+    }
+    // Discovery is an ahead-of-time compiler operation. There are no ambient
+    // runtime finders to invalidate; this matches the public API while keeping
+    // the compiled manifest immutable.
+    Ok(RValue::NONE)
+}
+
+fn invoke_read_binary_resource(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 2 {
+        return Err("read_binary() takes exactly 2 arguments".to_owned());
+    }
+    let name = crate::operations::string_value(context, positional[1])
+        .ok_or_else(|| "resource must be a string".to_owned())?
+        .to_owned();
+    context.read_module_resource(positional[0], &name)
+}
+
 fn invoke_iter(
     context: &mut RimeraContext,
     positional: &[RValue],
@@ -4482,7 +5461,8 @@ fn invoke_next(
     }
     if matches!(
         context.heap.get(positional[0]),
-        Some(HeapObject::Generator(_))
+        Some(HeapObject::Generator(generator))
+            if generator.kind == crate::object::SuspendedKind::Generator
     ) {
         return match context.resume_generator(
             positional[0],
@@ -4504,6 +5484,10 @@ fn invoke_next(
                 context.raise_stop_iteration(value)?;
                 Err("generator exhausted".to_owned())
             }
+            crate::context::GeneratorResume {
+                outcome: rimera_abi::RGeneratorOutcome::Suspended,
+                ..
+            } => Err("synchronous generator produced an async suspension".to_owned()),
         };
     }
     match crate::operations::iterator_next(context, positional[0])? {
@@ -4515,6 +5499,97 @@ fn invoke_next(
         }
     }
 }
+
+fn invoke_aiter(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() {
+        return Err("aiter() takes no keyword arguments".to_owned());
+    }
+    if positional.len() != 1 {
+        return Err(format!(
+            "aiter() takes exactly one argument ({} given)",
+            positional.len()
+        ));
+    }
+    let value = positional[0];
+    let Some(iterator) = context.invoke_special_method(value, "__aiter__", &[])? else {
+        let value_type = context.type_of(value)?;
+        return Err(format!(
+            "'{}' object is not an async iterable",
+            context.type_name(value_type)
+        ));
+    };
+    context.with_temporary_roots(&[value, iterator], |context| {
+        if context.has_special_method_slot(iterator, "__anext__")? {
+            return Ok(iterator);
+        }
+        let iterator_type = context.type_of(iterator)?;
+        Err(format!(
+            "aiter() returned not an async iterator of type '{}'",
+            context.type_name(iterator_type)
+        ))
+    })
+}
+
+fn invoke_anext(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() {
+        return Err("anext() takes no keyword arguments".to_owned());
+    }
+    if positional.is_empty() {
+        return Err("anext expected at least 1 argument, got 0".to_owned());
+    }
+    if positional.len() > 2 {
+        return Err(format!(
+            "anext expected at most 2 arguments, got {}",
+            positional.len()
+        ));
+    }
+    let iterator = positional[0];
+    let Some(awaitable) = context.invoke_special_method(iterator, "__anext__", &[])? else {
+        let iterator_type = context.type_of(iterator)?;
+        return Err(format!(
+            "'{}' object is not an async iterator",
+            context.type_name(iterator_type)
+        ));
+    };
+    if positional.len() == 1 {
+        return Ok(awaitable);
+    }
+    let default = positional[1];
+    context.with_temporary_roots(&[iterator, awaitable, default], |context| {
+        context.allocate(HeapObject::AsyncNextAwaitable(AsyncNextAwaitableObject {
+            owner: iterator,
+            awaitable,
+            default,
+            iterator: None,
+            started: false,
+            running: false,
+            completed: false,
+        }))
+    })
+}
+
+fn invoke_async_runtime_run(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err(format!(
+            "async_runtime.run() takes exactly one argument ({} given)",
+            positional.len()
+        ));
+    }
+    context.run_async_root(positional[0])
+}
+
 fn invoke_type_prepare(
     context: &mut RimeraContext,
     positional: &[RValue],
@@ -4686,6 +5761,21 @@ fn bind(
     positional: &[RValue],
     keywords: &[(String, RValue)],
 ) -> Result<Vec<RValue>, String> {
+    // Exact positional calls require no name matching, default lookup, vararg
+    // packaging, or missing-argument diagnostics. Preserve the generic binder
+    // for every other Python call shape.
+    if keywords.is_empty()
+        && positional.len() == code.parameters.len()
+        && code.parameters.iter().all(|parameter| {
+            matches!(
+                parameter.kind,
+                ParameterKind::PositionalOnly | ParameterKind::PositionalOrKeyword
+            )
+        })
+    {
+        return Ok(positional.to_vec());
+    }
+
     let mut bound = vec![None; code.parameters.len()];
     let fixed = code
         .parameters

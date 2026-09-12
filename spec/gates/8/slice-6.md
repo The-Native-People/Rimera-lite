@@ -24,3 +24,14 @@ cleanup for resumed, thrown, closed, delegated, and abandoned paths.
 Public CPython differentials cover suspension states, sends, throws, closes,
 delegation, nested contexts/finally, abandonment, traceback order, forced GC,
 and post-completion collection.
+
+## Completion evidence
+
+- `gate8_generator_cleanup.py` proves normal resume/send, injected throw with
+  suppression and propagation, `GeneratorExit`, ignored-close failure,
+  captured-exit mutation, user delegation, and abandoned-generator cleanup
+  against CPython 3.12.11 under heap pressure.
+- `unreachable_suspended_generators_close_once_before_collection` proves the GC
+  lifecycle runs the ordinary Close resume operation exactly once before sweep.
+- The public test is
+  `gate8_slice6_suspension_throw_close_and_delegated_cleanup_match_cpython_312`.

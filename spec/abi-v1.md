@@ -126,9 +126,10 @@ the heap cannot allocate.
 - A source `Yield` MIR terminator records the yielded value, the SSA resume
   input when the expression consumes `send`, its normal continuation, its
   injected-exception successor, and an optional active delegation value.
-  Codegen saves every liveness-selected persistent value before publishing the
-  next state and restores those slots before entering the compiler-selected
-  continuation. The generator owns and traces persistent slots, the active
+  Codegen saves every liveness-selected persistent value required by either the
+  normal resume continuation or the injected-exception successor before
+  publishing the next state, and restores those slots before entering the
+  compiler-selected continuation. The generator owns and traces persistent slots, the active
   delegate, saved handled-exception stack, a pending managed exception that may
   cross cleanup suspension, and its terminal return value; terminal completion
   or failure clears obsolete slots/delegates/exception state exactly once.
@@ -138,6 +139,12 @@ the heap cannot allocate.
   `StopIteration` is converted to `RuntimeError` under PEP 479. `throw` and
   `close` inject the managed exception at the exact compiler suspension point,
   so local handlers/finally blocks remain ordinary verified MIR control flow.
+  The GC lifecycle phase preserves an unreachable started generator for one
+  turn and invokes that same `Close` resume operation exactly once before
+  sweep. The finalizer is registered lazily when the first generator is
+  allocated, allowing programs without generators to dead-strip the resume
+  path. Cleanup failures are unraisable during collection and cannot replace
+  an exception already active at the allocating safepoint.
 - `yield from` uses the additive `RGeneratorDelegateOutcome` contract
   (`Yielded`, `Completed`, `Propagate`) and three opaque helpers:
   `rimera_generator_delegate_start` performs the first generic iterator step,
@@ -206,6 +213,56 @@ the heap cannot allocate.
   `ModuleNotFoundError`. This helper does not execute Python module source and
   does not implement dotted/package imports, `from ... import ...`, public
   `sys.modules`, a user-visible `__import__`, or either module shell's stdlib API.
+- Gate 9 Slice 1 gives that same `ModuleObject` and context-owned cache the sole
+  lifecycle contract used by later source/package loading. A managed module is
+  `created`, then `initializing`, then either `ready` or `failed`; invalid state
+  transitions are rejected. Cached ready modules and their namespaces remain
+  context roots. Failed, unpublished module objects are not retained and are
+  collectible. Later Gate 9 slices must insert source modules before executing
+  their native initializer and must implement rollback/retry on this state
+  machine rather than introducing a second loader registry.
+- Gate 9 Slices 3–7 add
+  `rimera_import_source(context, name, name_len, filename, filename_len,
+  package, package_len, is_package, initializer, output)`. The initializer has
+  the ordinary five-argument native-function layout and returns `RStatus`.
+  Name, filename, and package are borrowed UTF-8 for the duration of the call;
+  `is_package` is zero or one; the runtime copies all Python-visible metadata
+  into managed values. It publishes one `initializing` module and its namespace
+  before invoking the initializer, so cycles observe the same partial object.
+  Success moves it to `ready`; failure moves it to `failed`, removes that exact
+  cache entry, and preserves the managed exception for a later retry. Dotted
+  imports initialize each parent prefix in source order and publish a ready
+  child in its parent's namespace. Generated import operations still own the
+  Python binding rule: an unaliased dotted import stores the top-level module,
+  while an explicit alias stores the requested leaf module.
+- Gate 9 Slice 6 adds `rimera_import_from(context, module, name, name_len,
+  filename, filename_len, package, package_len, is_package, initializer,
+  output)` and `rimera_import_star(context, module)`. The former reads an
+  existing module attribute and otherwise may invoke the statically resolved
+  child initializer using the same managed metadata contract; a null
+  initializer carries zero metadata pointers and raises managed `ImportError`
+  for a missing name. The latter publishes sequence-indexed `__all__` entries,
+  or only non-underscore namespace entries when `__all__` is absent, into the
+  active module globals. Invalid `__all__` entries and callbacks propagate as
+  managed exceptions; generated MIR retains source spans and owns all target
+  bindings.
+- Gate 9 Slice 7 uses the source-import metadata to publish managed `__name__`,
+  `__package__`, `__file__`, optional package `__path__`, `__loader__`, and
+  `__spec__` values before module execution. The loader/spec are ordinary
+  traced managed instances; `spec.loader` is identical to `__loader__`, and a
+  package's `spec.submodule_search_locations` is identical to `__path__`.
+- Gate 9 Slice 8 adds
+  `rimera_import_namespace(context, name, name_len, locations,
+  locations_len, output)`. `locations` is a borrowed NUL-separated UTF-8 blob
+  of canonical, ordered namespace portions and is copied into one managed
+  `__path__` list before publication. Namespace modules use the same
+  context-owned cache and parent-publication path as source modules, expose
+  `__file__` and `spec.origin` as `None`, set `spec.has_location` false, and
+  share the identical managed search-path object between `__path__` and
+  `spec.submodule_search_locations`. The additive location pointer and length
+  on `rimera_import_from` allow a statically resolved namespace child to use
+  this path when the requested parent attribute is absent; source children
+  continue to use the native initializer pointer.
 - Gate 7 Slice 5 extends the existing managed exception/traceback ABI without
   exposing native frame pointers. Function/generator failures use
   `rimera_traceback_append(context, filename, filename_len, function,
@@ -296,8 +353,32 @@ the heap cannot allocate.
   bound-method values whose generic call prepends the receiver. `property`,
   `staticmethod`, `classmethod`, and custom `__get__`/`__set__`/`__delete__`
   values therefore share the generic call path; codegen has no descriptor
-  special case. Class namespace writes and deletes advance a type version tag
-  reserved for attribute-cache invalidation.
+  special case. `rimera_special_method_get(context, receiver, name, name_len,
+  output)` is the lookup-only companion used by compiler-planned protocols: it
+  resolves on the receiver type/MRO, descriptor-binds once, and returns the
+  captured callable without invoking it. Gate 8 MIR uses it to capture
+  `__enter__` and `__exit__`, then uses ordinary `rimera_call` operations for
+  every invocation; entry/body/exit ordering, cleanup, and suppression remain
+  explicit compiler CFG. Exceptional exits obtain the exact exception type via
+  `rimera_type_of` and the managed traceback through the normal exception
+  metadata contract before calling the captured exit with three rooted values.
+  Gate 10 uses the same lookup ABI for `__aenter__` and `__aexit__`, captured
+  in that order before calling entry. Each call result flows through the owned
+  await/delegation operations. Cleanup is registered only after successful
+  awaited entry; the captured exit and pending completion remain live across
+  suspension. Missing async methods raise `TypeError` with asynchronous-context-
+  manager wording, including the missing-`__aexit__` suffix for an exit lookup
+  failure. No additional cleanup or exception ABI is introduced.
+  The source-level `async_runtime.run` entry permits one active root per context.
+  Re-entry through a callback raises a managed `RuntimeError` before constructing
+  another executor, without consuming the rejected coroutine. The guard clears
+  after either normal or exceptional root completion, allowing a later root.
+  Reflective class namespace/name/base writes invalidate the
+  mutated type plus descendant and metaclass-dependent observers through one
+  version-tag owner. String-key namespace growth and string-backed reflective
+  metadata growth preflight the hard managed-heap limit before publication; a
+  failed `MemoryError` leaves the previous namespace/metadata/version state
+  visible, while successful mutation refreshes retained managed-byte accounting.
 - Class suites compile as hidden native `ClassBody` functions with their
   prepared namespace as an internal positional parameter. They use the normal
   five-word native function ABI and generic call path, so class-body failures,

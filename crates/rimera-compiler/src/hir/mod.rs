@@ -51,6 +51,7 @@ pub enum StatementKind {
     FunctionDef {
         name: String,
         binding: Binding,
+        is_async: bool,
         type_params: Vec<TypeParameter>,
         decorators: Vec<Expression>,
         parameters: Vec<Parameter>,
@@ -82,9 +83,14 @@ pub enum StatementKind {
     Import {
         aliases: Vec<ImportAlias>,
     },
+    ImportFrom {
+        module: String,
+        aliases: Vec<ImportAlias>,
+    },
     Break,
     Continue,
     Expression(Expression),
+    Display(Expression),
     Raise {
         exception: Option<Expression>,
         cause: Option<Expression>,
@@ -95,6 +101,11 @@ pub enum StatementKind {
         else_body: Vec<Statement>,
         finally_body: Vec<Statement>,
         is_star: bool,
+    },
+    With {
+        items: Vec<WithItem>,
+        body: Vec<Statement>,
+        is_async: bool,
     },
     Print {
         values: Vec<Expression>,
@@ -113,6 +124,7 @@ pub enum StatementKind {
         iterable: Expression,
         body: Vec<Statement>,
         else_body: Vec<Statement>,
+        is_async: bool,
     },
     Match {
         subject: Expression,
@@ -121,9 +133,16 @@ pub enum StatementKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct WithItem {
+    pub context: Expression,
+    pub target: Option<Target>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ImportAlias {
     pub module: String,
     pub bind_name: String,
+    pub explicit_alias: bool,
     pub binding: Binding,
 }
 
@@ -252,7 +271,15 @@ pub enum ClassMember {
         finally_body: Vec<ClassMember>,
         is_star: bool,
     },
+    With {
+        items: Vec<WithItem>,
+        body: Vec<ClassMember>,
+    },
     Import {
+        aliases: Vec<ImportAlias>,
+    },
+    ImportFrom {
+        module: String,
         aliases: Vec<ImportAlias>,
     },
     ClassDef {
@@ -277,6 +304,7 @@ pub enum ClassMember {
         span: Span,
         name: String,
         binding: Binding,
+        is_async: bool,
         type_params: Vec<TypeParameter>,
         decorators: Vec<Expression>,
         uses_zero_argument_super: bool,
@@ -383,6 +411,7 @@ pub struct ComprehensionClause {
     /// containing scope and passed to the hidden comprehension function.
     pub iterable: Option<Expression>,
     pub filters: Vec<Expression>,
+    pub is_async: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -459,6 +488,9 @@ pub enum ExpressionKind {
         value: Option<Box<Expression>>,
     },
     YieldFrom {
+        value: Box<Expression>,
+    },
+    Await {
         value: Box<Expression>,
     },
     Comprehension {

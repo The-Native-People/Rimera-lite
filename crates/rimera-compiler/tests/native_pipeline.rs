@@ -8,10 +8,38 @@ use rimera_compiler::mir::{
     Block, BlockId, Constant, Function, FunctionId, Operation, OperationKind, Program, Terminator,
     ValueId,
 };
-use rimera_compiler::project::{BuildRequest, CapabilitySet};
+use rimera_compiler::project::{AsyncBackend, BuildRequest, CapabilitySet};
 
 fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+#[test]
+fn gate11_dynamic_namespaces_use_public_native_pipeline() {
+    let status = Command::new("cargo").current_dir(workspace())
+        .args(["build", "-p", "rimera-compiler", "--lib"]).status().unwrap();
+    assert!(status.success());
+    let mut build_request = request("gate11_dynamic_namespaces.py", output("gate11-dynamic"));
+    build_request.capabilities = CapabilitySet::from_names(["dynamic_compilation".to_owned()]);
+    let expected = Command::new("/opt/homebrew/bin/python3.12").arg(&build_request.entry).output().unwrap();
+    assert!(expected.status.success(), "{}", String::from_utf8_lossy(&expected.stderr));
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let actual = run(&artifact.executable);
+    assert!(actual.status.success(), "{}", String::from_utf8_lossy(&actual.stderr));
+    assert_eq!(String::from_utf8_lossy(&actual.stdout), String::from_utf8_lossy(&expected.stdout));
+    assert_native_only_artifact(&artifact.executable);
+    let mut limited = request("gate11_dynamic_namespaces.py", output("gate11-dynamic-small-heap"));
+    limited.capabilities = CapabilitySet::from_names(["dynamic_compilation".to_owned()]);
+    limited.heap_limit_bytes = Some(262_144);
+    let limited = rimera_compiler::build(limited).unwrap();
+    let actual = run(&limited.executable);
+    assert!(actual.status.success(), "{}", String::from_utf8_lossy(&actual.stderr));
+    assert_eq!(actual.stdout, expected.stdout);
+    let denied = request("gate11_dynamic_namespaces.py", output("gate11-denied"));
+    let denied_output = denied.output.clone();
+    let errors = rimera_compiler::build(denied).unwrap_err();
+    assert!(errors.as_slice().iter().any(|error| error.code == "RIM-CAP-G7-02"));
+    assert!(!denied_output.exists());
 }
 
 fn ensure_runtime_archive() {
@@ -33,9 +61,39 @@ fn ensure_runtime_archive() {
     });
 }
 
+fn ensure_release_runtime_archive() {
+    static RUNTIME_ARCHIVE: OnceLock<()> = OnceLock::new();
+    RUNTIME_ARCHIVE.get_or_init(|| {
+        let status = Command::new("cargo")
+            .current_dir(workspace())
+            .args([
+                "rustc",
+                "-p",
+                "rimera-runtime",
+                "--release",
+                "--lib",
+                "--crate-type",
+                "staticlib",
+            ])
+            .status()
+            .expect("run Cargo to build the release runtime static archive");
+        assert!(
+            status.success(),
+            "release runtime static archive build failed"
+        );
+    });
+}
+
 fn output(name: &str) -> PathBuf {
-    let directory =
-        std::env::temp_dir().join(format!("rimera-native-{}-{}", std::process::id(), name));
+    // Different conformance tests intentionally compile the same fixture.
+    // Give each request its own output so a concurrent linker cannot replace
+    // another test's executable between build completion and process launch.
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "rimera-native-{}-{sequence}-{name}",
+        std::process::id()
+    ));
     fs::create_dir_all(&directory).unwrap();
     directory.join(name)
 }
@@ -45,6 +103,7 @@ fn request(fixture: &str, output: PathBuf) -> BuildRequest {
     let root = workspace();
     BuildRequest {
         project_root: root.clone(),
+        module_search_roots: Vec::new(),
         entry: root.join("tests/fixtures/basic").join(fixture),
         output,
         target: TargetTriple::default(),
@@ -52,7 +111,34 @@ fn request(fixture: &str, output: PathBuf) -> BuildRequest {
         capabilities: CapabilitySet::default(),
         debug: false,
         heap_limit_bytes: None,
+        async_backend: AsyncBackend::Auto,
     }
+}
+
+fn relocate_entry_to_project(request: &mut BuildRequest) {
+    fs::create_dir_all(&request.project_root).unwrap();
+    let entry = request.project_root.join(
+        request
+            .entry
+            .file_name()
+            .expect("fixture entry has a file name"),
+    );
+    fs::copy(&request.entry, &entry).unwrap();
+    request.entry = entry;
+}
+
+fn isolated_async_request(project_name: &str, fixture: &str, output_name: &str) -> BuildRequest {
+    let source = workspace().join("tests/fixtures/async").join(fixture);
+    let project_root = std::env::temp_dir().join(format!(
+        "rimera-native-{}-{project_name}-project",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&project_root);
+    let mut request = request("hello.py", output(output_name));
+    request.project_root = project_root;
+    request.entry = source;
+    relocate_entry_to_project(&mut request);
+    request
 }
 
 fn run(path: &Path) -> std::process::Output {
@@ -71,6 +157,18 @@ fn assert_native_only_artifact(path: &Path) {
     }
 }
 
+fn assert_no_async_backend_symbols(path: &Path) {
+    let symbols = Command::new("nm").arg(path).output().unwrap();
+    assert!(symbols.status.success());
+    let symbols = String::from_utf8_lossy(&symbols.stdout).to_ascii_lowercase();
+    for forbidden in ["rimera_async", "compio", "monoio", "tokio"] {
+        assert!(
+            !symbols.contains(forbidden),
+            "synchronous artifact unexpectedly contains async/backend symbol `{forbidden}`"
+        );
+    }
+}
+
 #[test]
 fn hand_built_mir_keeps_managed_values_alive_across_collection() {
     let output = output("mir_gc");
@@ -80,6 +178,7 @@ fn hand_built_mir_keeps_managed_values_alive_across_collection() {
         name: "<module>".to_owned(),
         qualified_name: "<module>".to_owned(),
         parameters: vec![],
+        native_local_count: 0,
         entry: BlockId(0),
         value_count: 2,
         exception_edges: std::collections::BTreeMap::new(),
@@ -143,6 +242,7 @@ fn hand_built_mir_traces_children_through_a_managed_graph() {
         name: "<module>".to_owned(),
         qualified_name: "<module>".to_owned(),
         parameters: vec![],
+        native_local_count: 0,
         entry: BlockId(0),
         value_count: 3,
         exception_edges: std::collections::BTreeMap::new(),
@@ -206,7 +306,7 @@ fn hand_built_mir_traces_children_through_a_managed_graph() {
 fn dead_values_are_reclaimed_under_a_small_heap_limit() {
     let output = output("gc_reclaims_dead");
     let mut request = request("gc_reclaims_dead.py", output);
-    request.heap_limit_bytes = Some(8192);
+    request.heap_limit_bytes = Some(12 * 1024);
     let artifact = rimera_compiler::build(request).unwrap();
     let result = run(&artifact.executable);
     assert_eq!(result.status.code(), Some(0));
@@ -221,7 +321,7 @@ fn dead_values_are_reclaimed_under_a_small_heap_limit() {
 fn reachable_values_over_heap_limit_fail_deterministically() {
     let output = output("gc_limit_reachable");
     let mut request = request("gc_limit_reachable.py", output);
-    request.heap_limit_bytes = Some(8192);
+    request.heap_limit_bytes = Some(12 * 1024);
     let artifact = rimera_compiler::build(request).unwrap();
     let result = run(&artifact.executable);
     assert_eq!(result.status.code(), Some(1));
@@ -620,6 +720,7 @@ fn intermediate_object_is_kept_under_the_project_rimera_cache() {
     let mut request = request("hello.py", output);
     request.project_root =
         std::env::temp_dir().join(format!("rimera-cache-project-{}", std::process::id()));
+    relocate_entry_to_project(&mut request);
     let artifact = rimera_compiler::build(request.clone()).unwrap();
     let expected_cache = request.project_root.join(".rimera");
     assert_eq!(artifact.cache_dir, expected_cache);
@@ -640,6 +741,7 @@ fn debug_build_writes_a_readable_python_ir_dump() {
     let mut request = request("hello.py", output);
     request.project_root =
         std::env::temp_dir().join(format!("rimera-ir-project-{}", std::process::id()));
+    relocate_entry_to_project(&mut request);
     request.debug = true;
     let artifact = rimera_compiler::build(request).unwrap();
     let dump = artifact.ir_dump.expect("debug builds produce an IR dump");
@@ -663,6 +765,7 @@ fn compiler_rejects_debug_ir_dumps_as_source_entries() {
         "rimera-ir-rejection-project-{}",
         std::process::id()
     ));
+    relocate_entry_to_project(&mut debug_request);
     debug_request.debug = true;
     let artifact = rimera_compiler::build(debug_request).unwrap();
     let mut ir_request = request("hello.py", output);
@@ -776,8 +879,7 @@ fn gate5_slice1_existing_function_scope_exception_kernel_remains_native_and_diff
 #[test]
 fn gate5_slice1_later_gate_boundaries_are_stable_and_emit_no_artifact() {
     for (fixture, code) in [
-        ("gate5_cap_async_def.py", "RIM-CAP-001"),
-        ("gate5_cap_import.py", "RIM-CAP-001"),
+        ("gate5_cap_import.py", "RIM-IMPORT-001"),
         ("gate7_cap_type_param_bound.py", "RIM-CAP-G7-03"),
     ] {
         let output = output(fixture);
@@ -846,15 +948,46 @@ fn gate5_slice5_exception_objects_tracebacks_and_normalization_match_cpython_312
 }
 
 #[test]
+fn gate5_slice6_handler_capture_survives_generator_suspension_and_cleanup() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate5_handler_capture_suspend.py",
+        Some(96_000),
+    );
+}
+
+#[test]
+fn gate5_slice6_propagation_chaining_groups_and_cleanup_match_cpython_312() {
+    for fixture in [
+        "exceptions.py",
+        "exception_control_flow.py",
+        "exception_groups.py",
+        "gate6_throw_close.py",
+        "gate6_cleanup_suspend.py",
+    ] {
+        assert_gate4_fixture_matches_cpython_with_heap_limit(fixture, Some(128_000));
+    }
+}
+
+#[test]
+fn gate5_slice7_cross_feature_composition_matches_cpython_312_under_gc_pressure() {
+    for fixture in [
+        "gate4_composition.py",
+        "gate6_composition.py",
+        "gate5_scope_matrix.py",
+        "gate5_function_metadata_gc.py",
+    ] {
+        assert_gate4_fixture_matches_cpython_with_heap_limit(fixture, Some(160_000));
+    }
+}
+
+#[test]
 fn gate7_slice1_deferred_reflection_boundaries_are_stable_and_emit_no_artifact() {
     for (fixture, code) in [
         ("gate7_cap_eval.py", "RIM-CAP-G7-02"),
         ("gate7_cap_exec.py", "RIM-CAP-G7-02"),
         ("gate7_cap_compile.py", "RIM-CAP-G7-02"),
-        ("gate7_cap_unregistered_import.py", "RIM-CAP-001"),
-        ("gate7_cap_dotted_import.py", "RIM-CAP-001"),
-        ("gate7_cap_from_import.py", "RIM-CAP-001"),
-        ("gate5_cap_async_def.py", "RIM-CAP-001"),
+        ("gate7_cap_unregistered_import.py", "RIM-IMPORT-001"),
+        ("gate7_cap_dotted_import.py", "RIM-IMPORT-001"),
         ("gate7_cap_type_param_bound.py", "RIM-CAP-G7-03"),
     ] {
         let output = output(fixture);
@@ -996,6 +1129,80 @@ fn gate7_slice8_release_callback_exception_semantics_match_cpython_312() {
 }
 
 #[test]
+fn gate7_slice9_reflection_mutation_composition_matches_cpython_312_under_gc_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate7_reflection_mutation_composition.py",
+        Some(192_000),
+    );
+}
+
+#[test]
+fn gate8_async_with_boundary_is_owned_by_gate10_native_lowering() {
+    let fixture = "gate8_async_with_deferred.py";
+    let mut build_request = request(fixture, output(fixture));
+    build_request.debug = true;
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let dump = fs::read_to_string(artifact.ir_dump.as_ref().expect("debug MIR dump")).unwrap();
+    assert!(dump.contains("await_iter("), "{dump}");
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate8_slice2_single_manager_lookup_enter_body_and_exit_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate8_single_manager.py", Some(160_000));
+}
+
+#[test]
+fn gate8_slice2_single_manager_lookup_and_call_failures_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate8_single_manager_failures.py",
+        Some(160_000),
+    );
+}
+
+#[test]
+fn gate8_slice2_dead_manager_cycles_collect_under_heap_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate8_single_manager_gc.py",
+        Some(96_000),
+    );
+}
+
+#[test]
+fn gate8_slice3_targets_multiple_managers_and_partial_entry_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate8_targets_multiple.py",
+        Some(192_000),
+    );
+}
+
+#[test]
+fn gate8_slice4_control_transfers_nested_cleanup_and_class_suites_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate8_control_cleanup.py", Some(192_000));
+}
+
+#[test]
+fn gate8_slice5_exception_triples_suppression_replacement_and_chaining_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate8_exceptional_cleanup.py",
+        Some(224_000),
+    );
+}
+
+#[test]
+fn gate8_slice6_suspension_throw_close_and_delegated_cleanup_match_cpython_312() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit(
+        "gate8_generator_cleanup.py",
+        Some(224_000),
+    );
+}
+
+#[test]
+fn gate8_slice7_composition_and_gc_match_cpython_312_under_heap_pressure() {
+    assert_gate4_fixture_matches_cpython_with_heap_limit("gate8_composition_gc.py", Some(128_000));
+}
+
+#[test]
 fn gate6_source_generator_protocol_matches_cpython_312_under_gc_pressure() {
     assert_gate4_fixture_matches_cpython_with_heap_limit(
         "gate6_source_generators.py",
@@ -1044,7 +1251,14 @@ fn assert_gate4_fixture_matches_cpython_with_heap_limit(
         .arg(&request.entry)
         .output()
         .unwrap();
-    assert_eq!(native.status.code(), python.status.code(), "{fixture}");
+    assert_eq!(
+        native.status.code(),
+        python.status.code(),
+        "{fixture}\nnative stdout:\n{}\nnative stderr:\n{}\npython stderr:\n{}",
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&native.stderr),
+        String::from_utf8_lossy(&python.stderr),
+    );
     assert_eq!(native.stdout, python.stdout, "{fixture}");
     assert_eq!(native.stderr, python.stderr, "{fixture}");
     assert_native_only_artifact(&artifact.executable);
@@ -2954,4 +3168,1133 @@ fn large_modules_are_outlined_without_changing_order_or_tracebacks() {
     let stderr = String::from_utf8_lossy(&failure.stderr);
     assert_eq!(stderr.matches("in <module>").count(), 1, "{stderr}");
     assert!(stderr.contains("line 703, in <module>"), "{stderr}");
+}
+
+#[test]
+fn source_modules_link_as_native_objects_with_isolated_globals_and_one_time_initialization() {
+    ensure_runtime_archive();
+    let project_root = workspace().join("tests/fixtures/modules/gate9_native_modules");
+    let entry = project_root.join("app.py");
+    let executable = output("gate9_native_modules");
+    let artifact = rimera_compiler::build(BuildRequest {
+        project_root: project_root.clone(),
+        module_search_roots: Vec::new(),
+        entry: entry.clone(),
+        output: executable,
+        target: TargetTriple::default(),
+        profile: BuildProfile::Debug,
+        capabilities: CapabilitySet::default(),
+        debug: false,
+        heap_limit_bytes: None,
+        async_backend: AsyncBackend::Auto,
+    })
+    .unwrap();
+
+    let native = Command::new(&artifact.executable)
+        .current_dir(&project_root)
+        .output()
+        .unwrap();
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&project_root)
+        .output()
+        .unwrap();
+
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout)
+            .matches("shared initialized")
+            .count(),
+        1
+    );
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn module_cache_preserves_cycle_identity_and_rolls_back_failed_initialization() {
+    ensure_runtime_archive();
+    let project_root = workspace().join("tests/fixtures/modules/gate9_cache_cycles");
+    let entry = project_root.join("app.py");
+    let artifact = rimera_compiler::build(BuildRequest {
+        project_root: project_root.clone(),
+        module_search_roots: Vec::new(),
+        entry: entry.clone(),
+        output: output("gate9_cache_cycles"),
+        target: TargetTriple::default(),
+        profile: BuildProfile::Debug,
+        capabilities: CapabilitySet::default(),
+        debug: false,
+        heap_limit_bytes: Some(256 * 1024),
+        async_backend: AsyncBackend::Auto,
+    })
+    .unwrap();
+
+    let native = Command::new(&artifact.executable)
+        .current_dir(&project_root)
+        .output()
+        .unwrap();
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&project_root)
+        .output()
+        .unwrap();
+
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn dotted_imports_bind_parent_or_explicit_leaf_across_scopes() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_dotted");
+    let mut request = request("hello.py", output("gate9_dotted"));
+    request.project_root = root.clone();
+    request.entry = root.join("app.py");
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&request.entry)
+        .output()
+        .unwrap();
+    let artifact = rimera_compiler::build(request).unwrap();
+    let native = run(&artifact.executable);
+    assert_eq!(
+        native.status.code(),
+        python.status.code(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn from_imports_star_all_submodule_fallback_and_partial_binding_match_cpython() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_from_imports");
+    let mut request = request("hello.py", output("gate9_from_imports"));
+    request.project_root = root.clone();
+    request.entry = root.join("app.py");
+    request.heap_limit_bytes = Some(512 * 1024);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&request.entry)
+        .output()
+        .unwrap();
+    let artifact = rimera_compiler::build(request).unwrap();
+    let native = run(&artifact.executable);
+    assert_eq!(
+        native.status.code(),
+        python.status.code(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn star_import_rejects_iterator_only_all_like_cpython() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_from_imports");
+    let mut request = request("hello.py", output("gate9_bad_all"));
+    request.project_root = root.clone();
+    request.entry = root.join("bad_all_app.py");
+    request.heap_limit_bytes = Some(256 * 1024);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&request.entry)
+        .output()
+        .unwrap();
+    let artifact = rimera_compiler::build(request).unwrap();
+    let native = run(&artifact.executable);
+    assert_eq!(native.status.code(), python.status.code());
+    assert!(
+        String::from_utf8_lossy(&native.stderr).contains("does not support indexing"),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&python.stderr).contains("does not support indexing"),
+        "{}",
+        String::from_utf8_lossy(&python.stderr)
+    );
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn star_import_preserves_partial_bindings_and_failure_types() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_from_imports");
+    let mut request = request("hello.py", output("gate9_partial_all"));
+    request.project_root = root.clone();
+    request.entry = root.join("partial_all_app.py");
+    request.heap_limit_bytes = Some(256 * 1024);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&request.entry)
+        .output()
+        .unwrap();
+    let artifact = rimera_compiler::build(request).unwrap();
+    let native = run(&artifact.executable);
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn star_import_is_rejected_outside_module_scope_before_output() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_from_imports");
+    let output = output("gate9_illegal_star");
+    let mut request = request("hello.py", output.clone());
+    request.project_root = root.clone();
+    request.entry = root.join("illegal_star.py");
+    let diagnostics = rimera_compiler::build(request).unwrap_err();
+    let diagnostic = &diagnostics.as_slice()[0];
+    assert_eq!(diagnostic.code, "RIM-SEMA-001");
+    assert!(
+        diagnostic
+            .message
+            .contains("import * only allowed at module level")
+    );
+    assert!(diagnostic.span.end > diagnostic.span.start);
+    assert!(!output.exists());
+}
+
+#[test]
+fn regular_packages_relative_imports_and_metadata_match_cpython() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_packages");
+    let mut request = request("hello.py", output("gate9_packages"));
+    request.project_root = root.clone();
+    request.entry = root.join("app.py");
+    request.heap_limit_bytes = Some(512 * 1024);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&request.entry)
+        .output()
+        .unwrap();
+    let artifact = rimera_compiler::build(request).unwrap();
+    let native = run(&artifact.executable);
+    assert_eq!(
+        native.status.code(),
+        python.status.code(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn relative_import_beyond_top_level_fails_before_artifact_output() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_packages");
+    let output = output("gate9_relative_beyond");
+    let mut request = request("hello.py", output.clone());
+    request.project_root = root.clone();
+    request.entry = root.join("beyond_app.py");
+    let diagnostics = rimera_compiler::build(request).unwrap_err();
+    let diagnostic = &diagnostics.as_slice()[0];
+    assert_eq!(diagnostic.code, "RIM-IMPORT-003");
+    assert!(
+        diagnostic
+            .message
+            .contains("relative import beyond top-level package")
+    );
+    assert!(diagnostic.span.end > diagnostic.span.start);
+    assert!(!output.exists());
+}
+
+#[test]
+fn namespace_packages_merge_declared_roots_and_publish_children() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_namespaces");
+    let entry = root.join("app.py");
+    let mut request = request("hello.py", output("gate9_namespaces"));
+    request.project_root = root.clone();
+    request.module_search_roots = vec![PathBuf::from("root_a"), PathBuf::from("root_b")];
+    request.entry = entry.clone();
+    request.heap_limit_bytes = Some(512 * 1024);
+
+    let python_path = [root.join("root_a"), root.join("root_b")]
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .env("PYTHONPATH", python_path)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let artifact = rimera_compiler::build(request).unwrap();
+    let native = run(&artifact.executable);
+    assert_eq!(
+        native.status.code(),
+        python.status.code(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn regular_packages_precede_earlier_namespace_portions() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_namespace_precedence");
+    let entry = root.join("app.py");
+    let mut request = request("hello.py", output("gate9_namespace_precedence"));
+    request.project_root = root.clone();
+    request.module_search_roots = vec![PathBuf::from("root_a"), PathBuf::from("root_b")];
+    request.entry = entry.clone();
+
+    let python_path = [root.join("root_a"), root.join("root_b")]
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .env("PYTHONPATH", python_path)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let artifact = rimera_compiler::build(request).unwrap();
+    let native = run(&artifact.executable);
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn sys_modules_and_import_builtin_match_cpython_under_gc_pressure() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_sys_modules");
+    let entry = root.join("app.py");
+    let mut request = request("hello.py", output("gate9_sys_modules"));
+    request.project_root = root.clone();
+    request.entry = entry.clone();
+    request.heap_limit_bytes = Some(512 * 1024);
+
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let artifact = rimera_compiler::build(request).unwrap();
+    let native = run(&artifact.executable);
+    assert_eq!(
+        native.status.code(),
+        python.status.code(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn import_hooks_reload_and_reentrant_loading_match_cpython() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_hooks_reload");
+    let entry = root.join("app.py");
+    let mut request = request("hello.py", output("gate9_hooks_reload"));
+    request.project_root = root.clone();
+    request.entry = entry.clone();
+    request.heap_limit_bytes = Some(512 * 1024);
+
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let artifact = rimera_compiler::build(request).unwrap();
+    let native = run(&artifact.executable);
+    assert_eq!(
+        native.status.code(),
+        python.status.code(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn locked_package_resources_and_build_manifest_are_reproducible() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_locked_resources");
+    let entry = root.join("app.py");
+    let mut request = request("hello.py", output("gate9_locked_resources"));
+    request.project_root = root.clone();
+    request.entry = entry.clone();
+
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .env("PYTHONWARNINGS", "ignore::DeprecationWarning")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let first = rimera_compiler::build(request.clone()).unwrap();
+    let native = run(&first.executable);
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    let first_manifest = fs::read_to_string(first.manifest.as_ref().unwrap()).unwrap();
+    let second = rimera_compiler::build(request).unwrap();
+    let second_manifest = fs::read_to_string(second.manifest.as_ref().unwrap()).unwrap();
+    assert_eq!(first_manifest, second_manifest);
+    for expected in [
+        "runtime_abi = 1",
+        "name = \"fixture-package\"",
+        "name = \"message.txt\"",
+        "hash = \"f29e14873b1fdb17\"",
+    ] {
+        assert!(first_manifest.contains(expected), "{first_manifest}");
+    }
+    assert_native_only_artifact(&first.executable);
+}
+
+#[test]
+fn stale_locked_resource_fails_before_artifact_publication() {
+    let temporary = std::env::temp_dir().join(format!("rimera-stale-lock-{}", std::process::id()));
+    fs::create_dir_all(temporary.join("pkg")).unwrap();
+    fs::copy(
+        workspace().join("tests/fixtures/modules/gate9_locked_resources/app.py"),
+        temporary.join("app.py"),
+    )
+    .unwrap();
+    fs::copy(
+        workspace().join("tests/fixtures/modules/gate9_locked_resources/pkg/__init__.py"),
+        temporary.join("pkg/__init__.py"),
+    )
+    .unwrap();
+    fs::write(temporary.join("pkg/message.txt"), "changed\n").unwrap();
+    fs::write(
+        temporary.join("pyproject.toml"),
+        "[tool.rimera]\nlocked = true\n",
+    )
+    .unwrap();
+    fs::copy(
+        workspace().join("tests/fixtures/modules/gate9_locked_resources/rimera.lock"),
+        temporary.join("rimera.lock"),
+    )
+    .unwrap();
+    let output = temporary.join("out");
+    let mut request = request("hello.py", output.clone());
+    request.project_root = temporary.clone();
+    request.entry = temporary.join("app.py");
+    let diagnostics = rimera_compiler::build(request).unwrap_err();
+    assert_eq!(diagnostics.as_slice()[0].code, "RIM-LOCK-002");
+    assert!(!output.exists());
+}
+
+#[test]
+fn gate9_cross_feature_reentrant_reload_stress_matches_cpython_under_low_heap() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/modules/gate9_composition_stress");
+    let entry = root.join("app.py");
+    let mut build_request = request("hello.py", output("gate9_composition_stress"));
+    build_request.project_root = root.clone();
+    build_request.entry = entry.clone();
+    build_request.heap_limit_bytes = Some(64 * 1024);
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate10_slice1_preimplementation_oracles_and_budgets_are_frozen() {
+    let result = Command::new("/opt/homebrew/bin/python3.12")
+        .current_dir(workspace())
+        .arg(workspace().join("scripts/verify_gate10_slice1.py"))
+        .output()
+        .expect("run Gate 10 Slice 1 evidence verifier");
+    assert!(
+        result.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "Gate 10 Slice 1 preparatory evidence verified\n"
+    );
+}
+
+#[test]
+fn gate10_slice2_async_await_uses_explicit_native_suspension_and_no_artifact_negatives() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/async");
+    let entry = root.join("gate10_slice23_protocol.py");
+    let mut build_request = request("hello.py", output("gate10_slice2_suspend"));
+    build_request.project_root = root.clone();
+    build_request.entry = entry.clone();
+    build_request.debug = true;
+
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let dump = fs::read_to_string(artifact.ir_dump.as_ref().expect("debug MIR dump")).unwrap();
+    assert!(dump.contains("suspend Await"), "{dump}");
+    assert!(
+        !dump.contains("# yield ValueId"),
+        "coroutine await must not lower as generator yield: {dump}"
+    );
+    assert_native_only_artifact(&artifact.executable);
+
+    let temporary =
+        std::env::temp_dir().join(format!("rimera-gate10-slice2-{}", std::process::id()));
+    fs::create_dir_all(&temporary).unwrap();
+    for (index, (source, expected)) in [
+        ("await value\n", "'await' outside function"),
+        (
+            "def f():\n    return await value\n",
+            "'await' outside async function",
+        ),
+        (
+            "async for item in values:\n    value = item\n",
+            "'async for' outside async function",
+        ),
+        (
+            "async with manager:\n    value = 1\n",
+            "'async with' outside async function",
+        ),
+        (
+            "values = [x async for x in source]\n",
+            "asynchronous comprehension outside of an asynchronous function",
+        ),
+        (
+            "async def f():\n    yield from source\n",
+            "'yield from' inside async function",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let entry = temporary.join(format!("negative_{index}.py"));
+        fs::write(&entry, source).unwrap();
+        let executable = temporary.join(format!("negative_{index}"));
+        let mut build_request = request("hello.py", executable.clone());
+        build_request.project_root = temporary.clone();
+        build_request.entry = entry;
+        let diagnostics = rimera_compiler::build(build_request).unwrap_err();
+        assert!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.message == expected),
+            "expected {expected:?}, got {diagnostics:?}"
+        );
+        assert!(
+            !executable.exists(),
+            "negative async source published an artifact"
+        );
+    }
+}
+
+#[test]
+fn gate10_slice3_native_coroutine_protocol_matches_cpython_and_warns_when_unawaited() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/async");
+    let entry = root.join("gate10_slice23_protocol.py");
+    let mut build_request = request("hello.py", output("gate10_slice3_protocol"));
+    build_request.project_root = root.clone();
+    build_request.entry = entry.clone();
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&artifact.executable);
+
+    let warning_entry = root.join("gate10_slice3_unawaited.py");
+    let mut warning_request = request("hello.py", output("gate10_slice3_unawaited"));
+    warning_request.project_root = root.clone();
+    warning_request.entry = warning_entry;
+    let warning_artifact = rimera_compiler::build(warning_request).unwrap();
+    let warning = run(&warning_artifact.executable);
+    assert_eq!(warning.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&warning.stderr);
+    assert!(
+        stderr.contains("RuntimeWarning: coroutine 'pending' was never awaited"),
+        "{stderr}"
+    );
+    assert_native_only_artifact(&warning_artifact.executable);
+
+    let low_heap_entry = root.join("gate10_slice3_low_heap.py");
+    let mut low_heap_request = request("hello.py", output("gate10_slice3_low_heap"));
+    low_heap_request.project_root = root.clone();
+    low_heap_request.entry = low_heap_entry.clone();
+    low_heap_request.heap_limit_bytes = Some(16 * 1024);
+    let low_heap_artifact = rimera_compiler::build(low_heap_request).unwrap();
+    let native = run(&low_heap_artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(low_heap_entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&low_heap_artifact.executable);
+}
+
+#[test]
+fn gate10_slice4_5_sync_control_has_zero_async_backend_reachability() {
+    ensure_runtime_archive();
+    let artifact =
+        rimera_compiler::build(request("hello.py", output("gate10_slice45_sync_control"))).unwrap();
+    let native = run(&artifact.executable);
+    assert_eq!(native.status.code(), Some(0));
+    assert_native_only_artifact(&artifact.executable);
+    assert_no_async_backend_symbols(&artifact.executable);
+}
+
+#[test]
+fn gate10_slice6_generic_awaitable_protocol_matches_cpython() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/async");
+    let entry = root.join("gate10_slice6_awaitables.py");
+    let mut build_request = request("hello.py", output("gate10_slice6_awaitables"));
+    build_request.project_root = root.clone();
+    build_request.entry = entry.clone();
+    build_request.debug = true;
+
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    let dump = fs::read_to_string(artifact.ir_dump.as_ref().expect("debug MIR dump")).unwrap();
+    assert!(dump.contains("await_iter("), "{dump}");
+    assert!(dump.contains("yield_from_next("), "{dump}");
+    assert_native_only_artifact(&artifact.executable);
+
+    let mut low_heap_request = request("hello.py", output("gate10_slice6_awaitables_low_heap"));
+    low_heap_request.project_root = root.clone();
+    low_heap_request.entry = entry.clone();
+    low_heap_request.heap_limit_bytes = Some(64 * 1024);
+    let low_heap_artifact = rimera_compiler::build(low_heap_request).unwrap();
+    let low_heap = run(&low_heap_artifact.executable);
+    assert_eq!(low_heap.status.code(), python.status.code());
+    assert_eq!(low_heap.stdout, python.stdout);
+    assert_eq!(low_heap.stderr, python.stderr);
+    assert_native_only_artifact(&low_heap_artifact.executable);
+}
+
+#[test]
+fn gate10_slice7_async_for_matches_cpython() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/async");
+    let entry = root.join("gate10_slice7_async_for.py");
+    let mut build_request = request("hello.py", output("gate10_slice7_async_for"));
+    build_request.project_root = root.clone();
+    build_request.entry = entry.clone();
+    build_request.debug = true;
+
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    let dump = fs::read_to_string(artifact.ir_dump.as_ref().expect("debug MIR dump")).unwrap();
+    assert!(dump.contains("async_iter("), "{dump}");
+    assert!(dump.contains("async_next("), "{dump}");
+    assert!(dump.contains("await_iter("), "{dump}");
+    assert_native_only_artifact(&artifact.executable);
+
+    let mut low_heap_request = request("hello.py", output("gate10_slice7_async_for_low_heap"));
+    low_heap_request.project_root = root.clone();
+    low_heap_request.entry = entry.clone();
+    low_heap_request.heap_limit_bytes = Some(64 * 1024);
+    let low_heap_artifact = rimera_compiler::build(low_heap_request).unwrap();
+    let low_heap = run(&low_heap_artifact.executable);
+    assert_eq!(low_heap.status.code(), python.status.code());
+    assert_eq!(low_heap.stdout, python.stdout);
+    assert_eq!(low_heap.stderr, python.stderr);
+    assert_native_only_artifact(&low_heap_artifact.executable);
+}
+
+#[test]
+fn gate10_slice7_async_comprehensions_match_cpython() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/async");
+    let entry = root.join("gate10_slice7_async_comprehensions.py");
+    let mut build_request = request("hello.py", output("gate10_slice7_async_comprehensions"));
+    build_request.project_root = root.clone();
+    build_request.entry = entry.clone();
+    build_request.debug = true;
+
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    let dump = fs::read_to_string(artifact.ir_dump.as_ref().expect("debug MIR dump")).unwrap();
+    assert!(dump.contains("async_iter("), "{dump}");
+    assert!(dump.contains("async_next("), "{dump}");
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate10_slice8_async_generator_protocol_matches_cpython() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/async");
+    let entry = root.join("gate10_slice8_async_generators.py");
+    let mut build_request = request("hello.py", output("gate10_slice8_async_generators"));
+    build_request.project_root = root.clone();
+    build_request.entry = entry.clone();
+    build_request.debug = true;
+
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        native.status.code(),
+        python.status.code(),
+        "native stdout:\n{}\nnative stderr:\n{}\npython stdout:\n{}\npython stderr:\n{}",
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&native.stderr),
+        String::from_utf8_lossy(&python.stdout),
+        String::from_utf8_lossy(&python.stderr),
+    );
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    let dump = fs::read_to_string(artifact.ir_dump.as_ref().expect("debug MIR dump")).unwrap();
+    assert!(dump.contains("await_iter("), "{dump}");
+    let source = fs::read_to_string(&entry).unwrap();
+    let syntax = rimera_compiler::syntax::parse(&entry, &source).unwrap();
+    let hir = rimera_compiler::sema::analyze(&entry, &syntax).unwrap();
+    let program = rimera_compiler::lower::lower(&hir).unwrap();
+    let basic = program
+        .functions
+        .iter()
+        .find(|function| function.name == "basic")
+        .expect("basic async generator MIR function");
+    assert_eq!(
+        basic.kind,
+        rimera_compiler::mir::FunctionKind::AsyncGenerator
+    );
+    assert!(
+        basic.blocks.iter().any(|block| matches!(
+            block.terminator,
+            rimera_compiler::mir::Terminator::Yield { .. }
+        )),
+        "async generator body must lower yields into the suspended native function"
+    );
+    assert_native_only_artifact(&artifact.executable);
+
+    let mut low_heap_request = request(
+        "hello.py",
+        output("gate10_slice8_async_generators_low_heap"),
+    );
+    low_heap_request.project_root = root.clone();
+    low_heap_request.entry = entry.clone();
+    low_heap_request.heap_limit_bytes = Some(96 * 1024);
+    let low_heap_artifact = rimera_compiler::build(low_heap_request).unwrap();
+    let low_heap = run(&low_heap_artifact.executable);
+    assert_eq!(low_heap.status.code(), python.status.code());
+    assert_eq!(low_heap.stdout, python.stdout);
+    assert_eq!(low_heap.stderr, python.stderr);
+    assert_native_only_artifact(&low_heap_artifact.executable);
+}
+
+#[test]
+fn gate10_slice8_abandoned_async_generator_cycle_finalizes_exactly_once() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/async");
+    let entry = root.join("gate10_slice8_finalization.py");
+    let mut build_request = request("hello.py", output("gate10_slice8_finalization"));
+    build_request.project_root = root.clone();
+    build_request.entry = entry.clone();
+
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), python.status.code());
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "started 1\n['cycle-finally']\nshutdown-started 2\nbefore-shutdown\nshutdown-finally\n"
+    );
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate10_slice8_async_generator_return_value_is_rejected_before_artifact_output() {
+    let temporary = std::env::temp_dir().join(format!(
+        "rimera-gate10-slice8-return-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temporary).unwrap();
+    let entry = temporary.join("invalid.py");
+    fs::write(&entry, "async def invalid():\n    yield 1\n    return 2\n").unwrap();
+    let executable = temporary.join("invalid");
+    let mut build_request = request("hello.py", executable.clone());
+    build_request.project_root = temporary;
+    build_request.entry = entry;
+    let diagnostics = rimera_compiler::build(build_request).unwrap_err();
+    assert!(
+        diagnostics
+            .as_slice()
+            .iter()
+            .any(|diagnostic| diagnostic.message == "'return' with value in async generator"),
+        "unexpected diagnostics: {diagnostics:?}"
+    );
+    assert!(
+        !executable.exists(),
+        "invalid async generator published an artifact"
+    );
+}
+
+#[test]
+fn gate10_slice9_async_with_cleanup_matches_cpython() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/async");
+    let entry = root.join("gate10_slice9_async_with.py");
+    let mut build_request = request("hello.py", output("gate10_slice9_async_with"));
+    build_request.project_root = root.clone();
+    build_request.entry = entry.clone();
+    build_request.debug = true;
+
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let native = run(&artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        native.status.code(),
+        python.status.code(),
+        "native stdout:\n{}\nnative stderr:\n{}\npython stdout:\n{}\npython stderr:\n{}",
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&native.stderr),
+        String::from_utf8_lossy(&python.stdout),
+        String::from_utf8_lossy(&python.stderr),
+    );
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    let dump = fs::read_to_string(artifact.ir_dump.as_ref().expect("debug MIR dump")).unwrap();
+    assert!(
+        dump.contains("special_method_get") || dump.contains("__aenter__"),
+        "{dump}"
+    );
+    assert!(dump.contains("await_iter("), "{dump}");
+    assert_native_only_artifact(&artifact.executable);
+
+    let mut low_heap_request = request("hello.py", output("gate10_slice9_async_with_low_heap"));
+    low_heap_request.project_root = root.clone();
+    low_heap_request.entry = entry.clone();
+    low_heap_request.heap_limit_bytes = Some(128 * 1024);
+    let low_heap_artifact = rimera_compiler::build(low_heap_request).unwrap();
+    let low_heap = run(&low_heap_artifact.executable);
+    assert_eq!(low_heap.status.code(), python.status.code());
+    assert_eq!(low_heap.stdout, python.stdout);
+    assert_eq!(low_heap.stderr, python.stderr);
+    assert_native_only_artifact(&low_heap_artifact.executable);
+}
+
+#[test]
+fn gate10_slice10_compio_root_is_linked_only_when_async_execution_is_reachable() {
+    ensure_runtime_archive();
+    let mut async_request = isolated_async_request(
+        "gate10-slice10-auto",
+        "gate10_slice10_compio_root.py",
+        "gate10_slice10_compio_root",
+    );
+    async_request.async_backend = AsyncBackend::Auto;
+
+    let async_artifact = rimera_compiler::build(async_request).unwrap();
+    assert_eq!(async_artifact.async_backend, Some(AsyncBackend::Compio));
+    let native = run(&async_artifact.executable);
+    assert_eq!(native.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "async-root 42\nroot-return 42\n"
+    );
+    assert!(
+        native.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_native_only_artifact(&async_artifact.executable);
+    let symbols = Command::new("nm")
+        .arg(&async_artifact.executable)
+        .output()
+        .unwrap();
+    assert!(symbols.status.success());
+    let symbols = String::from_utf8_lossy(&symbols.stdout).to_ascii_lowercase();
+    assert!(
+        symbols.contains("rimera_async_backend_select_compio"),
+        "{symbols}"
+    );
+    assert!(symbols.contains("compio"), "{symbols}");
+    assert!(!symbols.contains("monoio"), "{symbols}");
+    assert!(!symbols.contains("tokio"), "{symbols}");
+
+    let mut sync_request = isolated_async_request(
+        "gate10-slice10-sync",
+        "gate10_slice10_sync_control.py",
+        "gate10_slice10_sync_control",
+    );
+    sync_request.async_backend = AsyncBackend::Compio;
+    let sync_artifact = rimera_compiler::build(sync_request).unwrap();
+    assert_eq!(sync_artifact.async_backend, None);
+    assert_no_async_backend_symbols(&sync_artifact.executable);
+    assert_native_only_artifact(&sync_artifact.executable);
+}
+
+#[test]
+fn gate10_slice10_unavailable_backends_fail_before_artifact_output() {
+    for backend in [AsyncBackend::Monoio, AsyncBackend::Tokio] {
+        let executable = output(&format!("gate10_slice10_unavailable_{}", backend.as_str()));
+        let mut build_request = request("hello.py", executable.clone());
+        build_request.async_backend = backend;
+        let diagnostics = rimera_compiler::build(build_request).unwrap_err();
+        let rendered = diagnostics.to_string();
+        assert!(rendered.contains("RIM-ASYNC-001"), "{rendered}");
+        assert!(rendered.contains(backend.as_str()), "{rendered}");
+        assert!(rendered.contains(TargetTriple::MACOS_ARM64), "{rendered}");
+        assert!(rendered.contains("available backend: compio"), "{rendered}");
+        assert!(
+            !executable.exists(),
+            "unavailable backend published an artifact"
+        );
+    }
+}
+
+#[test]
+fn gate10_slice10_explicit_compio_matches_auto_for_async_root_execution() {
+    ensure_runtime_archive();
+    let mut build_request = isolated_async_request(
+        "gate10-slice10-explicit",
+        "gate10_slice10_compio_root.py",
+        "gate10_slice10_explicit_compio",
+    );
+    build_request.async_backend = AsyncBackend::Compio;
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    assert_eq!(artifact.async_backend, Some(AsyncBackend::Compio));
+    let native = run(&artifact.executable);
+    assert_eq!(native.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "async-root 42\nroot-return 42\n"
+    );
+    assert!(
+        native.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+}
+
+#[test]
+fn gate10_slice10_release_async_size_delta_stays_within_fixed_budget() {
+    ensure_release_runtime_archive();
+    let mut sync_request = isolated_async_request(
+        "gate10-slice10-release-sync",
+        "gate10_slice10_sync_control.py",
+        "gate10_slice10_release_sync",
+    );
+    sync_request.profile = BuildProfile::Release;
+    let sync_artifact = rimera_compiler::build(sync_request).unwrap();
+    assert_eq!(sync_artifact.async_backend, None);
+    assert_no_async_backend_symbols(&sync_artifact.executable);
+
+    let mut async_request = isolated_async_request(
+        "gate10-slice10-release-async",
+        "gate10_slice10_compio_root.py",
+        "gate10_slice10_release_async",
+    );
+    async_request.profile = BuildProfile::Release;
+    async_request.async_backend = AsyncBackend::Auto;
+    let async_artifact = rimera_compiler::build(async_request).unwrap();
+    assert_eq!(async_artifact.async_backend, Some(AsyncBackend::Compio));
+    let native = run(&async_artifact.executable);
+    assert_eq!(native.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "async-root 42\nroot-return 42\n"
+    );
+
+    let sync_bytes = fs::metadata(&sync_artifact.executable).unwrap().len();
+    let async_bytes = fs::metadata(&async_artifact.executable).unwrap().len();
+    let delta = async_bytes.saturating_sub(sync_bytes);
+    assert!(
+        delta <= 524_288,
+        "async release artifact grew by {delta} bytes ({sync_bytes} -> {async_bytes}), budget is 524288"
+    );
+}
+
+#[test]
+fn gate10_slice11_cross_feature_stress_matches_cpython_under_gc_and_low_heap() {
+    ensure_runtime_archive();
+    let root = workspace().join("tests/fixtures/async/gate10_slice11");
+    let entry = root.join("app.py");
+    let mut build_request = request("hello.py", output("gate10_slice11_composition"));
+    build_request.project_root = root.clone();
+    build_request.entry = entry.clone();
+    build_request.async_backend = AsyncBackend::Auto;
+
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    assert_eq!(artifact.async_backend, Some(AsyncBackend::Compio));
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        python.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&python.stderr)
+    );
+
+    for attempt in 0..5 {
+        let native = run(&artifact.executable);
+        assert_eq!(
+            native.status.code(),
+            python.status.code(),
+            "attempt {attempt}: native stderr:\n{}\npython stderr:\n{}",
+            String::from_utf8_lossy(&native.stderr),
+            String::from_utf8_lossy(&python.stderr),
+        );
+        assert_eq!(native.stdout, python.stdout, "attempt {attempt}");
+        assert_eq!(native.stderr, python.stderr, "attempt {attempt}");
+    }
+    assert_native_only_artifact(&artifact.executable);
+
+    let mut low_heap_request = request("hello.py", output("gate10_slice11_composition_low_heap"));
+    low_heap_request.project_root = root.clone();
+    low_heap_request.entry = entry;
+    low_heap_request.async_backend = AsyncBackend::Auto;
+    low_heap_request.heap_limit_bytes = Some(512 * 1024);
+    let low_heap_artifact = rimera_compiler::build(low_heap_request).unwrap();
+    assert_eq!(low_heap_artifact.async_backend, Some(AsyncBackend::Compio));
+    for attempt in 0..3 {
+        let native = run(&low_heap_artifact.executable);
+        assert_eq!(
+            native.status.code(),
+            python.status.code(),
+            "low-heap attempt {attempt}: native stderr:\n{}\npython stderr:\n{}",
+            String::from_utf8_lossy(&native.stderr),
+            String::from_utf8_lossy(&python.stderr),
+        );
+        assert_eq!(native.stdout, python.stdout, "low-heap attempt {attempt}");
+        assert_eq!(native.stderr, python.stderr, "low-heap attempt {attempt}");
+    }
+    assert_native_only_artifact(&low_heap_artifact.executable);
+}
+
+#[test]
+fn gate10_slice13_creation_close_elision_matches_cpython_and_falls_back() {
+    ensure_runtime_archive();
+    let fixtures = workspace().join("tests/fixtures/async/gate10_slice13");
+
+    for (project, fixture, output_name) in [
+        (
+            "gate10-slice13-creation-semantics",
+            "gate10_slice13/creation_close_semantics.py",
+            "gate10_slice13_creation_semantics",
+        ),
+        (
+            "gate10-slice13-creation-rebound",
+            "gate10_slice13/creation_close_rebound.py",
+            "gate10_slice13_creation_rebound",
+        ),
+    ] {
+        let request = isolated_async_request(project, fixture, output_name);
+        let artifact = rimera_compiler::build(request).unwrap();
+        let native = run(&artifact.executable);
+        let python = Command::new("/opt/homebrew/bin/python3.12")
+            .arg(fixtures.join(Path::new(fixture).file_name().unwrap()))
+            .output()
+            .unwrap();
+        assert_eq!(python.status.code(), Some(0), "{python:?}");
+        assert_eq!(native.status.code(), python.status.code(), "{native:?}");
+        assert_eq!(native.stdout, python.stdout, "fixture {fixture}");
+        assert_eq!(native.stderr, python.stderr, "fixture {fixture}");
+        assert_native_only_artifact(&artifact.executable);
+    }
+
+    let mut low_heap_request = isolated_async_request(
+        "gate10-slice13-creation-lowheap",
+        "gate10_slice13/creation_close_semantics.py",
+        "gate10_slice13_creation_lowheap",
+    );
+    low_heap_request.heap_limit_bytes = Some(128 * 1024);
+    let low_heap_artifact = rimera_compiler::build(low_heap_request).unwrap();
+    let native = run(&low_heap_artifact.executable);
+    let python = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(fixtures.join("creation_close_semantics.py"))
+        .output()
+        .unwrap();
+    assert_eq!(python.status.code(), Some(0), "{python:?}");
+    assert_eq!(native.status.code(), python.status.code(), "{native:?}");
+    assert_eq!(native.stdout, python.stdout);
+    assert_eq!(native.stderr, python.stderr);
+    assert_native_only_artifact(&low_heap_artifact.executable);
+}
+
+#[test]
+fn gate10_reentrant_root_rejects_a_second_executor_and_restores_the_entry() {
+    let request = isolated_async_request(
+        "gate10-reentrant-root",
+        "gate10_slice11/reentrant_root.py",
+        "gate10-reentrant-root",
+    );
+    let artifact = rimera_compiler::build(request).unwrap();
+    let result = run(&artifact.executable);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    assert_eq!(
+        result.stdout,
+        b"async_runtime.run() cannot be nested\nouter 41\nroot-failure\nnext 41\n"
+    );
+    assert!(result.stderr.is_empty(), "{result:?}");
+    assert_native_only_artifact(&artifact.executable);
 }

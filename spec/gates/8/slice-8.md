@@ -23,3 +23,12 @@ Only after the audit is green, mark every Gate 8 slice and Gate 8 complete and
 promote synchronous context managers to
 `Implemented — conformance audit pending`. Do not claim `async with`, stdlib
 `contextlib`, imports/modules, dynamic compilation, async, or PyPI compatibility.
+
+## Completion evidence
+
+- The final corpus passes 317 tests with zero failures and zero ignored tests:
+  3 ABI, 8 CLI, 44 compiler-unit, 190 public native-pipeline, and 72 runtime.
+- Warning-denied workspace clippy, doc tests, formatting, diff hygiene, release
+  build, release execution, the 512 KiB size ceiling, and forbidden-symbol scans
+  pass. The audited macOS arm64 release `hello` is 503,544 bytes.
+- Gate 8 is closed; Gate 9 Slice 1 has since closed and Slice 2 is active.

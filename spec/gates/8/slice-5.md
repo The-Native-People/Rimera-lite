@@ -23,3 +23,12 @@ Gate 7 traceback metadata.
 Public CPython differentials cover exact triples, suppression truthiness,
 replacement/chaining, multiple exits, reraises, groups, tracebacks, forced GC,
 and allocation failure during exceptional cleanup.
+
+## Completion evidence
+
+- `gate8_exceptional_cleanup.py` proves identical exception values and
+  tracebacks, generic truth callbacks, false/true suppression, truth and exit
+  replacement, reraising, right-to-left nested chaining, exception groups, and
+  cleanup-time `MemoryError` against CPython 3.12.11 under a constrained heap.
+- The public test is
+  `gate8_slice5_exception_triples_suppression_replacement_and_chaining_match_cpython_312`.

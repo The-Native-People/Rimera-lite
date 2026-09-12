@@ -1,0 +1,186 @@
+---
+title: How Rimera works
+description: Follow a Python entry file through configuration, native compilation, linking, and execution.
+icon: Workflow
+---
+
+import {
+  ArchiveIcon,
+  BinaryIcon,
+  FileCode2Icon,
+  Link2Icon,
+  PlayIcon,
+  SearchCodeIcon,
+  Settings2Icon,
+  ShieldCheckIcon,
+} from 'lucide-react';
+
+Rimera Lite turns a supported Python entry file into a native executable. It
+does not translate your program to C, ship Python bytecode, or start a Python
+interpreter when the result runs.
+
+```bash
+rimera-lite app.py --output dist/app --profile release
+./dist/app
+```
+
+## The complete path
+
+```text
+app.py + pyproject.toml
+          │
+          ▼
+  Read project settings
+          │
+          ▼
+  Parse Python source
+          │
+          ▼
+  Resolve names and check semantics
+          │
+          ▼
+  HIR → verified MIR → native lowering
+          │
+          ▼
+  Cranelift machine-code object files
+          │
+          ▼
+  .rimera/objects/*.o + Rimera runtime archive
+          │
+          ▼
+       clang linker
+          │
+          ▼
+       dist/app
+```
+
+Each arrow is a real boundary. If Rimera finds unsupported syntax, an invalid
+name, or unsupported behavior, it reports the source location and stops before
+publishing an executable.
+
+## 1. Rimera finds the project
+
+When you pass `app.py`, Rimera walks upward from that file and uses the nearest
+directory containing `pyproject.toml` as the project root. Relative output and
+cache paths are anchored there, so running the command from a different shell
+directory does not move the build.
+
+```text
+my-project/
+├── pyproject.toml       ← project root and build defaults
+├── app.py               ← entry file
+├── dist/
+│   └── app              ← final executable
+└── .rimera/
+    ├── objects/         ← native object files
+    └── ir/              ← readable debug IR when requested
+```
+
+<Cards>
+  <Card icon={<FileCode2Icon className="text-cyan-400" />} title="Entry file">
+    The Python file supplied to `rimera-lite` is the program's starting point.
+  </Card>
+  <Card icon={<Settings2Icon className="text-violet-400" />} title="Project root">
+    The nearest `pyproject.toml` controls defaults and anchors relative paths.
+  </Card>
+</Cards>
+
+## 2. Rimera reads `pyproject.toml`
+
+Project defaults live in `[tool.rimera]`. Command-line flags override the
+matching values for one build.
+
+```toml
+[tool.rimera]
+output = "dist/app"
+target = "aarch64-apple-darwin"
+profile = "release"
+run = false
+debug = false
+heap_limit_bytes = 33554432
+```
+
+Here, Rimera writes the executable to `<project>/dist/app`, builds an optimized
+release artifact for Apple Silicon macOS, and gives the generated program a
+32 MiB ceiling for Rimera-managed values. The ceiling does not include native
+stack memory, executable code, system libraries, or operating-system memory.
+
+<Callout title="What wins?">
+  `rimera-lite app.py --output build/demo` uses `build/demo` even when
+  `pyproject.toml` says `dist/app`. The other project defaults still apply.
+</Callout>
+
+Read [Configuration](/docs/configuration) for every setting and its exact
+runtime effect.
+
+## 3. Source becomes executable meaning
+
+<Cards>
+  <Card icon={<SearchCodeIcon className="text-cyan-400" />} title="Parse and resolve">
+    Rimera reads Python syntax, preserves source locations, and determines what every supported name refers to.
+  </Card>
+  <Card icon={<ShieldCheckIcon className="text-emerald-400" />} title="Check semantics">
+    Calls, control flow, values, and operations are validated before machine code is emitted.
+  </Card>
+  <Card icon={<BinaryIcon className="text-violet-400" />} title="Lower to native code">
+    Rimera converts its verified internal representation into target instructions through Cranelift.
+  </Card>
+  <Card icon={<ArchiveIcon className="text-amber-300" />} title="Cache object files">
+    Native `.o` intermediates are kept under the project-local `.rimera/objects/` directory.
+  </Card>
+</Cards>
+
+HIR and MIR are Rimera's internal representations. HIR records resolved Python
+meaning; MIR makes control flow and values explicit enough to verify before
+native lowering. They are compiler internals—you do not write or maintain them.
+
+Use `--debug` only when investigating a build. It writes a readable `.ir.py`
+inspection file under `.rimera/ir/`; that file is a diagnostic view, not Python
+source that should be compiled again.
+
+## 4. clang links the executable
+
+Cranelift emits native object files directly. Rimera then asks `clang` to act as
+the platform linker driver and combine:
+
+```text
+Rimera object files (.o)
+        +
+Rust runtime archive (librimera_runtime.a)
+        +
+required platform libraries
+        │
+        ▼
+one native executable
+```
+
+The runtime supplies the behavior the generated machine code needs—managed
+values, memory management, exceptions, and supported Python operations. `clang`
+does not compile generated C because Rimera never generates a C source file.
+
+<Cards>
+  <Card icon={<Link2Icon className="text-amber-300" />} title="One link step">
+    Object code and the Rust runtime are combined into the output path shown before compilation begins.
+  </Card>
+  <Card icon={<PlayIcon className="text-emerald-400" />} title="Run directly">
+    Start the resulting file yourself, or pass `--run` to launch it after a successful build.
+  </Card>
+</Cards>
+
+## What the terminal is showing
+
+The build display follows the same path: source analysis, semantic resolution,
+native IR lowering, object emission, then runtime linking. Its header shows the
+entry file, target, exact executable output, profile, and linker. Progress is
+based on measured work such as bytes read and statements processed rather than
+decorative time estimates.
+
+If a stage fails, Rimera removes a partial output instead of leaving a file that
+looks runnable. On success, the final line identifies the executable that was
+written and the `.rimera/` cache that can be safely deleted and rebuilt.
+
+<Callout type="warn" title="Current platform boundary">
+  Rimera Lite currently emits executables for Apple Silicon macOS
+  (`aarch64-apple-darwin`). See [Supported Python](/docs/supported-python) for
+  the current language boundary before moving an application.
+</Callout>

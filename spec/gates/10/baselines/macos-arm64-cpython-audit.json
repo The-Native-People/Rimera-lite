@@ -1,0 +1,103 @@
+{
+  "environment": {
+    "cargo": "cargo 1.92.0 (344c4567c 2025-10-21)",
+    "clang": "Apple clang version 17.0.0 (clang-1700.6.3.2)",
+    "cpu": "Apple M3",
+    "machine": "arm64",
+    "os_version": "27.0",
+    "platform": "macOS-27.0-arm64-arm-64bit",
+    "processor": "arm",
+    "python": "3.12.11 (main, Jun  3 2025, 15:41:47) [Clang 17.0.0 (clang-1700.0.13.3)]",
+    "python_executable": "/opt/homebrew/opt/python@3.12/bin/python3.12",
+    "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)"
+  },
+  "measurements": {
+    "cancellation_delivery_ns": {
+      "count": 2100,
+      "max": 84167,
+      "mean": 27733.794761904763,
+      "min": 16667,
+      "p50": 27250.0,
+      "p95": 31000.0,
+      "p99": 33793.23999999997,
+      "stdev": 2393.883312641615
+    },
+    "coroutine_creation_ns_per_op": {
+      "count": 7,
+      "max": 46.3771,
+      "mean": 45.56905,
+      "min": 45.1729,
+      "p50": 45.29585,
+      "p95": 46.310215,
+      "p99": 46.363723,
+      "stdev": 0.4538736545402412
+    },
+    "direct_await_ready_ns_per_op": {
+      "count": 7,
+      "max": 233.3604,
+      "mean": 218.6345142857143,
+      "min": 213.71875,
+      "p50": 214.76875,
+      "p95": 230.629785,
+      "p99": 232.814277,
+      "stdev": 6.89142263592495
+    },
+    "direct_await_throughput_ops_per_second": {
+      "count": 7,
+      "max": 4679046.644246235,
+      "mean": 4578212.016406655,
+      "min": 4285217.200519025,
+      "p50": 4656170.88147135,
+      "p95": 4674151.534934043,
+      "p99": 4678067.622383797,
+      "stdev": 138627.25113451935
+    },
+    "idle_task_memory": {
+      "current_bytes_per_task": 896.308,
+      "peak_bytes_per_task": 896.884,
+      "task_count": 1000
+    },
+    "ready_task_handoff_ns_per_op": {
+      "count": 7,
+      "max": 42701.666666666664,
+      "mean": 41827.043333333335,
+      "min": 41172.5,
+      "p50": 41726.943333333336,
+      "p95": 42515.791666666664,
+      "p99": 42664.49166666667,
+      "stdev": 447.92258006284743
+    },
+    "timer_overshoot_ns": {
+      "count": 112,
+      "max": 198500,
+      "mean": 168651.0,
+      "min": 144750,
+      "p50": 171042.0,
+      "p95": 179710.44999999995,
+      "p99": 194253.25,
+      "stdev": 10180.670498723128
+    }
+  },
+  "notes": [
+    "CPython asyncio task/timer measurements are an external baseline only; Gate 10 does not claim asyncio compatibility.",
+    "Rimera structural budgets are checked separately from these platform-sensitive timing distributions.",
+    "No Rimera async implementation is exercised by this Slice 1 baseline harness."
+  ],
+  "oracle": "CPython 3.12",
+  "parameters": {
+    "idle_tasks": 1000,
+    "samples": 7,
+    "sync_iterations": 20000,
+    "task_iterations": 300,
+    "timer_delay_seconds": 0.001,
+    "timer_iterations": 16,
+    "warmups": 2
+  },
+  "schema": 1,
+  "sync_artifact": {
+    "async_symbols": [],
+    "path": "dist/hello",
+    "size_bytes": 909144,
+    "status": "ok"
+  }
+}

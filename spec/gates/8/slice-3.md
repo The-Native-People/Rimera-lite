@@ -22,3 +22,11 @@ Complete `as` binding and multiple-manager acquisition/unwind semantics.
 Public CPython differentials cover every target family, multi-manager ordering,
 partial entry, target failure, suppression/replacement during unwind, callback
 mutation, forced GC, and heap limits.
+
+## Status
+
+Complete. Name, attribute, item, recursive, and starred targets use the existing
+assignment-target lowering. Multiple and parenthesized managers enter
+left-to-right and captured exits run right-to-left. Public native differentials
+cover partial acquisition, target callback failure, suppression, replacement
+with preserved exception context, and constrained-heap execution.

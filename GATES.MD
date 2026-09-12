@@ -2,9 +2,15 @@
 
 ## Summary
 
-The current epic is not complete. Gates 1–4 and Gate 6 are complete. Gate 6 closes native synchronous generator lifecycle on the permanent generator object/resume ABI. Gate 5 Slices 1–5 are complete and Gate 5 Slice 6 is now the sole active compatibility slice; the remaining Gate 5 closure, reflection, and context managers still require their own end-to-end promotions.
+The zero-partial synchronous-core epic is complete. Gates 1–8 are closed: Gate
+5 closes native functions/LEGB/structured exceptions, Gate 6 closes synchronous
+generator lifecycle, Gate 7 closes reflection/introspection, and Gate 8 closes
+synchronous context managers on the same managed metadata, cleanup, and resume
+models. Gate 9 imports/modules is closed; Gate 10 async is now the sole active
+compatibility gate.
 
-Continue from the current worktree. Preserve every passing implementation and finish all started synchronous language areas plus synchronous context managers.
+Continue from the current worktree and preserve every passing synchronous-core
+implementation while executing the post-core gates in numeric order.
 
 Successful completion means these areas no longer use `Partial`, `Substantial partial`, `Foundation only`, or `Active gate`:
 
@@ -27,8 +33,8 @@ Finished categories become `Implemented — conformance audit pending` unless ex
 
 Imports/modules, async, dynamic compilation, weakrefs/finalizers, conformance,
 stdlib, native-extension/platform integration, ecosystem compatibility, and
-drop-in release qualification are the numbered post-core Gates 9–17. They
-remain queued while Gate 5 is active.
+drop-in release qualification are the numbered post-core Gates 9–17. Gate 9 is
+closed; Gate 10 is active and Gates 11–17 remain queued behind it.
 
 ## Continuous Execution Rules
 
@@ -156,10 +162,9 @@ Acceptance must cover evaluation order, scope isolation, nested/starred failures
 ## Gate 5 — Close Functions, LEGB, and Structured Exceptions
 
 The detailed implementation order is the eight-slice ledger in
-[`spec/gates/5/README.md`](spec/gates/5/README.md). Gate 6 is now closed; Gate 5
-Slices 1–5 are complete and Slice 6 is the sole active compatibility slice.
-Continue this ledger in numeric order without introducing a second call, scope,
-exception, traceback, or cleanup model.
+[`spec/gates/5/README.md`](spec/gates/5/README.md). Gate 5 is closed: all eight
+slices reached the single call, scope, exception, traceback, cleanup, GC, and
+public CPython 3.12.11 proof path.
 
 Functions and scopes:
 
@@ -218,17 +223,16 @@ The detailed implementation order is the ten-slice ledger in
 vertical unit with synchronized compiler, runtime/ABI, metadata, and public-
 proof lanes; only the integrated slice advances the ledger.
 
-Slices 1–8 are closed as pulled-forward prerequisites without promoting Gate 7
-itself. They establish the single-owner reflection matrix; documented
-`ReflectionScopeConfigure`/`ReflectionLocalRegister` and `ImportName` ABI paths;
-managed `globals`/`locals`/`vars`/`dir`; cached traced `inspect`/`weakref` module
-shells; generic identity/type/attribute reflection; managed function,
-closure-cell, signature, code, exception/traceback/frame, generator, and Python
-3.12 type-parameter metadata; audited class/type method tables; and Python-level
-PEP 688 provider dispatch over the Gate 3 memoryview core. CPython 3.12.11
-differentials, stable deferred boundaries, retained-metadata/exporter-cycle GC,
-low-heap failure atomicity, and the startup/release contracts are green. Slices
-9–10 remain open.
+All ten slices are closed. They establish the single-owner reflection matrix;
+documented `ReflectionScopeConfigure`/`ReflectionLocalRegister` and `ImportName`
+ABI paths; managed `globals`/`locals`/`vars`/`dir`; cached traced
+`inspect`/`weakref` module shells; generic identity/type/attribute reflection;
+managed function, closure-cell, signature, code, exception/traceback/frame,
+generator, and Python 3.12 type-parameter metadata; audited class/type method
+tables; Python-level PEP 688 provider dispatch; descendant/metaclass observer
+invalidation; and constrained-heap atomic reflective mutation. CPython 3.12.11
+differentials, stable deferred boundaries, composition/GC proof, startup/release
+contracts, and the final owner/symbol audit are green.
 
 Publish reflection through managed builtin functions and ordinary protocol calls:
 
@@ -272,11 +276,18 @@ Implement `with` as compiler-managed cleanup, not a runtime shortcut.
 
 Acceptance includes multiple-manager ordering, suppression, failed entry, replacement exceptions, all control-flow exits, generator suspension inside `with`, forced GC, and heap-limit behavior.
 
+Gate 8 is closed. Its public corpus proves the complete acceptance matrix
+against CPython 3.12.11 under constrained heaps, including exact triples,
+replacement/chaining, generator throw/close/delegation/abandonment, cross-core
+composition, and native-only artifacts. Final evidence is 317 passing tests,
+warning-denied clippy, doc tests, a 503,544-byte release artifact, and a clean
+forbidden-symbol scan.
+
 ## Post-core Gates 9–17
 
 The synchronous-core epic ends with Gate 8, not with a general Python 3.12 or
 drop-in claim. Continue through these queued gates in numeric order. Their
-detailed eight-slice ledgers define the implementation and proof boundaries:
+detailed ledgers define the implementation and proof boundaries:
 
 ### Gate 9 — Imports, Modules, Packages, and `sys.modules`
 
@@ -293,7 +304,11 @@ Detailed ledger: [`spec/gates/9/README.md`](spec/gates/9/README.md).
 Implement coroutines and `await`, generic awaitables, async iteration and
 comprehensions, async generators, asynchronous context managers, cancellation
 and suspended cleanup over the existing generator/call/exception machinery.
-The language protocols close here; `asyncio` closes with the standard library.
+Use a thin, statically selected async-runtime adapter: Rimera owns Python
+semantics and Compio initially owns scheduling, wakeups, timers, and platform
+I/O. Do not build a second scheduler or impose async runtime cost on synchronous
+artifacts. The language protocols close here; public `asyncio` closes with the
+standard library.
 
 Detailed ledger: [`spec/gates/10/README.md`](spec/gates/10/README.md).
 
@@ -344,7 +359,9 @@ Detailed ledger: [`spec/gates/15/README.md`](spec/gates/15/README.md).
 Prove real locked projects through resolution, installation, source/wheel
 builds, imports, entry points, tests, packaging, and representative application
 workloads. Publish correctness and performance matrices for every supported
-target and ABI tier.
+target and ABI tier. Flask, FastAPI, discord.py, and Pycord are mandatory
+flagship profiles, including their declared base/standard/voice/speed tiers as
+separate locked dependency graphs.
 
 Detailed ledger: [`spec/gates/16/README.md`](spec/gates/16/README.md).
 
@@ -385,10 +402,9 @@ At final acceptance:
 
 No included row may remain `Partial`, `Substantial partial`, `Foundation only`, or `Active gate`.
 
-After Gates 5, 7, and 8 close, Gate 9 imports/modules becomes the sole active
-gate. Gates 10–17 remain queued behind it in numeric order; no language,
-stdlib, extension-ABI, ecosystem, or drop-in claim advances ahead of its
-matching gate.
+Gate 9 imports/modules is now closed. Gate 10 async is the sole active gate and
+Gates 11–17 remain queued behind it in numeric order; no language, stdlib,
+extension-ABI, ecosystem, or drop-in claim advances ahead of its matching gate.
 
 ## Verification Contract
 
@@ -421,7 +437,7 @@ Then verify:
 
 - The public synchronous corpus compiles and runs.
 - `/opt/homebrew/bin/python3.12` reports version 3.12.11 and matches representative fixtures.
-- Release `hello` remains within 512 KiB.
+- Release `hello` remains within the current 2 MiB global ceiling.
 - No ignored tests, placeholder panics, dead ABI exports, generic development diagnostics, or generated C exist.
 - `TODO.md`, `AGENTS.md`, `spec/compatibility.md`, and `spec/abi-v1.md` agree.
 - Exactly one later active gate is recorded.

@@ -24,3 +24,10 @@ cleanup and ordinary object protocols.
 Public differentials cover normal order, descriptors, inherited/custom methods,
 mutation after entry, missing methods, failures, aliases, forced GC, and low
 heap limits through the real build API.
+
+## Status
+
+Complete. Public CPython 3.12.11 differentials cover type/MRO descriptor lookup,
+metaclass managers, captured-exit mutation behavior, exact lookup/call order,
+missing methods, enter/exit failures, aliases, retained state, dead cycles, and
+constrained-heap execution through native artifacts.

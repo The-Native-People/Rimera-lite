@@ -8,6 +8,15 @@ use rimera_abi::{RParameterKind as ParameterKind, RTypeParameterKind, RValue};
 pub enum FunctionKind {
     Normal,
     Generator { persistent_slot_count: usize },
+    Coroutine { persistent_slot_count: usize },
+    AsyncGenerator { persistent_slot_count: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendedKind {
+    Generator,
+    Coroutine,
+    AsyncGenerator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +35,8 @@ pub struct CallArgumentsObject {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeObject {
+    pub dynamic_mode: Option<rimera_abi::RDynamicCompileMode>,
+    pub flags_override: Option<u32>,
     pub code_address: usize,
     pub kind: FunctionKind,
     pub name: String,
@@ -38,9 +49,136 @@ pub struct CodeObject {
     pub free_names: Box<[String]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum FastFunctionKind {
+    Normal,
+    Generator,
+    Coroutine,
+    AsyncGenerator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FastCallMetadata {
+    pub code_address: usize,
+    /// Zero is the absent sentinel; native function addresses supplied through
+    /// the ABI are non-null by contract.
+    ready_coroutine_code_address: usize,
+    persistent_slot_count: usize,
+    /// `usize::MAX` is the generic-binding sentinel. This keeps exact arity in
+    /// one machine word instead of Rust's two-word `Option<usize>` layout.
+    positional_arity: usize,
+    /// First source line cached with native dispatch metadata so creating a
+    /// suspended activation does not have to chase the CodeObject.
+    pub first_line: u32,
+    kind: FastFunctionKind,
+    /// True only for an allocation-free, side-effect-free zero-argument ready
+    /// coroutine whose MIR is a single constant/copy return.
+    pub ready_coroutine_repeat_pure: bool,
+}
+
+impl FastCallMetadata {
+    #[must_use]
+    pub fn new(
+        code_address: usize,
+        first_line: u32,
+        positional_arity: Option<usize>,
+        kind: FunctionKind,
+    ) -> Self {
+        let mut metadata = Self {
+            code_address,
+            ready_coroutine_code_address: 0,
+            persistent_slot_count: 0,
+            positional_arity: positional_arity.unwrap_or(usize::MAX),
+            first_line,
+            kind: FastFunctionKind::Normal,
+            ready_coroutine_repeat_pure: false,
+        };
+        metadata.set_kind(kind);
+        metadata
+    }
+
+    #[must_use]
+    pub fn positional_arity(self) -> Option<usize> {
+        (self.positional_arity != usize::MAX).then_some(self.positional_arity)
+    }
+
+    #[must_use]
+    pub fn kind(self) -> FunctionKind {
+        match self.kind {
+            FastFunctionKind::Normal => FunctionKind::Normal,
+            FastFunctionKind::Generator => FunctionKind::Generator {
+                persistent_slot_count: self.persistent_slot_count,
+            },
+            FastFunctionKind::Coroutine => FunctionKind::Coroutine {
+                persistent_slot_count: self.persistent_slot_count,
+            },
+            FastFunctionKind::AsyncGenerator => FunctionKind::AsyncGenerator {
+                persistent_slot_count: self.persistent_slot_count,
+            },
+        }
+    }
+
+    pub fn set_kind(&mut self, kind: FunctionKind) {
+        let (kind, persistent_slot_count) = match kind {
+            FunctionKind::Normal => (FastFunctionKind::Normal, 0),
+            FunctionKind::Generator {
+                persistent_slot_count,
+            } => (FastFunctionKind::Generator, persistent_slot_count),
+            FunctionKind::Coroutine {
+                persistent_slot_count,
+            } => (FastFunctionKind::Coroutine, persistent_slot_count),
+            FunctionKind::AsyncGenerator {
+                persistent_slot_count,
+            } => (FastFunctionKind::AsyncGenerator, persistent_slot_count),
+        };
+        self.kind = kind;
+        self.persistent_slot_count = persistent_slot_count;
+    }
+
+    #[must_use]
+    pub fn ready_coroutine_code_address(self) -> Option<usize> {
+        (self.ready_coroutine_code_address != 0).then_some(self.ready_coroutine_code_address)
+    }
+
+    pub fn set_ready_coroutine(&mut self, code_address: usize, repeat_pure: bool) {
+        debug_assert_ne!(code_address, 0);
+        self.ready_coroutine_code_address = code_address;
+        self.ready_coroutine_repeat_pure = repeat_pure;
+    }
+}
+
+impl CodeObject {
+    #[must_use]
+    pub fn fast_call_metadata(&self) -> FastCallMetadata {
+        let positional_arity = self
+            .parameters
+            .iter()
+            .all(|parameter| {
+                matches!(
+                    parameter.kind,
+                    ParameterKind::PositionalOnly | ParameterKind::PositionalOrKeyword
+                )
+            })
+            .then_some(self.parameters.len());
+        FastCallMetadata::new(
+            self.code_address,
+            self.first_line,
+            positional_arity,
+            self.kind,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionObject {
     pub code: RValue,
+    /// Cached immutable native dispatch facts. This avoids re-reading the Code
+    /// object and rescanning parameter kinds on every exact positional call.
+    pub fast_call: FastCallMetadata,
+    /// The defining module namespace. Python functions resolve globals in the
+    /// module where they were created, not in the module that calls them.
+    pub globals: RValue,
     pub name: String,
     pub qualified_name: String,
     pub closure: Option<RValue>,
@@ -66,11 +204,20 @@ pub struct TypeAliasObject {
 /// Persistent execution state for one compiled synchronous generator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratorObject {
+    pub kind: SuspendedKind,
     pub function: RValue,
-    pub name: String,
-    pub qualified_name: String,
+    /// Names normally live on the owning FunctionObject and are read lazily at
+    /// reflection/repr/finalizer boundaries. Python allows a suspended object's
+    /// `__name__` and `__qualname__` to diverge from its function, so only an
+    /// explicit write allocates these per-activation overrides.
+    pub name_override: Option<String>,
+    pub qualified_name_override: Option<String>,
     pub resume_address: usize,
     pub state: u32,
+    /// Last source line published by native suspension code. Frame objects are
+    /// reflection metadata and may be materialized lazily for coroutines, so
+    /// the execution object owns the authoritative line independently.
+    pub current_line: u32,
     pub slots: Box<[Option<RValue>]>,
     /// Reflection-only cell registry for the generator activation. The cells
     /// are the same cells used by compiled execution; no duplicate locals
@@ -88,9 +235,51 @@ pub struct GeneratorObject {
     pub raised: Option<RValue>,
     pub started: bool,
     pub running: bool,
+    /// Async generators allow only one outstanding protocol operation to own
+    /// resume rights at a time. Ordinary generators/coroutines leave this false.
+    pub async_operation_active: bool,
     pub closed: bool,
     pub completed: bool,
+    /// Set before GC-triggered close so an ignored `GeneratorExit` or an
+    /// unraisable cleanup failure cannot schedule the same finalizer forever.
+    pub finalizer_ran: bool,
     pub return_value: Option<RValue>,
+}
+
+/// Awaitable wrapper used only by the two-argument `anext(iterator, default)`
+/// builtin. It retains the underlying `__anext__` awaitable and converts a
+/// terminal `StopAsyncIteration` into the caller-provided default without
+/// creating a second coroutine execution model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsyncNextAwaitableObject {
+    pub owner: RValue,
+    pub awaitable: RValue,
+    pub default: RValue,
+    pub iterator: Option<RValue>,
+    pub started: bool,
+    pub running: bool,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncGeneratorOperationKind {
+    Next,
+    Send,
+    Throw,
+    Close,
+}
+
+/// One awaitable protocol operation on an async generator. The operation owns
+/// resume rights from its first poll until it yields an item, terminates, or
+/// propagates an exception; internal awaits remain generator-local delegates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsyncGeneratorOperationObject {
+    pub generator: RValue,
+    pub input: RValue,
+    pub kind: AsyncGeneratorOperationKind,
+    pub started: bool,
+    pub running: bool,
+    pub completed: bool,
 }
 
 /// A permanent native callable exposed through the ordinary Python call path.
@@ -110,6 +299,21 @@ pub enum BuiltinFunctionKind {
     IsSubclass,
     Iter,
     Next,
+    AIter,
+    ANext,
+    Compile,
+    Eval,
+    Exec,
+    AsyncRuntimeRun,
+    AsyncGeneratorIter,
+    AsyncGeneratorNext,
+    AsyncGeneratorSend,
+    AsyncGeneratorThrow,
+    AsyncGeneratorClose,
+    AsyncGeneratorOperationNext,
+    AsyncGeneratorOperationSend,
+    AsyncGeneratorOperationThrow,
+    AsyncGeneratorOperationClose,
     TypePrepare,
     Property,
     StaticMethod,
@@ -204,6 +408,10 @@ pub enum BuiltinFunctionKind {
     Vars,
     Globals,
     Locals,
+    Import,
+    Reload,
+    InvalidateImportCaches,
+    ReadBinaryResource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -521,11 +729,44 @@ pub struct MemoryViewObject {
 }
 
 impl DictionaryObject {
-    pub fn get(&self, name: &str) -> Option<RValue> {
+    pub fn get_index(&self, name: &str) -> Option<(usize, RValue)> {
         self.entries
             .iter()
+            .enumerate()
             .rev()
-            .find_map(|(key, value)| (key == name).then_some(*value))
+            .find_map(|(index, (key, value))| (key == name).then_some((index, *value)))
+    }
+
+    pub fn get(&self, name: &str) -> Option<RValue> {
+        self.get_index(name).map(|(_, value)| value)
+    }
+
+    pub fn managed_growth_for_insert(&self, name: &str) -> usize {
+        if self.entries.iter().any(|(key, _)| key == name) {
+            return 0;
+        }
+        let element_size = size_of::<(String, RValue)>();
+        let old_capacity = self.entries.capacity();
+        let required = self.entries.len().saturating_add(1);
+        let minimum_capacity = if element_size == 1 {
+            8
+        } else if element_size <= 1_024 {
+            4
+        } else {
+            1
+        };
+        let new_capacity = if required <= old_capacity {
+            old_capacity
+        } else {
+            old_capacity
+                .saturating_mul(2)
+                .max(required)
+                .max(minimum_capacity)
+        };
+        new_capacity
+            .saturating_sub(old_capacity)
+            .saturating_mul(element_size)
+            .saturating_add(name.len())
     }
 
     pub fn insert(&mut self, name: String, value: RValue) -> Option<RValue> {
@@ -579,9 +820,18 @@ pub struct FrameObject {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleState {
+    Created,
+    Initializing,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleObject {
     pub name: String,
     pub namespace: RValue,
+    pub state: ModuleState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,7 +933,9 @@ pub enum ManagedObject {
     Super(SuperObject),
     Function(FunctionObject),
     Code(CodeObject),
-    Generator(Box<GeneratorObject>),
+    Generator(GeneratorObject),
+    AsyncNextAwaitable(AsyncNextAwaitableObject),
+    AsyncGeneratorOperation(AsyncGeneratorOperationObject),
     BuiltinFunction(BuiltinFunctionObject),
     Cell(CellObject),
     Exception(ExceptionObject),
@@ -790,6 +1042,7 @@ impl ManagedObject {
             }
             Self::Function(object) => {
                 visitor(object.code);
+                visitor(object.globals);
                 object.closure.into_iter().for_each(&mut *visitor);
                 object.defaults.into_iter().for_each(&mut *visitor);
                 object.keyword_defaults.into_iter().for_each(&mut *visitor);
@@ -816,6 +1069,16 @@ impl ManagedObject {
                 object.handled.iter().copied().for_each(&mut *visitor);
                 object.raised.into_iter().for_each(&mut *visitor);
                 object.return_value.into_iter().for_each(visitor);
+            }
+            Self::AsyncNextAwaitable(object) => {
+                visitor(object.owner);
+                visitor(object.awaitable);
+                visitor(object.default);
+                object.iterator.into_iter().for_each(visitor);
+            }
+            Self::AsyncGeneratorOperation(object) => {
+                visitor(object.generator);
+                visitor(object.input);
             }
             Self::BuiltinFunction(_) => {}
             Self::Cell(object) => object.value.into_iter().for_each(visitor),
@@ -957,7 +1220,13 @@ impl ManagedObject {
                 .name
                 .capacity()
                 .saturating_add(object.qualified_name.capacity())
-                .saturating_add(size_of::<FunctionObject>()),
+                // FastCallMetadata is inline native optimization state, not
+                // Python-visible managed payload. Do not make a managed-heap
+                // limit fail merely because the runtime learned a new cache;
+                // native/RSS overhead is audited separately.
+                .saturating_add(
+                    size_of::<FunctionObject>().saturating_sub(size_of::<FastCallMetadata>()),
+                ),
             Self::Code(object) => object
                 .name
                 .capacity()
@@ -990,8 +1259,13 @@ impl ManagedObject {
                         .saturating_mul(size_of::<String>()),
                 ),
             Self::Generator(object) => size_of::<GeneratorObject>()
-                .saturating_add(object.name.capacity())
-                .saturating_add(object.qualified_name.capacity())
+                .saturating_add(object.name_override.as_ref().map_or(0, String::capacity))
+                .saturating_add(
+                    object
+                        .qualified_name_override
+                        .as_ref()
+                        .map_or(0, String::capacity),
+                )
                 .saturating_add(
                     object
                         .slots
@@ -1012,6 +1286,8 @@ impl ManagedObject {
                         .sum::<usize>(),
                 )
                 .saturating_add(object.handled.len().saturating_mul(size_of::<RValue>())),
+            Self::AsyncNextAwaitable(_) => size_of::<AsyncNextAwaitableObject>(),
+            Self::AsyncGeneratorOperation(_) => size_of::<AsyncGeneratorOperationObject>(),
             Self::BuiltinFunction(object) => object.name.capacity(),
             Self::Cell(_) => size_of::<CellObject>(),
             Self::Exception(object) => object

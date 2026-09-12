@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::core::{Diagnostic, DiagnosticSet, Span};
 pub use rimera_abi::{
     RBinaryOperator as BinaryOperator, RCompareOperator as CompareOperator,
-    RUnaryOperator as UnaryOperator,
+    RDynamicCompileMode as CompileMode, RUnaryOperator as UnaryOperator,
 };
 use rustpython_parser::ast::Ranged;
 use rustpython_parser::{Parse, ast};
@@ -53,6 +53,7 @@ pub enum StatementKind {
     },
     FunctionDef {
         name: String,
+        is_async: bool,
         type_params: Vec<TypeParameter>,
         decorators: Vec<Expression>,
         parameters: Vec<Parameter>,
@@ -79,6 +80,11 @@ pub enum StatementKind {
     Import {
         aliases: Vec<ImportAlias>,
     },
+    ImportFrom {
+        module: Option<String>,
+        level: u32,
+        aliases: Vec<ImportAlias>,
+    },
     Break,
     Continue,
     Expression(Expression),
@@ -94,6 +100,11 @@ pub enum StatementKind {
         else_body: Vec<Statement>,
         finally_body: Vec<Statement>,
         is_star: bool,
+    },
+    With {
+        items: Vec<WithItem>,
+        body: Vec<Statement>,
+        is_async: bool,
     },
     Print {
         values: Vec<Expression>,
@@ -112,6 +123,7 @@ pub enum StatementKind {
         iterable: Expression,
         body: Vec<Statement>,
         else_body: Vec<Statement>,
+        is_async: bool,
     },
     Match {
         subject: Expression,
@@ -120,9 +132,16 @@ pub enum StatementKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct WithItem {
+    pub context: Expression,
+    pub target: Option<Target>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ImportAlias {
     pub module: String,
     pub bind_name: String,
+    pub explicit_alias: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +292,7 @@ pub struct ComprehensionClause {
     pub target: Target,
     pub iterable: Expression,
     pub filters: Vec<Expression>,
+    pub is_async: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +356,9 @@ pub enum ExpressionKind {
     YieldFrom {
         value: Box<Expression>,
     },
+    Await {
+        value: Box<Expression>,
+    },
     Comprehension {
         kind: ComprehensionKind,
         element: Box<Expression>,
@@ -355,18 +378,59 @@ pub enum ExpressionKind {
 }
 
 pub fn parse(path: &Path, source: &str) -> Result<Module, DiagnosticSet> {
-    let suite = ast::Suite::parse(source, &path.to_string_lossy()).map_err(|error| {
+    parse_mode(path, source, CompileMode::Exec)
+}
+
+/// Parses one of Python's three `compile()` grammar modes through the same
+/// RustPython-parser front end used by ordinary Rimera source builds. No AST
+/// interpreter or alternate dynamic grammar exists behind this entry point.
+pub fn parse_mode(
+    path: &Path,
+    source: &str,
+    mode: CompileMode,
+) -> Result<Module, DiagnosticSet> {
+    let source_path = path.to_string_lossy();
+    let parse_error = |error: rustpython_parser::ParseError| {
         DiagnosticSet::one(Diagnostic::new(
             "RIM-PARSE-001",
             error.to_string(),
             path,
-            Span::default(),
+            Span::new(error.offset.to_u32(), error.offset.to_u32()),
         ))
-    })?;
-    let statements = suite
-        .iter()
-        .map(|statement| convert_statement(path, statement))
-        .collect::<Result<Vec<_>, _>>()?;
+    };
+    let statements = match mode {
+        CompileMode::Exec => ast::Suite::parse(source, &source_path)
+            .map_err(parse_error)?
+            .iter()
+            .map(|statement| convert_statement(path, statement))
+            .collect::<Result<Vec<_>, _>>()?,
+        CompileMode::Eval => {
+            let expression = ast::ModExpression::parse(source, &source_path).map_err(parse_error)?;
+            let expression = convert_expression(path, &expression.body)?;
+            vec![Statement {
+                span: expression.span,
+                kind: StatementKind::Expression(expression),
+            }]
+        }
+        CompileMode::Single => {
+            let interactive = ast::ModInteractive::parse(source, &source_path).map_err(parse_error)?;
+            if interactive.body.windows(2).any(|pair| {
+                source[pair[0].end().to_usize()..pair[1].start().to_usize()].contains('\n')
+            }) {
+                return Err(DiagnosticSet::one(Diagnostic::new(
+                    "RIM-PARSE-001",
+                    "multiple statements found while compiling a single statement",
+                    path,
+                    Span::default(),
+                )));
+            }
+            interactive
+                .body
+                .iter()
+                .map(|statement| convert_statement(path, statement))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
     let line_starts = std::iter::once(0)
         .chain(
             source
@@ -388,6 +452,24 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
     let kind = match statement {
         ast::Stmt::FunctionDef(node) => StatementKind::FunctionDef {
             name: node.name.to_string(),
+            is_async: false,
+            type_params: convert_type_parameters(path, &node.type_params)?,
+            decorators: node
+                .decorator_list
+                .iter()
+                .map(|decorator| convert_expression(path, decorator))
+                .collect::<Result<Vec<_>, _>>()?,
+            parameters: convert_parameters(path, &node.args)?,
+            return_annotation: node
+                .returns
+                .as_deref()
+                .map(|annotation| convert_expression(path, annotation))
+                .transpose()?,
+            body: convert_statements(path, &node.body)?,
+        },
+        ast::Stmt::AsyncFunctionDef(node) => StatementKind::FunctionDef {
+            name: node.name.to_string(),
+            is_async: true,
             type_params: convert_type_parameters(path, &node.type_params)?,
             decorators: node
                 .decorator_list
@@ -507,21 +589,38 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
             let mut aliases = Vec::with_capacity(node.names.len());
             for alias in &node.names {
                 let module = alias.name.to_string();
-                if module.contains('.') {
-                    return unsupported(
-                        path,
-                        span,
-                        "dotted imports are outside the pulled-forward native import foundation",
-                    );
-                }
-                let bind_name = alias
-                    .asname
-                    .as_ref()
-                    .map_or_else(|| module.clone(), ToString::to_string);
-                aliases.push(ImportAlias { module, bind_name });
+                let bind_name = alias.asname.as_ref().map_or_else(
+                    || module.split('.').next().unwrap_or(&module).to_owned(),
+                    ToString::to_string,
+                );
+                aliases.push(ImportAlias {
+                    module,
+                    bind_name,
+                    explicit_alias: alias.asname.is_some(),
+                });
             }
             StatementKind::Import { aliases }
         }
+        ast::Stmt::ImportFrom(node) => StatementKind::ImportFrom {
+            module: node.module.as_ref().map(ToString::to_string),
+            level: node.level.map_or(0, |level| level.to_u32()),
+            aliases: node
+                .names
+                .iter()
+                .map(|alias| {
+                    let module = alias.name.to_string();
+                    let bind_name = alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| module.clone(), ToString::to_string);
+                    ImportAlias {
+                        module,
+                        bind_name,
+                        explicit_alias: alias.asname.is_some(),
+                    }
+                })
+                .collect(),
+        },
         ast::Stmt::Break(_) => StatementKind::Break,
         ast::Stmt::Continue(_) => StatementKind::Continue,
         ast::Stmt::Global(node) => {
@@ -555,6 +654,42 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
             else_body: convert_statements(path, &node.orelse)?,
             finally_body: convert_statements(path, &node.finalbody)?,
             is_star: true,
+        },
+        ast::Stmt::With(node) => StatementKind::With {
+            items: node
+                .items
+                .iter()
+                .map(|item| {
+                    Ok(WithItem {
+                        context: convert_expression(path, &item.context_expr)?,
+                        target: item
+                            .optional_vars
+                            .as_deref()
+                            .map(|target| convert_target(path, target))
+                            .transpose()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, DiagnosticSet>>()?,
+            body: convert_statements(path, &node.body)?,
+            is_async: false,
+        },
+        ast::Stmt::AsyncWith(node) => StatementKind::With {
+            items: node
+                .items
+                .iter()
+                .map(|item| {
+                    Ok(WithItem {
+                        context: convert_expression(path, &item.context_expr)?,
+                        target: item
+                            .optional_vars
+                            .as_deref()
+                            .map(|target| convert_target(path, target))
+                            .transpose()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, DiagnosticSet>>()?,
+            body: convert_statements(path, &node.body)?,
+            is_async: true,
         },
         ast::Stmt::Assign(node) => StatementKind::Assign {
             targets: node
@@ -627,6 +762,14 @@ fn convert_statement(path: &Path, statement: &ast::Stmt) -> Result<Statement, Di
             iterable: convert_expression(path, &node.iter)?,
             body: convert_statements(path, &node.body)?,
             else_body: convert_statements(path, &node.orelse)?,
+            is_async: false,
+        },
+        ast::Stmt::AsyncFor(node) => StatementKind::For {
+            target: convert_target(path, node.target.as_ref())?,
+            iterable: convert_expression(path, &node.iter)?,
+            body: convert_statements(path, &node.body)?,
+            else_body: convert_statements(path, &node.orelse)?,
+            is_async: true,
         },
         _ => {
             return unsupported(
@@ -841,6 +984,7 @@ fn convert_class_body(
                 | StatementKind::Assert { .. }
                 | StatementKind::Raise { .. }
                 | StatementKind::Try { .. }
+                | StatementKind::With { .. }
                 | StatementKind::ClassDef { .. }
                 | StatementKind::Import { .. }
                 | StatementKind::Global(_)
@@ -865,14 +1009,6 @@ fn convert_comprehension_clauses(
     generators
         .iter()
         .map(|generator| {
-            if generator.is_async {
-                return capability(
-                    path,
-                    Span::default(),
-                    "RIM-CAP-ASYNC-001",
-                    "asynchronous comprehensions are owned by the async compatibility gate",
-                );
-            }
             Ok(ComprehensionClause {
                 target: convert_target(path, &generator.target)?,
                 iterable: convert_expression(path, &generator.iter)?,
@@ -881,6 +1017,7 @@ fn convert_comprehension_clauses(
                     .iter()
                     .map(|filter| convert_expression(path, filter))
                     .collect::<Result<Vec<_>, _>>()?,
+                is_async: generator.is_async,
             })
         })
         .collect()
@@ -1061,6 +1198,9 @@ fn convert_expression(path: &Path, expression: &ast::Expr) -> Result<Expression,
                 .map(Box::new),
         },
         ast::Expr::YieldFrom(node) => ExpressionKind::YieldFrom {
+            value: Box::new(convert_expression(path, &node.value)?),
+        },
+        ast::Expr::Await(node) => ExpressionKind::Await {
             value: Box::new(convert_expression(path, &node.value)?),
         },
         ast::Expr::ListComp(node) => ExpressionKind::Comprehension {
@@ -1299,6 +1439,34 @@ mod tests {
                 CallPart::Keyword { name, .. }
             ] if name == "end"
         ));
+    }
+
+    #[test]
+    fn gate8_with_syntax_preserves_items_targets_and_async_boundary() {
+        let module = parse(path(), "with first as value, second:\n    print(value)\n").unwrap();
+        let StatementKind::With { items, body, .. } = &module.statements[0].kind else {
+            panic!("expected a with statement");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(items[0].target.is_some());
+        assert!(items[1].target.is_none());
+        assert_eq!(body.len(), 1);
+        assert!(module.statements[0].span.end > module.statements[0].span.start);
+
+        let async_module = parse(
+            path(),
+            "async def main():\n    async with manager:\n        value = 1\n",
+        )
+        .unwrap();
+        let StatementKind::FunctionDef { body, is_async, .. } = &async_module.statements[0].kind
+        else {
+            panic!("expected async function");
+        };
+        assert!(*is_async);
+        let StatementKind::With { is_async, .. } = &body[0].kind else {
+            panic!("expected async with statement");
+        };
+        assert!(*is_async);
     }
 
     #[test]

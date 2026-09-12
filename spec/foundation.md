@@ -14,7 +14,7 @@
 - Verified SSA-style MIR lowers through Cranelift directly to arm64 Mach-O.
 - The linker accepts object files and the Rust runtime archive; it never
   accepts C sources.
-- The public compiler API and `rimera build` compile the first Python subset.
+- The public compiler API and `rimera-lite build` compile the first Python subset.
 - The execution kernel now includes managed type, function, cell, tuple,
   dictionary, exception, traceback, and exception-group objects. Compiled
   modules contain multiple native MIR functions using one generic call ABI.
@@ -25,6 +25,11 @@
   bare reraising, causes, contexts, suppression, `else`, `finally`, cleanup
   across return/break/continue, native traceback propagation, and `except*`
   subgroup splitting/merging.
+- Gate 8 completes Rimera-owned synchronous `with` syntax/HIR and verified
+  cleanup MIR. Captured type/MRO special methods use generic calls; multiple
+  managers, assignment targets, partial entry, every completion, exception
+  triples/suppression/chaining, generator suspension and abandonment, and
+  cross-feature GC share the existing exception, generator, and cleanup models.
 
 ## Proof
 
@@ -50,6 +55,13 @@
   39,371-line compile-stress fixture lowers into verified module chunks,
   compiles without Cranelift function-size failures, produces CPython-matching
   output, and preserves a single source-accurate module traceback frame.
+- synchronous context-manager lookup/call order, missing and failing methods,
+  captured-exit mutation, all supported `as` target shapes, multiple and
+  parenthesized acquisition, partial-entry unwind, return/break/continue,
+  exact exception triples, suppression/replacement/chaining, nested `finally`,
+  class-suite execution, generator send/throw/close/delegation/abandonment,
+  reflection and buffer composition, reentrancy, cycles, constrained heaps,
+  and native-only artifacts against CPython 3.12.11.
 
 Runtime unit tests prove child tracing, self and multi-object cycle collection,
 deep iterative marking, generation retirement, nested and temporary roots,
@@ -57,20 +69,16 @@ adaptive byte thresholds, heap limits, Python floor arithmetic, and
 large-integer handles. MIR tests prove exact branch, loop, and shrinking
 safepoint live sets.
 
-The release `print("hello")` artifact measures 470,408 bytes on macOS arm64,
+The release `print("hello")` artifact measures 503,544 bytes on macOS arm64,
 below the 512 KiB milestone budget. Release linking dead-strips unreachable
 sections and strips debug metadata; its only dynamic dependency is
 `/usr/lib/libSystem.B.dylib`.
 
 ## Next capability
 
-The completed object-model gates add executable module-scope class bodies,
-traceable class and instance dictionaries, native attribute read/write/delete,
-bound compiled methods, user multiple inheritance, C3 MRO, subtype behavior,
-and explicit two-argument `super` through the generic call ABI. The active
-compatibility milestone is descriptor precedence, slots, `__class__` cells,
-and zero-argument `super`; metaclass construction and operator dunder dispatch
-follow in the order recorded in `TODO.md` and `spec/compatibility.md`. Every
-gate must reuse the managed type objects, generic call ABI, explicit exception
-edges, and tracing contracts established here rather than introduce a
-parallel representation.
+Gate 9 Slice 1 closed the canonical graph and managed module-state ownership.
+Gate 9 Slice 2 is the sole active compatibility slice and owns deterministic
+project-source discovery, graph edges, hashes, spans, and diagnostics
+that the later import/package slices execute. It must extend the narrow managed
+module registry established by Gate 7 rather than introduce a parallel module
+representation.

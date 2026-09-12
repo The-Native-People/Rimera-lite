@@ -2,11 +2,94 @@
 @import 'fumadocs-ui/css/neutral.css';
 @import 'fumadocs-ui/css/preset.css';
 
-html {
-  scrollbar-gutter: stable;
+:root {
+  --font-sans: 'Red Hat Mono Variable', 'Red Hat Mono', ui-monospace, monospace;
+  --font-mono: 'Red Hat Mono Variable', 'Red Hat Mono', ui-monospace, monospace;
+  --font-display: 'Syne Variable', 'Arial Black', sans-serif;
+  --rimera-canvas: hsl(195 16% 95%);
+  --rimera-hero: hsl(195 18% 93%);
+  --rimera-surface: hsl(0 0% 100%);
+  --rimera-surface-raised: hsl(195 18% 90%);
+  --rimera-ink: hsl(198 24% 8%);
+  --rimera-strong: hsl(198 30% 3%);
+  --rimera-muted: hsl(195 10% 34%);
+  --rimera-accent: hsl(194 100% 27%);
+  --rimera-accent-soft: hsl(194 72% 82%);
+  --rimera-on-accent: hsl(198 35% 8%);
+  --rimera-line: hsl(195 10% 65%);
+  --rimera-ring: hsl(195 10% 80%);
+  --rimera-header: hsl(195 18% 97% / 0.9);
+  --rimera-hero-shade: linear-gradient(90deg, hsl(195 18% 95% / 0.97) 0%, hsl(195 18% 95% / 0.8) 48%, hsl(195 18% 95% / 0.16) 100%), linear-gradient(0deg, hsl(195 18% 95% / 0.68) 0%, transparent 62%);
 }
 
-html > body[data-scroll-locked] {
-  margin-right: 0px !important;
-  --removed-body-scroll-bar-size: 0px !important;
+.dark {
+  --rimera-canvas: hsl(210 33% 4%);
+  --rimera-hero: hsl(210 44% 4%);
+  --rimera-surface: hsl(205 31% 7%);
+  --rimera-surface-raised: hsl(204 32% 11%);
+  --rimera-ink: hsl(190 24% 94%);
+  --rimera-strong: hsl(0 0% 100%);
+  --rimera-muted: hsl(195 10% 72%);
+  --rimera-accent: hsl(194 78% 75%);
+  --rimera-accent-soft: hsl(194 82% 87%);
+  --rimera-on-accent: hsl(198 35% 8%);
+  --rimera-line: hsl(195 3% 29%);
+  --rimera-ring: hsl(200 5% 18%);
+  --rimera-header: hsl(210 33% 4% / 0.9);
+  --rimera-hero-shade: linear-gradient(90deg, hsl(210 44% 4% / 0.97) 0%, hsl(210 44% 4% / 0.76) 48%, hsl(210 44% 4% / 0.2) 100%), linear-gradient(0deg, hsl(210 44% 4% / 0.7) 0%, transparent 62%);
 }
+
+@theme inline {
+  --color-rimera-canvas: var(--rimera-canvas);
+  --color-rimera-hero: var(--rimera-hero);
+  --color-rimera-surface: var(--rimera-surface);
+  --color-rimera-surface-raised: var(--rimera-surface-raised);
+  --color-rimera-ink: var(--rimera-ink);
+  --color-rimera-strong: var(--rimera-strong);
+  --color-rimera-muted: var(--rimera-muted);
+  --color-rimera-accent: var(--rimera-accent);
+  --color-rimera-accent-soft: var(--rimera-accent-soft);
+  --color-rimera-on-accent: var(--rimera-on-accent);
+  --color-rimera-line: var(--rimera-line);
+  --color-rimera-ring: var(--rimera-ring);
+}
+
+body {
+  font-family: var(--font-sans);
+  font-optical-sizing: auto;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html { scrollbar-gutter: stable; }
+
+html > body[data-scroll-locked] {
+  margin-right: 0 !important;
+  --removed-body-scroll-bar-size: 0 !important;
+}
+
+.rimera-site {
+  min-height: 100dvh;
+  background: var(--rimera-canvas);
+  color: var(--rimera-ink);
+  color-scheme: light;
+  transition: background-color 300ms ease, color 300ms ease;
+}
+
+.dark .rimera-site { color-scheme: dark; }
+
+.rimera-site > header {
+  border-color: var(--rimera-line);
+  background: var(--rimera-header);
+  backdrop-filter: blur(18px);
+}
+
+.rimera-paper-shader,
+.rimera-paper-shader > canvas {
+  position: absolute !important;
+  inset: 0;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.rimera-paper-shader { z-index: -20; }

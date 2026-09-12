@@ -1,21 +1,25 @@
 pub mod codegen;
 pub mod core;
+pub mod dynamic;
 pub mod hir;
 pub mod link;
 pub mod lir;
 pub mod lower;
+pub mod manifest;
 pub mod mir;
 pub mod project;
 pub mod resolve;
 pub mod sema;
 pub mod syntax;
+mod runtime_symbols;
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::core::{Diagnostic, DiagnosticSet, Span};
-use crate::project::{BuildArtifact, BuildRequest};
+use crate::project::{AsyncBackend, BuildArtifact, BuildRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildStage {
@@ -78,6 +82,25 @@ pub fn build_with_progress(
             &request.entry,
         ));
     }
+    if matches!(
+        request.async_backend,
+        AsyncBackend::Monoio | AsyncBackend::Tokio
+    ) {
+        return Err(error(
+            "RIM-ASYNC-001",
+            format!(
+                "async backend `{}` is unavailable for target `{}`; available backend: compio",
+                request.async_backend.as_str(),
+                request.target.as_str()
+            ),
+            &request.entry,
+        ));
+    }
+    let locked_inputs = manifest::validate(
+        &request.project_root,
+        &request.target,
+        &request.capabilities,
+    )?;
     trace(
         &mut report,
         request.debug,
@@ -94,7 +117,33 @@ pub fn build_with_progress(
     );
     report(BuildProgress::Started(BuildStage::AnalyzeSource));
     let source = read_source_with_progress(&request.entry, &mut report)?;
-    let syntax = syntax::parse(&request.entry, &source)?;
+    let parsed_entry = syntax::parse(&request.entry, &source)?;
+    let entry_filename = parsed_entry.filename.clone();
+    let resolved = resolve::discover_project_with_roots(
+        &request.project_root,
+        &request.entry,
+        &request.module_search_roots,
+    )?;
+    manifest::validate_graph(&request.project_root, &resolved.graph, &locked_inputs)?;
+    let reaches_async_runtime = resolved
+        .graph
+        .nodes()
+        .any(|node| node.name.as_str() == "rimera.async_runtime");
+    let linked_async_backend = reaches_async_runtime.then_some(AsyncBackend::Compio);
+    trace(
+        &mut report,
+        request.debug,
+        linked_async_backend.map_or_else(
+            || "async backend: not linked".to_owned(),
+            |backend| format!("async backend: {}", backend.as_str()),
+        ),
+    );
+    let mut syntax = resolved
+        .sources
+        .get(&resolved.graph.entry_name)
+        .map(|source| source.syntax.clone())
+        .unwrap_or(parsed_entry);
+    syntax.filename = entry_filename;
     let source_lines = source.lines().count();
     report(BuildProgress::Measured(ProgressMeasure {
         stage: BuildStage::AnalyzeSource,
@@ -115,12 +164,45 @@ pub fn build_with_progress(
     );
 
     report(BuildProgress::Started(BuildStage::AnalyzeSemantics));
-    let _graph = resolve::single_file(request.entry.clone());
-    let hir = sema::analyze(&request.entry, &syntax)?;
+    trace(
+        &mut report,
+        request.debug,
+        format!(
+            "module graph: {} node(s), {} edge(s)",
+            resolved.graph.nodes().count(),
+            resolved.graph.edges().count()
+        ),
+    );
+    let allow_dynamic_compilation = request.capabilities.dynamic_compilation();
+    let hir = sema::analyze_with_dynamic_compilation(
+        &request.entry,
+        &syntax,
+        allow_dynamic_compilation,
+    )?;
+    let mut module_hir = BTreeMap::new();
+    for (name, source) in &resolved.sources {
+        if name.as_str() == "__main__" {
+            continue;
+        }
+        let path = Path::new(&source.syntax.filename);
+        module_hir.insert(
+            name.as_str().to_owned(),
+            sema::analyze_with_dynamic_compilation(
+                path,
+                &source.syntax,
+                allow_dynamic_compilation,
+            )?,
+        );
+    }
+    let hir_statement_count = hir.statements.len()
+        + module_hir
+            .values()
+            .map(|module| module.statements.len())
+            .sum::<usize>();
     report(BuildProgress::Measured(ProgressMeasure {
         stage: BuildStage::AnalyzeSemantics,
-        completed: hir.statements.len() as u64,
-        total: Some(hir.statements.len() as u64),
+        completed: hir_statement_count as u64,
+        total: Some(hir_statement_count as u64),
         unit: "HIR statements",
         detail: "analyzed".to_owned(),
     }));
@@ -128,20 +210,47 @@ pub fn build_with_progress(
 
     report(BuildProgress::Started(BuildStage::LowerMir));
     let mir = lower::lower(&hir).map_err(|cause| error("RIM-IR-001", cause, &request.entry))?;
-    let mir_blocks = mir
-        .functions
-        .iter()
+    let mut module_mir = BTreeMap::new();
+    for (name, hir) in module_hir {
+        let path = resolved
+            .graph
+            .nodes()
+            .find(|node| node.name.as_str() == name)
+            .and_then(|node| node.source.as_deref())
+            .unwrap_or(&request.entry);
+        let program = lower::lower(&hir).map_err(|cause| error("RIM-IR-001", cause, path))?;
+        let source_hash = resolved
+            .graph
+            .nodes()
+            .find(|node| node.name.as_str() == name)
+            .and_then(|node| node.source_hash)
+            .unwrap_or(0);
+        module_mir.insert(
+            name,
+            NativeModule {
+                program,
+                source_hash,
+            },
+        );
+    }
+    let programs = std::iter::once(&mir).chain(module_mir.values().map(|module| &module.program));
+    let mir_functions = programs
+        .clone()
+        .map(|program| program.functions.len())
+        .sum::<usize>();
+    let mir_blocks = programs
+        .clone()
+        .flat_map(|program| &program.functions)
         .map(|function| function.blocks.len())
         .sum::<usize>();
-    let mir_values = mir
-        .functions
-        .iter()
+    let mir_values = programs
+        .flat_map(|program| &program.functions)
         .map(|function| u64::from(function.value_count))
         .sum::<u64>();
     report(BuildProgress::Measured(ProgressMeasure {
         stage: BuildStage::LowerMir,
-        completed: mir.functions.len() as u64,
-        total: Some(mir.functions.len() as u64),
+        completed: mir_functions as u64,
+        total: Some(mir_functions as u64),
         unit: "native functions",
         detail: format!(
             "{} blocks · {} values",
@@ -155,33 +264,126 @@ pub fn build_with_progress(
         request.debug,
         format!(
             "MIR: {} function(s), {} block(s), {} value(s)",
-            mir.functions.len(),
-            mir.functions
-                .iter()
-                .map(|function| function.blocks.len())
-                .sum::<usize>(),
-            mir.functions
-                .iter()
-                .map(|function| u64::from(function.value_count))
-                .sum::<u64>()
+            mir_functions, mir_blocks, mir_values
         ),
     );
-    build_mir_with_progress(&request, &mir, report)
+    let module_descriptors = resolved
+        .graph
+        .nodes()
+        .filter(|node| {
+            !matches!(
+                node.kind,
+                resolve::ModuleKind::Entry | resolve::ModuleKind::NativeShell
+            )
+        })
+        .map(|node| {
+            let is_package = matches!(
+                node.kind,
+                resolve::ModuleKind::RegularPackage | resolve::ModuleKind::NamespacePackage
+            );
+            let package = if is_package {
+                node.name.as_str().to_owned()
+            } else {
+                node.name
+                    .as_str()
+                    .rsplit_once('.')
+                    .map_or_else(String::new, |(parent, _)| parent.to_owned())
+            };
+            (
+                node.name.as_str().to_owned(),
+                codegen::ModuleInitializer {
+                    symbol: node
+                        .source
+                        .as_ref()
+                        .map(|_| module_symbol(node.name.as_str())),
+                    filename: node
+                        .source
+                        .as_ref()
+                        .map_or_else(String::new, |path| path.display().to_string()),
+                    package,
+                    is_package,
+                    search_locations: node
+                        .search_locations
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect(),
+                    resources: locked_inputs
+                        .resources
+                        .iter()
+                        .filter(|resource| resource.module == node.name.as_str())
+                        .map(|resource| codegen::ModuleResource {
+                            name: resource.name.clone(),
+                            bytes: resource.bytes.clone(),
+                        })
+                        .collect(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let build_manifest = manifest::render_build_manifest(
+        &request.target,
+        request.profile,
+        &request.capabilities,
+        &resolved.graph,
+        &locked_inputs,
+    );
+    let mut artifact = build_project_mir_with_progress(
+        &request,
+        &mir,
+        &module_mir,
+        &module_descriptors,
+        linked_async_backend,
+        report,
+    )?;
+    let manifest_path = artifact.cache_dir.join("build-manifest.toml");
+    // Independent builds can share a cache inside one compiler process.
+    // A PID alone lets one publisher rename another publisher's temporary file.
+    static MANIFEST_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = MANIFEST_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary_manifest = artifact.cache_dir.join(format!(
+        ".build-manifest-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    fs::write(&temporary_manifest, build_manifest)
+        .and_then(|()| fs::rename(&temporary_manifest, &manifest_path))
+        .map_err(|cause| error("RIM-OUTPUT-001", cause.to_string(), &request.entry))?;
+    artifact.manifest = Some(manifest_path);
+    Ok(artifact)
+}
+
+#[derive(Debug)]
+struct NativeModule {
+    program: mir::Program,
+    source_hash: u64,
 }
 
 pub fn build_mir(
     request: &BuildRequest,
     mir: &mir::Program,
 ) -> Result<BuildArtifact, DiagnosticSet> {
-    build_mir_with_progress(request, mir, |_| {})
+    build_project_mir_with_progress(
+        request,
+        mir,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+        |_| {},
+    )
 }
 
-fn build_mir_with_progress(
+fn build_project_mir_with_progress(
     request: &BuildRequest,
     mir: &mir::Program,
+    modules: &BTreeMap<String, NativeModule>,
+    module_descriptors: &BTreeMap<String, codegen::ModuleInitializer>,
+    linked_async_backend: Option<AsyncBackend>,
     mut report: impl FnMut(BuildProgress),
 ) -> Result<BuildArtifact, DiagnosticSet> {
     mir::verify(mir).map_err(|cause| error("RIM-IR-001", cause, &request.entry))?;
+    for module in modules.values() {
+        mir::verify(&module.program)
+            .map_err(|cause| error("RIM-IR-001", cause, Path::new(&module.program.filename)))?;
+    }
     let lir = lir::select(mir);
     let cache_dir = cache_dir(request)?;
     let ir_dump = request.debug.then(|| debug_ir_path(request, &cache_dir));
@@ -193,10 +395,13 @@ fn build_mir_with_progress(
         trace(&mut report, true, format!("IR dump: {}", ir_dump.display()));
     }
     report(BuildProgress::Started(BuildStage::EmitObject));
-    let object_bytes = codegen::emit_object(
+    let object_bytes = codegen::emit_entry_object(
         &lir,
         request.profile == core::BuildProfile::Release,
         request.heap_limit_bytes,
+        module_descriptors,
+        linked_async_backend,
+        request.capabilities.dynamic_compilation(),
     )
     .map_err(|cause| error("RIM-CODEGEN-001", cause, &request.entry))?;
     let object = object_path(request, &cache_dir);
@@ -204,15 +409,45 @@ fn build_mir_with_progress(
         .map_err(|cause| error("RIM-OUTPUT-001", cause.to_string(), &request.entry))?;
     fs::write(&object, &object_bytes)
         .map_err(|cause| error("RIM-OUTPUT-001", cause.to_string(), &request.entry))?;
+    let mut module_objects = Vec::new();
+    let mut total_object_bytes = object_bytes.len() as u64;
+    let mut total_functions = mir.functions.len();
+    for (name, native_module) in modules {
+        let lir = lir::select(&native_module.program);
+        let bytes = codegen::emit_module_object(
+            &lir,
+            request.profile == core::BuildProfile::Release,
+            module_descriptors,
+            &module_symbol(name),
+        )
+        .map_err(|cause| {
+            error(
+                "RIM-CODEGEN-001",
+                cause,
+                Path::new(&native_module.program.filename),
+            )
+        })?;
+        let path = module_object_path(request, &cache_dir, name, native_module.source_hash);
+        fs::write(&path, &bytes).map_err(|cause| {
+            error(
+                "RIM-OUTPUT-001",
+                cause.to_string(),
+                Path::new(&native_module.program.filename),
+            )
+        })?;
+        total_object_bytes = total_object_bytes.saturating_add(bytes.len() as u64);
+        total_functions = total_functions.saturating_add(native_module.program.functions.len());
+        module_objects.push(path);
+    }
     report(BuildProgress::Measured(ProgressMeasure {
         stage: BuildStage::EmitObject,
-        completed: 1,
-        total: Some(1),
-        unit: "object",
+        completed: (module_objects.len() + 1) as u64,
+        total: Some((module_objects.len() + 1) as u64),
+        unit: "objects",
         detail: format!(
             "{} · {} native functions",
-            format_bytes(object_bytes.len() as u64),
-            format_number(mir.functions.len() as u64)
+            format_bytes(total_object_bytes),
+            format_number(total_functions as u64)
         ),
     }));
     report(BuildProgress::Finished(BuildStage::EmitObject));
@@ -222,7 +457,9 @@ fn build_mir_with_progress(
         format!("object: {}", object.display()),
     );
 
-    let runtime = runtime_archive(request.profile).ok_or_else(|| {
+    let runtime = if request.capabilities.dynamic_compilation() {
+        compiler_archive(request.profile)
+    } else { runtime_archive(request.profile) }.ok_or_else(|| {
         error(
             "RIM-LINK-001",
             "Rust runtime archive is missing; build the Rimera workspace first",
@@ -245,7 +482,12 @@ fn build_mir_with_progress(
         unit: "executable",
         detail: format!("clang · runtime archive {}", format_bytes(runtime_size)),
     }));
-    if let Err(cause) = link::link(&object, &runtime, &request.output, request.profile) {
+    let link_objects = std::iter::once(object.as_path())
+        .chain(module_objects.iter().map(PathBuf::as_path))
+        .collect::<Vec<_>>();
+    if let Err(cause) =
+        link::link_objects(&link_objects, &runtime, &request.output, request.profile)
+    {
         return Err(error("RIM-LINK-001", cause, &request.entry));
     }
     report(BuildProgress::Measured(ProgressMeasure {
@@ -268,7 +510,18 @@ fn build_mir_with_progress(
         object,
         cache_dir,
         ir_dump,
+        manifest: None,
+        async_backend: linked_async_backend,
     })
+}
+
+fn compiler_archive(profile: core::BuildProfile) -> Option<PathBuf> {
+    let path = std::env::var_os("RIMERA_COMPILER_ARCHIVE").map(PathBuf::from).unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
+            .join(if profile == core::BuildProfile::Release { "release" } else { "debug" })
+            .join("librimera_compiler.a")
+    });
+    path.is_file().then_some(path)
 }
 
 fn runtime_archive(profile: core::BuildProfile) -> Option<PathBuf> {
@@ -318,6 +571,24 @@ fn object_path(request: &BuildRequest, cache_dir: &Path) -> PathBuf {
         .join(format!("{}.o", cache_key(request)))
 }
 
+fn module_object_path(
+    request: &BuildRequest,
+    cache_dir: &Path,
+    name: &str,
+    source_hash: u64,
+) -> PathBuf {
+    cache_dir.join("objects").join(format!(
+        "{}-{:016x}-{:016x}.o",
+        cache_key(request),
+        fnv1a_64(name),
+        source_hash
+    ))
+}
+
+fn module_symbol(name: &str) -> String {
+    format!("rimera_module_{:016x}", fnv1a_64(name))
+}
+
 fn debug_ir_path(request: &BuildRequest, cache_dir: &Path) -> PathBuf {
     cache_dir
         .join("ir")
@@ -325,8 +596,20 @@ fn debug_ir_path(request: &BuildRequest, cache_dir: &Path) -> PathBuf {
 }
 
 fn cache_key(request: &BuildRequest) -> String {
+    let entry_hash = fs::read(&request.entry)
+        .map(|source| resolve::source_hash(&source))
+        .unwrap_or(0);
+    let module_roots = request
+        .module_search_roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\0");
+    let lock_hash = fs::read(request.project_root.join("rimera.lock"))
+        .map(|bytes| resolve::source_hash(&bytes))
+        .unwrap_or(0);
     let key = format!(
-        "{}\0{}\0{}\0{:?}\0{}",
+        "{}\0{}\0{}\0{:?}\0{}\0{entry_hash:016x}\0{module_roots}\0{lock_hash:016x}",
         request.entry.display(),
         request.output.display(),
         request.target.as_str(),

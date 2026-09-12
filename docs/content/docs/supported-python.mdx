@@ -1,0 +1,82 @@
+---
+title: Supported Python
+description: See which Python features Rimera supports today.
+icon: BadgeCheck
+---
+
+Rimera supports a meaningful, growing subset of Python 3.12. It is not a
+drop-in replacement for every Python application, package, or standard-library
+module yet.
+
+<Cards>
+  <Card title="Everyday language features" description="Values, conditionals, loops, functions, closures, classes, inheritance, and exceptions." />
+  <Card title="Collections and iteration" description="Strings, arbitrary integers, lists, tuples, ranges, dictionaries, sets, comprehensions, and for-loops." />
+  <Card title="Native generators" description="Generator expressions plus supported source generators, send, throw, close, and yield from." />
+  <Card title="Object behavior" description="Attributes, descriptors, slots, super, multiple inheritance, and the supported metaclass protocol." />
+</Cards>
+
+<Callout title="Use a focused entry point">
+  Begin with the part of your application that has no external package or broad
+  standard-library dependency. Run `rimera-lite --help`, then compile a small entry
+  point first.
+</Callout>
+
+## Not available yet
+
+<Cards>
+  <Card title="Async standard library" description="asyncio event loops, asyncio.Task, networking, subprocesses, and framework integration are not available." />
+  <Card title="External module ecosystems" description="Project source imports are supported within declared roots; arbitrary stdlib modules, native extensions, and PyPI packages are not." />
+  <Card title="Dynamic code" description="eval and exec are not available." />
+  <Card title="Package ecosystems" description="Most stdlib modules and PyPI packages are outside the current supported surface." />
+</Cards>
+
+Unsupported behavior should fail clearly before Rimera writes a final artifact.
+
+## Asynchronous Python
+
+On Apple Silicon macOS (`aarch64-apple-darwin`), Rimera implements `async def`,
+`await`, generic `__await__` iterators, `async for`, async comprehensions,
+async-generator expressions, and `async with`. Coroutine calls bind arguments
+immediately but execute their bodies only when resumed. Coroutine `send`,
+`throw`, and `close`, and async-generator `__anext__`, `asend`, `athrow`, and
+`aclose` use native suspension state. Completed coroutine reuse and overlapping
+async-generator operations raise managed errors. Cleanup and exception state
+survive suspension; closing a started generator runs its cleanup, and abandoned
+async generators receive an exactly-once finalization attempt.
+
+This ready-completing program can use Rimera's small execution entry:
+
+```python
+from rimera import async_runtime
+
+async def child():
+    return 42
+
+async def main():
+    return await child()
+
+print(async_runtime.run(main()))
+```
+
+`async_runtime.run` accepts a native coroutine and returns its result or
+propagates its exception. It takes exactly one positional argument and accepts
+no keywords. Calling it from a running root raises
+`RuntimeError: async_runtime.run() cannot be nested`; use `await child()` inside
+the root instead. A rejected child coroutine remains the caller's responsibility
+to await or close. The current Python module exposes this entry, not a
+task/timer API. An awaitable that suspends for an external event requires an
+embedding host to arrange a wake through the runtime driver; `run` does not
+invent an event source and will remain pending without that wake. Manual
+`send`/`throw` driving remains available for language-protocol use.
+
+`--async auto` is the default and links Compio when the compiled module graph
+reaches `rimera.async_runtime`; `--async compio` requests the same backend
+explicitly. The corresponding `[tool.rimera]` setting is `async`; a CLI value
+overrides it. Builds linking Compio display `async   compio · experimental`.
+Synchronous controls link no executor. Recognized `monoio` and `tokio` choices
+fail before output with `RIM-ASYNC-001`, including when supplied for synchronous
+source. Unknown choices and unsupported targets are rejected before output.
+
+Compio remains experimental. This does not provide the `asyncio` library, event
+loop policies, Python networking/timer APIs, cross-thread task guarantees, or
+compatibility with async frameworks.
