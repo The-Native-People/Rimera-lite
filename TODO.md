@@ -320,7 +320,28 @@ These checks describe proven slices, not complete Python categories.
 
 ## Active gate
 
-- [ ] **Gate 11 Slice 3 — `eval` globals/locals, builtins injection, and closure reads**
+- [ ] **Gate 12 Slice 5 — resurrection, cyclic isolates, once-only guarantees, and reentrancy**
+
+## Completed Gate 12 lifecycle slices
+
+- [x] **Gate 12 Slice 1 — lifecycle states, reachability contract, and oracle matrix**
+  - Strong, weak, finalizable, resurrected, and dead states; mark/lifecycle/sweep
+    ordering; generational-handle rules; callback re-entry; and the CPython
+    3.12.11 oracle matrix are frozen before broader finalization work.
+- [x] **Gate 12 Slice 2 — weak-reference objects, callbacks, hashing, equality, and proxies**
+  - Managed refs do not trace referents, clear before callbacks, run callbacks
+    newest-first, preserve cached hashes, use live/dead equality rules, and
+    expose callable/attribute/protocol-transparent proxies with native proof.
+- [x] **Gate 12 Slice 3 — weakly held containers and mutation-safe iteration**
+  - `WeakKeyDictionary`, `WeakValueDictionary`, and `WeakSet` use managed weak
+    handles, collector-time pruning/recollection, revalidated equality lookup,
+    explicit-mutation versions, and iterators that never trace weak referents.
+- [x] **Gate 12 Slice 4 — `__del__`, finalization order, exception reporting, and shutdown**
+  - Ordinary unreachable instances receive one protected lifecycle turn before
+    weakref clearing, `__del__` is marked once-only before Python runs, failures
+    are reported as unraisable without replacing caller exception state, and
+    live shutdown finalizers run in monotonic instance-creation order rather
+    than recycled heap-slot order. CPython differential and heap proofs are green.
 
 
 ## Completed Gate 11 foundation slices
@@ -334,6 +355,27 @@ These checks describe proven slices, not complete Python categories.
     only after the normal parser/sema/HIR/verified-MIR/Cranelift path succeeds.
     Supported source/filename shapes, `flags=0`, `dont_inherit`, optimization,
     syntax metadata, low-heap behavior, and native-only proof are documented.
+- [x] **Gate 11 Slice 3 — `eval` globals/locals, builtins injection, and closure reads**
+  - Namespace precedence, mapping callbacks, builtins policy, existing native
+    code dispatch, closure rejection, managed failures, and low-heap proof pass.
+- [x] **Gate 11 Slice 4 — `exec` namespaces, writes, declarations, and class-body composition**
+  - Local/global writes, callback failures, closure cells, prepared class
+    mappings, and retained function namespaces pass native differentials.
+- [x] **Gate 11 Slice 5 — dynamic cache keys, linking/loading, lifetime, and reclamation**
+  - Exact source/filename/mode/flags/optimization keys reuse finalized native
+    units while returning distinct code objects; managed reachability safely
+    retains escaped entries and post-GC reclamation unloads dead units.
+- [x] **Gate 11 Slice 6 — nested dynamic code, modules, reflection, async, and exceptions**
+  - Nested compilation, registered imports, bidirectional callbacks,
+    generators/coroutines, descriptors, exceptions, and traceback metadata
+    compose through the existing native protocols under constrained heap proof.
+- [x] **Gate 11 Slice 7 — adversarial inputs, resource limits, atomicity, and artifact proof**
+  - Source, nested-execution, and live-native-unit ceilings fail before unsafe
+    publication; recovery, partial namespace behavior, capability denial, and
+    static service omission are proven at the public artifact boundary.
+- [x] **Gate 11 Slice 8 — final audit, documentation, and gate closure**
+  - The complete focused dynamic corpus, runtime ownership tests, stable
+    diagnostics, constrained heaps, and native/static symbol audits are green.
 
 ## Completed Gate 9 package and cache-visibility slices
 
@@ -441,10 +483,10 @@ These checks describe proven slices, not complete Python categories.
 
 ## Queued compatibility gates
 
-These remain unchecked until their own end-to-end evidence lands. Gate 11 Slice 3
+These remain unchecked until their own end-to-end evidence lands. Gate 12 Slice 5
 is the sole active compatibility slice; later post-core areas remain separate
 promotions and must not be implied complete.
-- [ ] **Gate 11 — capability-governed `compile`, `eval`, `exec`, and runtime
+- [x] **Gate 11 — capability-governed `compile`, `eval`, `exec`, and runtime
   native compilation**, split into eight queued slices in
   [`spec/gates/11/README.md`](spec/gates/11/README.md).
 - [ ] **Gate 12 — weak references, finalizers, and resurrection semantics**,

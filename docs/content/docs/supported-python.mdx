@@ -26,11 +26,40 @@ module yet.
 <Cards>
   <Card title="Async standard library" description="asyncio event loops, asyncio.Task, networking, subprocesses, and framework integration are not available." />
   <Card title="External module ecosystems" description="Project source imports are supported within declared roots; arbitrary stdlib modules, native extensions, and PyPI packages are not." />
-  <Card title="Dynamic code" description="Gate 11 Slices 1–2 qualify capability-gated native compile(); eval/exec namespace conformance remains in progress and is not yet generally supported." />
+  <Card title="Dynamic code" description="With dynamic_compilation enabled, native compile(), eval(), and exec() support the documented source, namespace, builtins, closure, class-body, cache/reclamation, resource-limit, and closed-feature composition subset. This is not unrestricted Python dynamic-code compatibility." />
   <Card title="Package ecosystems" description="Most stdlib modules and PyPI packages are outside the current supported surface." />
 </Cards>
 
 Unsupported behavior should fail clearly before Rimera writes a final artifact.
+
+## Weak references
+
+The managed `weakref` module currently supports `ref` (`ReferenceType`),
+`proxy`, `ProxyType`, `CallableProxyType`, `getweakrefcount`, and
+`getweakrefs`. References return the exact live target and `None` after it
+dies. Optional callbacks run newest-first, cached hashes survive target death,
+and a hash first requested after death raises `TypeError`. Live proxies forward
+attribute, call, and supported Python protocol operations; using a dead proxy
+raises `ReferenceError`.
+
+User instances are weak-referenceable when their class has the normal instance
+layout. A class declaring `__slots__` must include `__weakref__` or inherit that
+support. Managed functions, bound methods, classes, modules, code objects, and
+generator-family objects are also accepted. Builtin collection and scalar
+values such as `list`, `dict`, `int`, and `None` are rejected with `TypeError`.
+`WeakKeyDictionary`, `WeakValueDictionary`, and `WeakSet` are available. Each
+constructor accepts zero or one positional source and no keyword arguments.
+`WeakSet` accepts an iterable; the dictionary constructors accept a mapping,
+but not an iterable of key/value pairs. Weak dictionaries support item
+get/set/delete, membership, length, truth, iteration, `keys`, `values`,
+`items`, `get`, `pop`, `setdefault`, and `clear`. `WeakSet` supports membership,
+length, truth, iteration, `add`, `discard`, `remove`, and `clear`. Iteration does
+not keep weakly held objects alive; explicit size mutation invalidates an
+iterator, while collection simply causes it to skip dead entries.
+
+Weak-container algebra, `update`, `copy`, `WeakSet.pop`, `weakref.finalize`,
+`__del__`, resurrection, shutdown ordering, and callback-exception reporting
+are not available yet.
 
 ## Asynchronous Python
 

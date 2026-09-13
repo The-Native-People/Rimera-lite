@@ -6,10 +6,10 @@ model and must not be approximated with raw addresses or Rust destructors.
 
 ## Progress ledger
 
-- [ ] Slice 1 — lifecycle states, reachability contract, and oracle matrix
-- [ ] Slice 2 — weak-reference objects, callbacks, hashing, equality, and proxies
-- [ ] Slice 3 — weakly held containers and mutation-safe iteration
-- [ ] Slice 4 — `__del__`, finalization order, exception reporting, and shutdown
+- [x] Slice 1 — lifecycle states, reachability contract, and oracle matrix
+- [x] Slice 2 — weak-reference objects, callbacks, hashing, equality, and proxies
+- [x] Slice 3 — weakly held containers and mutation-safe iteration
+- [x] Slice 4 — `__del__`, finalization order, exception reporting, and shutdown
 - [ ] Slice 5 — resurrection, cyclic isolates, once-only guarantees, and reentrancy
 - [ ] Slice 6 — `weakref.finalize`, module teardown, and callback composition
 - [ ] Slice 7 — stress, concurrent mutation boundaries, heap limits, and atomicity
@@ -34,3 +34,7 @@ model and must not be approximated with raw addresses or Rust destructors.
 
 This gate owns object lifetime semantics; individual standard-library helpers
 outside `weakref` remain Gate 14 work.
+
+The exact state machine, phase ordering, CPython 3.12.11 oracle matrix, exposed
+surface, and remaining boundaries are recorded in
+[`lifecycle-contract.md`](lifecycle-contract.md). Gate 12 Slice 5 is active.

@@ -9,7 +9,8 @@ use crate::RimeraContext;
 use crate::heap::HeapObject;
 use crate::object::{
     BufferLeaseObject, DictionaryViewKind, DictionaryViewObject, IteratorObject, MemoryViewObject,
-    RangeObject, SetObject, SuspendedKind, ValueDictionaryObject,
+    RangeObject, SetObject, SuspendedKind, ValueDictionaryObject, WeakContainerKind,
+    WeakIteratorKind,
 };
 
 fn instance_storage(context: &RimeraContext, value: RValue) -> Option<RValue> {
@@ -1120,12 +1121,26 @@ pub fn async_iterator_next_awaitable(
 }
 
 pub fn iterator_new(context: &mut RimeraContext, value: RValue) -> Result<RValue, String> {
+    if matches!(context.heap.get(value), Some(HeapObject::WeakReference(object)) if object.proxy) {
+        let referent = context.resolve_weak_proxy(value)?;
+        return context.with_temporary_roots(&[value, referent], |context| {
+            iterator_new(context, referent)
+        });
+    }
     context.with_temporary_roots(&[value], |context| {
         if let Some(storage) = instance_storage(context, value) {
             if let Some(iterator) = context.invoke_special_method(value, "__iter__", &[])? {
                 return Ok(iterator);
             }
             return iterator_new(context, storage);
+        }
+        if let Some(HeapObject::WeakContainer(container)) = context.heap.get(value) {
+            let kind = if container.kind == WeakContainerKind::Set {
+                WeakIteratorKind::Set
+            } else {
+                WeakIteratorKind::Keys
+            };
+            return context.weak_container_iterator(value, kind);
         }
         let iterator = match context.heap.get(value) {
             Some(HeapObject::Range(range)) => IteratorObject::Range {
@@ -1206,6 +1221,114 @@ pub fn iterator_next(
                 ..
             } => Err("synchronous generator produced an async suspension".to_owned()),
         };
+    }
+    if matches!(
+        context.heap.get(iterator),
+        Some(HeapObject::Iterator(IteratorObject::WeakContainer { .. }))
+    ) {
+        loop {
+            let (source, entry, expected_version, kind) = {
+                let Some(HeapObject::Iterator(IteratorObject::WeakContainer {
+                    source,
+                    entries,
+                    index,
+                    expected_version,
+                    kind,
+                })) = context.heap.get_mut(iterator)
+                else {
+                    unreachable!()
+                };
+                let Some(entry) = entries.get(*index).copied() else {
+                    return Ok(None);
+                };
+                *index += 1;
+                (*source, entry, *expected_version, *kind)
+            };
+            let current_version = match context.heap.get(source) {
+                Some(HeapObject::WeakContainer(container)) => container.mutation_version,
+                _ => return Err("weak container iterator source is invalid".to_owned()),
+            };
+            if current_version != expected_version {
+                return context.raise_error(
+                    "RuntimeError",
+                    if kind == WeakIteratorKind::Set {
+                        "Set changed size during iteration"
+                    } else {
+                        "dictionary changed size during iteration"
+                    },
+                );
+            }
+            // The iterator snapshots entry identities, not replaceable payloads.
+            // Size-preserving assignment must remain visible to an existing
+            // iterator just as it is for CPython's weak dictionaries. GC pruning
+            // can remove a snapshotted entry without bumping mutation_version, in
+            // which case the iterator simply skips it.
+            let (container_kind, current_entry) = match context.heap.get(source) {
+                Some(HeapObject::WeakContainer(container)) => {
+                    let current = match container.kind {
+                        WeakContainerKind::KeyDictionary | WeakContainerKind::Set => container
+                            .entries
+                            .iter()
+                            .find(|current| current.weak == entry.0),
+                        WeakContainerKind::ValueDictionary => container
+                            .entries
+                            .iter()
+                            .find(|current| current.strong == entry.1),
+                    };
+                    (container.kind, current.cloned())
+                }
+                _ => return Err("weak container iterator source is invalid".to_owned()),
+            };
+            let Some(current_entry) = current_entry else {
+                continue;
+            };
+            let referent = match context.heap.get(current_entry.weak) {
+                Some(HeapObject::WeakReference(reference)) => reference.referent,
+                _ => None,
+            };
+            let Some(referent) = referent else {
+                continue;
+            };
+            return match kind {
+                WeakIteratorKind::Keys => Ok(Some(
+                    if container_kind == WeakContainerKind::ValueDictionary {
+                        current_entry
+                            .strong
+                            .expect("weak value iterator entries retain their keys")
+                    } else {
+                        referent
+                    },
+                )),
+                WeakIteratorKind::Values => Ok(Some(
+                    if container_kind == WeakContainerKind::KeyDictionary {
+                        current_entry
+                            .strong
+                            .expect("weak key iterator entries retain their values")
+                    } else {
+                        referent
+                    },
+                )),
+                WeakIteratorKind::Items => {
+                    let pair = if container_kind == WeakContainerKind::KeyDictionary {
+                        [
+                            referent,
+                            current_entry
+                                .strong
+                                .expect("weak key iterator entries retain their values"),
+                        ]
+                    } else {
+                        [
+                            current_entry
+                                .strong
+                                .expect("weak value iterator entries retain their keys"),
+                            referent,
+                        ]
+                    };
+                    tuple(context, &pair).map(Some)
+                }
+                WeakIteratorKind::Set => Ok(Some(referent)),
+            };
+        }
     }
     let Some(object) = context.heap.get_mut(iterator) else {
         return Err("value contains a stale heap handle".to_owned());
@@ -1553,6 +1676,11 @@ pub fn iterator_next(
 }
 
 pub fn reversed(context: &mut RimeraContext, value: RValue) -> Result<RValue, String> {
+    if matches!(context.heap.get(value), Some(HeapObject::WeakReference(object)) if object.proxy) {
+        let referent = context.resolve_weak_proxy(value)?;
+        return context
+            .with_temporary_roots(&[value, referent], |context| reversed(context, referent));
+    }
     context.with_temporary_roots(&[value], |context| {
         if let Some(result) = context.invoke_special_method(value, "__reversed__", &[])? {
             return Ok(result);
@@ -1628,6 +1756,14 @@ pub fn reversed(context: &mut RimeraContext, value: RValue) -> Result<RValue, St
 }
 
 pub fn length(context: &mut RimeraContext, value: RValue) -> Result<RValue, String> {
+    if matches!(context.heap.get(value), Some(HeapObject::WeakReference(object)) if object.proxy) {
+        let referent = context.resolve_weak_proxy(value)?;
+        return context
+            .with_temporary_roots(&[value, referent], |context| length(context, referent));
+    }
+    if let Some(length) = context.weak_container_len(value) {
+        return store_integer(context, length.into());
+    }
     context.with_temporary_roots(&[value], |context| {
         if let Some(storage) = instance_storage(context, value) {
             if let Some(result) = context.invoke_special_method(value, "__len__", &[])? {
@@ -1696,6 +1832,20 @@ pub fn item_get(
     collection: RValue,
     index: RValue,
 ) -> Result<RValue, String> {
+    if matches!(context.heap.get(collection), Some(HeapObject::WeakReference(object)) if object.proxy)
+    {
+        let referent = context.resolve_weak_proxy(collection)?;
+        return context.with_temporary_roots(&[collection, referent, index], |context| {
+            item_get(context, referent, index)
+        });
+    }
+    if matches!(context.heap.get(collection), Some(HeapObject::WeakContainer(container)) if container.kind != WeakContainerKind::Set)
+    {
+        return match context.weak_container_get(collection, index)? {
+            Some(value) => Ok(value),
+            None => context.raise_error("KeyError", "weak dictionary key not found"),
+        };
+    }
     if let Some(storage) = instance_storage(context, collection) {
         if let Some(result) = context.invoke_special_method(collection, "__getitem__", &[index])? {
             return Ok(result);
@@ -2119,6 +2269,19 @@ pub fn item_set(
     index: RValue,
     value: RValue,
 ) -> Result<(), String> {
+    if matches!(context.heap.get(collection), Some(HeapObject::WeakReference(object)) if object.proxy)
+    {
+        let referent = context.resolve_weak_proxy(collection)?;
+        return context.with_temporary_roots(&[collection, referent, index, value], |context| {
+            item_set(context, referent, index, value)
+        });
+    }
+    if matches!(
+        context.heap.get(collection),
+        Some(HeapObject::WeakContainer(_))
+    ) {
+        return context.weak_container_set_item(collection, index, value);
+    }
     context.with_temporary_roots(&[collection, index, value], |context| {
         if let Some(storage) = instance_storage(context, collection) {
             if context
@@ -2282,6 +2445,22 @@ pub fn item_delete(
     collection: RValue,
     index: RValue,
 ) -> Result<(), String> {
+    if matches!(context.heap.get(collection), Some(HeapObject::WeakReference(object)) if object.proxy)
+    {
+        let referent = context.resolve_weak_proxy(collection)?;
+        return context.with_temporary_roots(&[collection, referent, index], |context| {
+            item_delete(context, referent, index)
+        });
+    }
+    if matches!(
+        context.heap.get(collection),
+        Some(HeapObject::WeakContainer(_))
+    ) {
+        if context.weak_container_delete(collection, index)? {
+            return Ok(());
+        }
+        return context.raise_error("KeyError", "weak container key not found");
+    }
     context.with_temporary_roots(&[collection, index], |context| {
         if let Some(storage) = instance_storage(context, collection) {
             if context
@@ -2579,6 +2758,12 @@ pub fn inplace(
     left: RValue,
     right: RValue,
 ) -> Result<RValue, String> {
+    if matches!(context.heap.get(left), Some(HeapObject::WeakReference(object)) if object.proxy) {
+        let referent = context.resolve_weak_proxy(left)?;
+        return context.with_temporary_roots(&[left, referent, right], |context| {
+            inplace(context, op, referent, right)
+        });
+    }
     context.with_temporary_roots(&[left, right], |context| {
         if matches!(context.heap.get(left), Some(HeapObject::List(_))) {
             match op {
@@ -3165,10 +3350,21 @@ pub fn value_array_get(
 }
 
 pub fn unary(context: &mut RimeraContext, op: u8, operand: RValue) -> Result<RValue, String> {
+    if matches!(context.heap.get(operand), Some(HeapObject::WeakReference(object)) if object.proxy)
+    {
+        let referent = context.resolve_weak_proxy(operand)?;
+        return context
+            .with_temporary_roots(&[operand, referent], |context| unary(context, op, referent));
+    }
     context.with_temporary_roots(&[operand], |context| unary_rooted(context, op, operand))
 }
 
 pub fn absolute(context: &mut RimeraContext, value: RValue) -> Result<RValue, String> {
+    if matches!(context.heap.get(value), Some(HeapObject::WeakReference(object)) if object.proxy) {
+        let referent = context.resolve_weak_proxy(value)?;
+        return context
+            .with_temporary_roots(&[value, referent], |context| absolute(context, referent));
+    }
     context.with_temporary_roots(&[value], |context| match context.heap.get(value) {
         Some(HeapObject::Float(value)) => float(context, value.abs()),
         Some(HeapObject::Complex { real, imag }) => float(context, real.hypot(*imag)),
@@ -3213,6 +3409,24 @@ pub fn binary(
     left: RValue,
     right: RValue,
 ) -> Result<RValue, String> {
+    let resolved_left = if matches!(context.heap.get(left), Some(HeapObject::WeakReference(object)) if object.proxy)
+    {
+        context.resolve_weak_proxy(left)?
+    } else {
+        left
+    };
+    let resolved_right = if matches!(context.heap.get(right), Some(HeapObject::WeakReference(object)) if object.proxy)
+    {
+        context.resolve_weak_proxy(right)?
+    } else {
+        right
+    };
+    if resolved_left != left || resolved_right != right {
+        return context
+            .with_temporary_roots(&[left, right, resolved_left, resolved_right], |context| {
+                binary(context, op, resolved_left, resolved_right)
+            });
+    }
     context.with_temporary_roots(&[left, right], |context| {
         binary_rooted(context, op, left, right)
     })
@@ -4205,6 +4419,46 @@ pub fn compare(
         return Ok(RValue::boolean(left != right));
     }
 
+    let resolved_left = if matches!(context.heap.get(left), Some(HeapObject::WeakReference(object)) if object.proxy)
+    {
+        context.resolve_weak_proxy(left)?
+    } else {
+        left
+    };
+    let resolved_right = if matches!(context.heap.get(right), Some(HeapObject::WeakReference(object)) if object.proxy)
+    {
+        context.resolve_weak_proxy(right)?
+    } else {
+        right
+    };
+    if resolved_left != left || resolved_right != right {
+        return context
+            .with_temporary_roots(&[left, right, resolved_left, resolved_right], |context| {
+                compare(context, op, resolved_left, resolved_right)
+            });
+    }
+
+    if op <= 1 {
+        let left_weak = match context.heap.get(left) {
+            Some(HeapObject::WeakReference(object)) if !object.proxy => Some(object.referent),
+            _ => None,
+        };
+        let right_weak = match context.heap.get(right) {
+            Some(HeapObject::WeakReference(object)) if !object.proxy => Some(object.referent),
+            _ => None,
+        };
+        if let (Some(left_referent), Some(right_referent)) = (left_weak, right_weak) {
+            let equal = match (left_referent, right_referent) {
+                (Some(left_referent), Some(right_referent)) => {
+                    let compared = compare(context, 0, left_referent, right_referent)?;
+                    truthy(context, compared)?
+                }
+                _ => left == right,
+            };
+            return Ok(RValue::boolean(if op == 0 { equal } else { !equal }));
+        }
+    }
+
     let has_complex_operand =
         direct_complex(context, left).is_some() || direct_complex(context, right).is_some();
     if has_complex_operand {
@@ -4475,6 +4729,19 @@ pub fn contains(
     collection: RValue,
     needle: RValue,
 ) -> Result<bool, String> {
+    if matches!(context.heap.get(collection), Some(HeapObject::WeakReference(object)) if object.proxy)
+    {
+        let referent = context.resolve_weak_proxy(collection)?;
+        return context.with_temporary_roots(&[collection, referent, needle], |context| {
+            contains(context, referent, needle)
+        });
+    }
+    if matches!(
+        context.heap.get(collection),
+        Some(HeapObject::WeakContainer(_))
+    ) {
+        return Ok(context.weak_container_get(collection, needle)?.is_some());
+    }
     if let Some(storage) = instance_storage(context, collection) {
         if let Some(result) =
             context.invoke_special_method(collection, "__contains__", &[needle])?
@@ -4670,6 +4937,28 @@ pub fn hash(context: &mut RimeraContext, value: RValue) -> Result<RValue, String
             _ => {}
         }
 
+        if let Some(HeapObject::WeakReference(weakref)) = context.heap.get(value) {
+            if weakref.proxy {
+                return context.raise_error("TypeError", "unhashable type: 'weakref.ProxyType'");
+            }
+            if let Some(cached) = weakref.cached_hash {
+                return Ok(RValue::small_int(cached));
+            }
+            let referent = weakref
+                .referent
+                .ok_or(())
+                .or_else(|()| context.raise_error("TypeError", "weak object has gone away"))?;
+            let hashed = hash(context, referent)?;
+            let integer = integer(context, hashed)
+                .map_err(|_| "__hash__ method should return an integer".to_owned())?;
+            let cached = normalize_hash_integer(&integer);
+            let Some(HeapObject::WeakReference(weakref)) = context.heap.get_mut(value) else {
+                return Err("weak reference disappeared while caching its hash".to_owned());
+            };
+            weakref.cached_hash = Some(cached);
+            return Ok(RValue::small_int(cached));
+        }
+
         if matches!(context.heap.get(value), Some(HeapObject::Instance(_))) {
             if let Some(method) = context.special_method(value, "__hash__")? {
                 if method == RValue::NONE {
@@ -4758,6 +5047,9 @@ pub fn hash(context: &mut RimeraContext, value: RValue) -> Result<RValue, String
             }
             Some(HeapObject::DictionaryView(_)) => {
                 return context.raise_error("TypeError", "unhashable type: 'dict view'");
+            }
+            Some(HeapObject::WeakContainer(_)) => {
+                return context.raise_error("TypeError", "unhashable type: 'weak container'");
             }
             Some(HeapObject::ValueArray(_)) => {
                 return Err("managed value has no exposed Python hash".to_owned());
@@ -5041,6 +5333,11 @@ fn repr_text(
 }
 
 pub fn stringify(context: &mut RimeraContext, value: RValue) -> Result<String, String> {
+    if matches!(context.heap.get(value), Some(HeapObject::WeakReference(object)) if object.proxy) {
+        let referent = context.resolve_weak_proxy(value)?;
+        return context
+            .with_temporary_roots(&[value, referent], |context| stringify(context, referent));
+    }
     context.with_temporary_roots(&[value], |context| {
         if let Some(HeapObject::String(text)) = context.heap.get(value) {
             return Ok(text.clone());
@@ -5056,6 +5353,10 @@ pub fn stringify(context: &mut RimeraContext, value: RValue) -> Result<String, S
 }
 
 pub fn repr(context: &mut RimeraContext, value: RValue) -> Result<RValue, String> {
+    if matches!(context.heap.get(value), Some(HeapObject::WeakReference(object)) if object.proxy) {
+        let referent = context.resolve_weak_proxy(value)?;
+        return context.with_temporary_roots(&[value, referent], |context| repr(context, referent));
+    }
     context.with_temporary_roots(&[value], |context| {
         let rendered = repr_text(context, value, &mut Vec::new())?;
         string(context, &rendered)
@@ -5677,6 +5978,12 @@ fn format_string_value(value: &str, spec: &ParsedFormatSpec) -> Result<String, S
 }
 
 pub fn format(context: &mut RimeraContext, value: RValue, spec: RValue) -> Result<RValue, String> {
+    if matches!(context.heap.get(value), Some(HeapObject::WeakReference(object)) if object.proxy) {
+        let referent = context.resolve_weak_proxy(value)?;
+        return context.with_temporary_roots(&[value, referent, spec], |context| {
+            format(context, referent, spec)
+        });
+    }
     context.with_temporary_roots(&[value, spec], |context| {
         let spec_text = match context.heap.get(spec) {
             Some(HeapObject::String(value)) => value.clone(),
@@ -5760,6 +6067,17 @@ pub fn format_value(
 }
 
 pub fn truthy(context: &mut RimeraContext, value: RValue) -> Result<bool, String> {
+    if matches!(
+        context.heap.get(value),
+        Some(HeapObject::WeakReference(object)) if object.proxy
+    ) {
+        let referent = context.resolve_weak_proxy(value)?;
+        return context
+            .with_temporary_roots(&[value, referent], |context| truthy(context, referent));
+    }
+    if let Some(length) = context.weak_container_len(value) {
+        return Ok(length != 0);
+    }
     if value.tag == RTag::Handle as u32
         && matches!(context.heap.get(value), Some(HeapObject::Instance(_)))
     {
@@ -5843,6 +6161,8 @@ pub fn truthy(context: &mut RimeraContext, value: RValue) -> Result<bool, String
                 | HeapObject::AsyncNextAwaitable(_)
                 | HeapObject::AsyncGeneratorOperation(_)
                 | HeapObject::BuiltinFunction(_)
+                | HeapObject::WeakReference(_)
+                | HeapObject::WeakContainer(_)
                 | HeapObject::Cell(_)
                 | HeapObject::Exception(_)
                 | HeapObject::Traceback(_)
@@ -6157,6 +6477,35 @@ pub fn display(context: &RimeraContext, value: RValue) -> Result<String, String>
             Some(HeapObject::BuiltinFunction(object)) => {
                 Ok(format!("<built-in function {}>", object.name))
             }
+            Some(HeapObject::WeakReference(object)) if object.proxy => match object.referent {
+                Some(referent) => display(context, referent),
+                None => Err("weakly-referenced object no longer exists".to_owned()),
+            },
+            Some(HeapObject::WeakReference(object)) => Ok(match object.referent {
+                Some(referent) => format!(
+                    "<weakref at 0x{:x}; to '{}' at 0x{:x}>",
+                    value.payload,
+                    match context.heap.get(referent) {
+                        Some(HeapObject::Instance(instance)) =>
+                            match context.heap.get(instance.class) {
+                                Some(HeapObject::Type(class)) => class.name.as_str(),
+                                _ => "object",
+                            },
+                        _ => "object",
+                    },
+                    referent.payload
+                ),
+                None => format!("<weakref at 0x{:x}; dead>", value.payload),
+            }),
+            Some(HeapObject::WeakContainer(object)) => Ok(format!(
+                "<weakref.{} at 0x{:x}>",
+                match object.kind {
+                    WeakContainerKind::KeyDictionary => "WeakKeyDictionary",
+                    WeakContainerKind::ValueDictionary => "WeakValueDictionary",
+                    WeakContainerKind::Set => "WeakSet",
+                },
+                value.payload
+            )),
             Some(HeapObject::Cell(_)) => Ok("<cell>".to_owned()),
             Some(HeapObject::Exception(object)) => {
                 if let Some(message) = &object.group_message {

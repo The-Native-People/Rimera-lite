@@ -133,11 +133,12 @@
 - Gate 8 synchronous context managers are closed and `Implemented — conformance
   audit pending` through compiler-planned cleanup, exact exceptional exits,
   generator lifecycle, GC, low-heap, and public native artifact proof.
-- Not implemented as compatibility claims: `eval`/`exec`, weak
-  reference/finalizer behavior, stdlib corpora, native stdlib bindings, or PyPI
-  compatibility. Gate 10 closure also does not claim stdlib `asyncio`, networking,
+- Not implemented as general compatibility claims: resurrection,
+  `weakref.finalize`, weak-container algebra beyond the documented Slice 3 surface,
+  stdlib corpora, native stdlib bindings, or PyPI compatibility. Gate 10 closure
+  also does not claim stdlib `asyncio`, networking,
   subprocesses, framework integration, or cross-thread async guarantees.
-- Gates 1–10 are closed. Gate 10 proves async syntax/HIR/MIR, lazy native
+- Gates 1–11 are closed. Gate 10 proves async syntax/HIR/MIR, lazy native
   coroutines, direct/generic await, the one-root executor boundary,
   deterministic timers/wakes/cancellation and buffer lifetime, async iteration,
   comprehensions, async generators/finalization, suspended `async with` cleanup,
@@ -146,10 +147,16 @@
   13's guarded AOT performance qualification in its documented macOS ARM64
   boundary. Every comparable accepted p50 speed/throughput row beats CPython
   3.12.11; materialized lifecycle diagnostics remain distinct from AOT-elided
-  same-source workload results. The sole active compatibility slice is
-  **Gate 11 Slice 3**, covering `eval` globals/locals, builtins injection, and
-  closure reads after Slices 1–2 closed the dynamic compiler foundation. Execute Gates 11–17 in
-  numeric order for dynamic compilation, lifecycle semantics, language
+  same-source workload results. Gate 11 closes the documented
+  capability-enabled native `compile`/`eval`/`exec` subset through exact cache
+  ownership, reclamation, supported composition, resource limits, and artifact
+  audits. Gate 12 Slices 1–4 define the lifecycle state machine and prove
+  managed weak references, callbacks, hashing/equality, proxies, weak
+  containers with non-strengthening mutation-safe iteration, and once-only
+  ordinary/shutdown `__del__` with unraisable reporting. The sole active
+  compatibility slice is **Gate 12 Slice 5**, covering resurrection, cyclic
+  isolates, once-only guarantees, and reentrancy. Execute Gates 12–17 in
+  numeric order for lifecycle semantics, language
   conformance, stdlib, extension/platform ABI, ecosystem proof, and final
   drop-in release qualification. Do not jump to frameworks, modules, or
   packages ahead of that order. Only Gate 17 may authorize a drop-in claim, and

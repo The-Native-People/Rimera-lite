@@ -47,6 +47,25 @@ handled and raised exceptions, closure cells/tuples, function defaults,
 managed code objects, and an emergency `MemoryError` that remains usable when
 the heap cannot allocate.
 
+Gate 12 weak references remain internal managed objects behind the unchanged
+opaque `RValue` ABI. Their referent handle is not traced; callbacks and cached
+state are traced. During the lifecycle phase, reachable weak-reference objects
+whose referents were not marked are cleared before sweep, and callback actions
+temporarily root both the reference and callback. Python callbacks run only
+after the heap returns to its idle phase, newest registration first, through
+the ordinary call ABI. Slot generations—not native addresses—prevent a dead
+referent from resolving after storage reuse. No new public C/Rust layout or
+exported weak-reference ABI is introduced by Slices 1–2.
+
+Slice 3 weak containers are likewise internal managed objects behind `RValue`.
+Their strong payload fields and owned reference objects participate in ordinary
+tracing; observed keys/values remain in the non-tracing referent field. When
+the lifecycle phase clears an observation it prunes every reachable owning
+container and schedules an internal recollection turn. Iterator snapshots trace
+the container, weak-reference handles, and already-strong dictionary payloads,
+but never the observed referents. No exported collection ABI or parallel hash
+table representation is introduced.
+
 ## Execution-kernel objects and calls
 
 - `rimera_type_of` maps every immediate or managed Python-visible value to a
@@ -639,7 +658,64 @@ without changing the stable runtime ABI.
   generic `yield from` delegation. Async generators and async iteration remain
   later async-gate work.
 
-## Structured exceptions
+## Dynamic code execution and namespaces
+
+Capability-enabled artifacts call
+`rimera_dynamic_compiler_install(context) -> RStatus`. The compiler installs a
+same-toolchain Rust callback with borrowed source/filename, ABI-owned
+`RDynamicCompileMode`, flags, and optimization inputs. It returns a finalized
+native entry plus an opaque owner, or a structured compile error. The runtime
+never calls into the compiler through a dependency cycle and never interprets
+source or IR.
+
+Gate 11 Slice 5 keys finalized units by exact source text, filename, mode,
+flags, and optimization level. Cache reuse still publishes a fresh managed code
+object. Every dynamic code object also stores its owning unit address; nested
+function/generator/coroutine code created during that activation inherits the
+same owner. Managed collection retains units referenced by surviving code and
+drops all other opaque owners after sweeping. Cache-hit publication pins its
+unit across the allocating safepoint, so no published code receives a stale
+entry address. Context teardown drops any remaining units.
+
+Slice 7 rejects decoded dynamic source above 1,048,576 UTF-8 bytes, execution
+nesting above 32 active dynamic entries, and creation of a distinct 129th live
+native unit. The live-unit check collects first, and cache hits do not increase
+the count. Each rejection installs a managed `RuntimeError` before compiler
+invocation or code/native-unit publication. Managed allocation limits remain a
+separate `MemoryError` path.
+
+Dynamic top-level code uses the existing five-argument `RNativeFunction` ABI
+with one hidden rooted namespace argument. Its managed code metadata exposes
+zero Python parameters. Eval/exec create a managed function activation holding
+code, globals, captured builtins, and optional closure cells. Captured custom
+builtins use a weak-function/strong-builtins collector association: the value
+is traced only while the function key is otherwise reachable, and the
+association is removed after that function is swept. Existing ordinary
+function code instead enters the authoritative call binder, preserving its
+normal/generator/coroutine kind. Synthetic zero-address metadata is not an
+executable entry. `RStatus::Exception` preserves the raised managed exception.
+
+The MIR entry rewrites top-level names to `ClassNameGet`, `ClassNamespaceSet`,
+and `ClassNamespaceDelete`; explicit globals remain `GlobalGet/Set/Delete`.
+`AnnotationsEnsure` receives the same explicit locals namespace. These use the
+existing Cranelift namespace/global imports and ordinary mapping protocols.
+Direct global writes/deletes target native dictionary storage; locals retain
+dict-subclass callbacks. Namespace ABI error adapters preserve existing raised
+exceptions, including custom mapping exceptions, rather than replacing them.
+
+Python-created functions capture their defining builtins namespace at creation.
+Python `None` supplied as `__builtins__` is retained as `RValue::NONE` and has
+its normal subscriptability failure. The shared builtin call path
+also handles native dict item methods reached through super, and type's native
+class constructor reached through `type.__new__` or super. These reuse existing
+managed collection/class operations and do not add a second object model.
+
+`Display` MIR calls `rimera_display(context, value*) -> RStatus` for interactive
+expressions: None is suppressed; other values use managed repr and update the
+kernel builtin `_`. General stdlib displayhook replacement remains outside the
+published dynamic source contract.
+
+## Structured exception state
 
 - Exception instances are managed Python-visible values containing their type,
   live `args`, an optional traced instance dictionary, traceback, explicit

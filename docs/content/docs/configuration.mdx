@@ -76,9 +76,26 @@ dynamic_compilation = false
     opt-in. The flag can turn the capability on but cannot override a project
     `true` back to false.
 
-    The currently qualified surface is the Gate 11 Slice 1–2 `compile()`
-    foundation. `eval`/`exec` remain under their later Gate 11 conformance
-    slices and are not yet advertised as generally supported.
+    The qualified Gate 11 surface is native `compile()`,
+    the documented `eval()`/`exec()` namespace, builtins, closure and class-body
+    subset, exact-key native-unit reuse/reclamation, and composition with the
+    already-supported import, callback, generator/coroutine, descriptor,
+    exception, and traceback paths.
+
+    Dynamic source may contain at most 1,048,576 UTF-8 bytes inclusive after
+    bytes-like conversion and BOM removal. A larger input raises
+    `RuntimeError: dynamic source exceeds the 1048576 byte limit`. A context
+    permits 32 nested dynamic executions; level 33 raises `RuntimeError: dynamic
+    execution depth exceeds the 32 level limit`. It also permits 128
+    simultaneously live native compilation units; a distinct 129th unit raises
+    `RuntimeError: dynamic native unit limit of 128 reached` after first
+    collecting dead units. Cache hits do not consume another unit.
+
+    All three failures occur before compiler/native-unit publication. The
+    configured managed-heap limit still applies independently and can raise
+    `MemoryError`. These three limits cannot currently be configured. This
+    remains a documented subset, not a general dynamic Python compatibility
+    claim.
   </Accordion>
 
   <Accordion title="run — compile, then start the executable">

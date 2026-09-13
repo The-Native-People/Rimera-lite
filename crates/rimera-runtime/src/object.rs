@@ -37,6 +37,10 @@ pub struct CallArgumentsObject {
 pub struct CodeObject {
     pub dynamic_mode: Option<rimera_abi::RDynamicCompileMode>,
     pub flags_override: Option<u32>,
+    /// Address of the context-owned JIT unit that owns this entry point.
+    /// Nested functions inherit the outer dynamic unit even though their own
+    /// code address differs from the unit's published module entry.
+    pub native_unit_address: Option<usize>,
     pub code_address: usize,
     pub kind: FunctionKind,
     pub name: String,
@@ -350,6 +354,7 @@ pub enum BuiltinFunctionKind {
     DictValues,
     DictItems,
     DictGet,
+    DictItem,
     DictSetDefault,
     DictPop,
     DictPopItem,
@@ -412,12 +417,63 @@ pub enum BuiltinFunctionKind {
     Reload,
     InvalidateImportCaches,
     ReadBinaryResource,
+    WeakRefProxy,
+    WeakRefGetCount,
+    WeakRefGetRefs,
+    WeakContainerMethod,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltinFunctionObject {
     pub name: String,
     pub kind: BuiltinFunctionKind,
+}
+
+/// A weak observation of another managed value.
+///
+/// `referent` is deliberately omitted from `trace_children`: retaining a
+/// weak-reference object must never strengthen the observed value. Callback
+/// and cached-hash state belong to the weak-reference object and remain strong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeakReferenceObject {
+    pub referent: Option<RValue>,
+    pub callback: Option<RValue>,
+    pub cached_hash: Option<i64>,
+    pub proxy: bool,
+    pub callable_proxy: bool,
+    /// Private weak observations owned by weak containers must never participate
+    /// in public callback-free `weakref.ref` canonicalization.
+    pub container_owned: bool,
+    pub ordinal: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeakContainerKind {
+    KeyDictionary,
+    ValueDictionary,
+    Set,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeakContainerEntry {
+    pub weak: RValue,
+    pub strong: Option<RValue>,
+    pub hash: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeakContainerObject {
+    pub kind: WeakContainerKind,
+    pub entries: Vec<WeakContainerEntry>,
+    pub mutation_version: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeakIteratorKind {
+    Keys,
+    Values,
+    Items,
+    Set,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,6 +522,13 @@ pub struct InstanceObject {
     /// Native payload for a supported builtin-storage subclass. The payload
     /// remains opaque to generated code and is traced as an ordinary handle.
     pub storage: Option<RValue>,
+    /// Monotonic creation order used by deterministic shutdown finalization.
+    /// Heap slot order is not stable because generational slots are reused.
+    pub lifecycle_ordinal: u64,
+    /// PEP 442 finalization is a once-only lifecycle transition. This bit is
+    /// set before invoking `__del__` so re-entrant collection and later
+    /// resurrection cannot schedule the same finalizer twice.
+    pub finalized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -894,6 +957,13 @@ pub enum IteratorObject {
         predicate: RValue,
         source: RValue,
     },
+    WeakContainer {
+        source: RValue,
+        entries: Box<[(RValue, Option<RValue>)]>,
+        index: usize,
+        expected_version: u64,
+        kind: WeakIteratorKind,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -937,6 +1007,8 @@ pub enum ManagedObject {
     AsyncNextAwaitable(AsyncNextAwaitableObject),
     AsyncGeneratorOperation(AsyncGeneratorOperationObject),
     BuiltinFunction(BuiltinFunctionObject),
+    WeakReference(WeakReferenceObject),
+    WeakContainer(WeakContainerObject),
     Cell(CellObject),
     Exception(ExceptionObject),
     Traceback(TracebackObject),
@@ -1081,6 +1153,13 @@ impl ManagedObject {
                 visitor(object.input);
             }
             Self::BuiltinFunction(_) => {}
+            Self::WeakReference(object) => {
+                object.callback.into_iter().for_each(visitor);
+            }
+            Self::WeakContainer(object) => object.entries.iter().for_each(|entry| {
+                visitor(entry.weak);
+                entry.strong.into_iter().for_each(&mut *visitor);
+            }),
             Self::Cell(object) => object.value.into_iter().for_each(visitor),
             Self::Exception(object) => {
                 visitor(object.exception_type);
@@ -1125,6 +1204,15 @@ impl ManagedObject {
             Self::Iterator(IteratorObject::CallSentinel { callable, sentinel }) => {
                 visitor(*callable);
                 visitor(*sentinel);
+            }
+            Self::Iterator(IteratorObject::WeakContainer {
+                source, entries, ..
+            }) => {
+                visitor(*source);
+                entries.iter().for_each(|(weak, strong)| {
+                    visitor(*weak);
+                    strong.iter().copied().for_each(&mut *visitor);
+                });
             }
             Self::BigInt(_) | Self::Range(_) | Self::Iterator(IteratorObject::Range { .. }) => {}
         }
@@ -1220,12 +1308,11 @@ impl ManagedObject {
                 .name
                 .capacity()
                 .saturating_add(object.qualified_name.capacity())
-                // FastCallMetadata is inline native optimization state, not
-                // Python-visible managed payload. Do not make a managed-heap
-                // limit fail merely because the runtime learned a new cache;
-                // native/RSS overhead is audited separately.
+                // Managed children are traced and charged at their own
+                // allocations. Charge the non-cache scalar/header share here;
+                // FastCallMetadata and RValue handles are native bookkeeping.
                 .saturating_add(
-                    size_of::<FunctionObject>().saturating_sub(size_of::<FastCallMetadata>()),
+                    size_of::<FunctionObject>().saturating_sub(size_of::<FastCallMetadata>()) / 4,
                 ),
             Self::Code(object) => object
                 .name
@@ -1289,6 +1376,11 @@ impl ManagedObject {
             Self::AsyncNextAwaitable(_) => size_of::<AsyncNextAwaitableObject>(),
             Self::AsyncGeneratorOperation(_) => size_of::<AsyncGeneratorOperationObject>(),
             Self::BuiltinFunction(object) => object.name.capacity(),
+            Self::WeakReference(_) => size_of::<WeakReferenceObject>(),
+            Self::WeakContainer(object) => object
+                .entries
+                .capacity()
+                .saturating_mul(size_of::<WeakContainerEntry>()),
             Self::Cell(_) => size_of::<CellObject>(),
             Self::Exception(object) => object
                 .group_message
@@ -1332,6 +1424,12 @@ impl ManagedObject {
                 | IteratorObject::CallSentinel { .. }
                 | IteratorObject::Map { .. }
                 | IteratorObject::Filter { .. } => size_of::<IteratorObject>(),
+                IteratorObject::WeakContainer { entries, .. } => size_of::<IteratorObject>()
+                    .saturating_add(
+                        entries
+                            .len()
+                            .saturating_mul(size_of::<(RValue, Option<RValue>)>()),
+                    ),
             },
         };
         size_of::<Self>().saturating_add(payload)

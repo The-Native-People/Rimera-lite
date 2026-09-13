@@ -258,7 +258,7 @@ pub unsafe extern "C" fn rimera_context_free(context: *mut RimeraContext) {
     if !context.is_null() {
         // SAFETY: contexts are created by Box::into_raw and freed exactly once.
         let mut context = unsafe { Box::from_raw(context) };
-        context.finalize_suspended_for_shutdown();
+        context.finalize_for_shutdown();
         drop(context);
     }
 }
@@ -492,9 +492,11 @@ pub unsafe extern "C" fn rimera_function_new(
                 Some(value)
             };
             let code_value = context.with_temporary_roots(&metadata_roots, |context| {
+                let native_unit_address = context.active_dynamic_unit_address();
                 context.allocate(HeapObject::Code(CodeObject {
                     dynamic_mode: None,
                     flags_override: None,
+                    native_unit_address,
                     code_address: code as usize,
                     kind: FunctionKind::Normal,
                     name: name.to_owned(),
@@ -513,7 +515,7 @@ pub unsafe extern "C" fn rimera_function_new(
                 .ok_or_else(|| "function has no defining module namespace".to_owned())?;
             metadata_roots.push(globals);
             context.with_temporary_roots(&metadata_roots, |context| {
-                context.allocate(HeapObject::Function(FunctionObject {
+                let function = context.allocate(HeapObject::Function(FunctionObject {
                     code: code_value,
                     fast_call: FastCallMetadata::new(
                         code as usize,
@@ -529,7 +531,9 @@ pub unsafe extern "C" fn rimera_function_new(
                     keyword_defaults: keyword_defaults_value,
                     annotations: None,
                     type_params: None,
-                }))
+                }))?;
+                context.capture_function_builtins(function, globals);
+                Ok(function)
             })
         })
     })
@@ -1455,6 +1459,9 @@ pub unsafe extern "C" fn rimera_global_set(
             .initialize_kernel()
             .map_err(|_| RStatus::Exception)?;
         let globals = context.globals().ok_or(RStatus::InvalidArgument)?;
+        let globals = context
+            .dictionary_storage(globals)
+            .ok_or(RStatus::InvalidArgument)?;
         context
             .namespace_set(globals, name, value)
             .map_err(|message| {
@@ -1832,12 +1839,19 @@ pub unsafe extern "C" fn rimera_global_get(
             unsafe { output.write(value) };
             return Ok(());
         }
-        if let Some(value) = globals.and_then(|globals| context.namespace_value(globals, name)) {
+        if let Some(value) = context.execution_global(name).map_err(|message| {
+            if context.raised.is_none() {
+                record_exception(context, "NameError", message);
+            }
+            RStatus::Exception
+        })? {
             unsafe { output.write(value) };
             return Ok(());
         }
         let value = context.execution_builtin(name).map_err(|message| {
-            record_exception(context, "RuntimeError", message);
+            if context.raised.is_none() {
+                record_exception(context, "RuntimeError", message);
+            }
             RStatus::Exception
         })?;
         let Some(value) = value else {
@@ -1871,6 +1885,9 @@ pub unsafe extern "C" fn rimera_global_delete(
             .initialize_kernel()
             .map_err(|_| RStatus::Exception)?;
         let globals = context.globals().ok_or(RStatus::InvalidArgument)?;
+        let globals = context
+            .dictionary_storage(globals)
+            .ok_or(RStatus::InvalidArgument)?;
         context.namespace_delete(globals, name).map_err(|_| {
             record_exception(
                 context,
@@ -1946,7 +1963,9 @@ pub unsafe extern "C" fn rimera_namespace_set(
                 context.namespace_set(namespace, name, value)
             })
             .map_err(|message| {
-                record_exception(context, "TypeError", message);
+                if context.raised.is_none() {
+                    record_exception(context, "TypeError", message);
+                }
                 RStatus::Exception
             })
     })
@@ -2000,7 +2019,9 @@ pub unsafe extern "C" fn rimera_class_name_get(
             .initialize_kernel()
             .map_err(|_| RStatus::Exception)?;
         let value = context.class_name_get(namespace, name).map_err(|message| {
-            record_exception(context, "NameError", message);
+            if context.raised.is_none() {
+                record_exception(context, "NameError", message);
+            }
             RStatus::Exception
         })?;
         unsafe { output.write(value) };
@@ -2063,7 +2084,9 @@ pub unsafe extern "C" fn rimera_namespace_delete(
         context
             .namespace_delete(namespace, name)
             .map_err(|message| {
-                record_exception(context, "NameError", message);
+                if context.raised.is_none() {
+                    record_exception(context, "NameError", message);
+                }
                 RStatus::Exception
             })
     })
@@ -4392,6 +4415,7 @@ mod tests {
                     context.allocate(HeapObject::Code(CodeObject {
                         dynamic_mode: None,
                         flags_override: None,
+                        native_unit_address: None,
                         code_address,
                         kind,
                         name: name.to_owned(),
@@ -4408,7 +4432,7 @@ mod tests {
                 let globals = context.globals().unwrap();
                 metadata_roots.push(globals);
                 context.with_temporary_roots(&metadata_roots, |context| {
-                    context.allocate(HeapObject::Function(FunctionObject {
+                    let function = context.allocate(HeapObject::Function(FunctionObject {
                         code,
                         fast_call: FastCallMetadata::new(code_address, 1, positional_arity, kind),
                         globals,
@@ -4419,7 +4443,9 @@ mod tests {
                         keyword_defaults: None,
                         annotations: None,
                         type_params: None,
-                    }))
+                    }))?;
+                    context.capture_function_builtins(function, globals);
+                    Ok::<RValue, String>(function)
                 })
             })
             .unwrap()

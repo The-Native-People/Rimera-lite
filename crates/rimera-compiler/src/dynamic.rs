@@ -116,7 +116,11 @@ pub fn compile_source(
         ));
     }
     let mut syntax = syntax::parse_mode(&path, source, options.mode)?;
-    optimize_suite(&mut syntax.statements, options.optimize, true);
+    optimize_suite(
+        &mut syntax.statements,
+        options.optimize,
+        options.mode == RDynamicCompileMode::Exec,
+    );
     let mut hir = sema::analyze_with_dynamic_compilation(&path, &syntax, true)?;
     if options.mode == RDynamicCompileMode::Single {
         mark_display(&mut hir.statements);
@@ -267,9 +271,6 @@ fn optimize_suite(statements: &mut Vec<syntax::Statement>, optimize: i8, docstri
     {
         statements.remove(0);
     }
-    if optimize > 0 {
-        statements.retain(|statement| !matches!(statement.kind, S::Assert { .. }));
-    }
     for statement in statements {
         match &mut statement.kind {
             S::FunctionDef { body, .. } | S::ClassDef { body, .. } => {
@@ -310,6 +311,18 @@ fn optimize_suite(statements: &mut Vec<syntax::Statement>, optimize: i8, docstri
                 }
             }
             _ => {}
+        }
+        // Keep lexical uses/bindings and semantic validation even when assert
+        // execution is disabled. In particular a walrus still makes a local.
+        if optimize > 0 && matches!(statement.kind, S::Assert { .. }) {
+            statement.kind = S::If {
+                condition: syntax::Expression {
+                    span: statement.span,
+                    kind: syntax::ExpressionKind::Bool(false),
+                },
+                then_body: vec![statement.clone()],
+                else_body: Vec::new(),
+            };
         }
     }
 }
@@ -418,9 +431,11 @@ fn compile_native(
     })?;
     Ok(rimera_runtime::NativeDynamicCode {
         address: address as usize,
+        source: source.to_owned(),
         mode,
         filename: filename.to_owned(),
         flags: 0,
+        optimize,
         owner: Box::new(NativeOwner(Some(module))),
     })
 }
@@ -547,8 +562,8 @@ mod tests {
         optimize_suite(&mut module.statements, 2, true);
         assert_eq!(
             module.statements.len(),
-            1,
-            "optimize=2 should strip module docstring and assert"
+            2,
+            "optimize=2 strips the docstring but preserves dormant assert bindings"
         );
 
         for (level, expected) in [(0, true), (1, false), (2, false)] {

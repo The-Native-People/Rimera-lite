@@ -16,7 +16,8 @@ use crate::object::{
     GeneratorObject, InstanceObject, MemberDescriptorObject, ModuleObject, ModuleState,
     PropertyMethodKind, PropertyMethodObject, PropertyObject, StaticMethodObject, SuperObject,
     SuspendedKind, TYPE_FLAG_BUILTIN, TYPE_FLAG_EXCEPTION, TYPE_FLAG_INSTANTIABLE, TracebackObject,
-    TypeLayout, TypeObject,
+    TypeLayout, TypeObject, WeakContainerEntry, WeakContainerKind, WeakContainerObject,
+    WeakIteratorKind, WeakReferenceObject,
 };
 
 const HEAP_LIMIT_MESSAGE: &str = "managed heap limit exceeded";
@@ -84,6 +85,12 @@ const LAZY_BUILTIN_TYPES: &[(&str, &str)] = &[
     ("SourceFileLoader", "object"),
     ("NamespaceLoader", "object"),
     ("ModuleSpec", "object"),
+    ("ReferenceType", "object"),
+    ("ProxyType", "object"),
+    ("CallableProxyType", "object"),
+    ("WeakKeyDictionary", "object"),
+    ("WeakValueDictionary", "object"),
+    ("WeakSet", "object"),
 ];
 
 /// Gate-specific exception classes that do not need to inflate the permanent
@@ -102,6 +109,7 @@ const LAZY_BUILTIN_EXCEPTIONS: &[(&str, &str)] = &[
     ("StopAsyncIteration", "Exception"),
     ("ImportError", "Exception"),
     ("ModuleNotFoundError", "ImportError"),
+    ("ReferenceError", "Exception"),
 ];
 
 fn is_public_builtin_type_name(name: &str) -> bool {
@@ -150,6 +158,7 @@ fn is_public_builtin_type_name(name: &str) -> bool {
             | "StopAsyncIteration"
             | "ImportError"
             | "ModuleNotFoundError"
+            | "ReferenceError"
     )
 }
 
@@ -237,6 +246,8 @@ pub struct RimeraContext {
     generator_finalizer: Option<GeneratorFinalizer>,
     async_root_runner: Option<AsyncRootRunner>,
     async_root_running: bool,
+    weakref_sequence: u64,
+    instance_lifecycle_sequence: u64,
 }
 
 impl Default for RimeraContext {
@@ -264,6 +275,8 @@ impl Default for RimeraContext {
             generator_finalizer: None,
             async_root_runner: None,
             async_root_running: false,
+            weakref_sequence: 0,
+            instance_lifecycle_sequence: 0,
         }
     }
 }
@@ -316,37 +329,62 @@ impl RimeraContext {
     pub fn collect(&mut self) {
         loop {
             let roots = self.discover_roots();
-            let lifecycle_actions = self.heap.collect(roots);
+            let associations = self.dynamic.function_builtins.clone();
+            let finalizable = self.pending_instance_finalizers();
+            let lifecycle_actions = self.heap.collect_with_ephemerons_and_finalizers(
+                roots,
+                &associations,
+                &finalizable,
+            );
             if lifecycle_actions.is_empty() {
                 break;
             }
-            for action in lifecycle_actions {
-                let saved_raised = self.raised.take();
-                let saved_exception = self.exception.take();
-                match action {
-                    LifecycleAction::FinalizeBufferLease(lease) => {
-                        let finalizer = self.buffer_lease_finalizer.expect(
-                            "buffer lease finalizer must be installed before lease allocation",
-                        );
-                        let _ = self
-                            .with_temporary_roots(&[lease], |context| finalizer(context, lease));
+            let lifecycle_roots = lifecycle_actions
+                .iter()
+                .copied()
+                .flat_map(LifecycleAction::roots)
+                .flatten()
+                .collect::<Vec<_>>();
+            self.with_temporary_roots(&lifecycle_roots, |context| {
+                for action in lifecycle_actions {
+                    let saved_raised = context.raised.take();
+                    let saved_exception = context.exception.take();
+                    match action {
+                        LifecycleAction::FinalizeBufferLease(lease) => {
+                            let finalizer = context.buffer_lease_finalizer.expect(
+                                "buffer lease finalizer must be installed before lease allocation",
+                            );
+                            let _ = finalizer(context, lease);
+                        }
+                        LifecycleAction::CloseGenerator(generator) => {
+                            let finalizer = context.generator_finalizer.expect(
+                                "generator finalizer must be installed before generator allocation",
+                            );
+                            let _ = finalizer(context, generator);
+                        }
+                        LifecycleAction::FinalizeInstance(instance) => {
+                            context.finalize_instance(instance);
+                        }
+                        LifecycleAction::WeakReferenceCallback {
+                            weakref, callback, ..
+                        } => {
+                            if crate::call::invoke(context, callback, &[weakref], &[]).is_err()
+                                && context.raised.is_some()
+                            {
+                                context.report_unraisable(callback);
+                            }
+                        }
+                        LifecycleAction::Recollect => {}
                     }
-                    LifecycleAction::CloseGenerator(generator) => {
-                        let finalizer = self.generator_finalizer.expect(
-                            "generator finalizer must be installed before generator allocation",
-                        );
-                        let _ = self.with_temporary_roots(&[generator], |context| {
-                            finalizer(context, generator)
-                        });
-                    }
+                    // GC-triggered release callback failures are unraisable here;
+                    // generator cleanup failures follow the same rule. Neither may
+                    // replace the exception state of the allocating safepoint.
+                    context.raised = saved_raised;
+                    context.exception = saved_exception;
                 }
-                // GC-triggered release callback failures are unraisable here;
-                // generator cleanup failures follow the same rule. Neither may
-                // replace the exception state of the allocating safepoint.
-                self.raised = saved_raised;
-                self.exception = saved_exception;
-            }
+            });
         }
+        self.reclaim_dynamic_state();
         self.next_collection_bytes =
             MIN_COLLECTION_THRESHOLD.max(self.heap.live_bytes().saturating_mul(2));
     }
@@ -389,12 +427,92 @@ impl RimeraContext {
             .map(|_| ())
     }
 
-    /// Run lifecycle cleanup for live suspended objects before destroying the
-    /// entire runtime context. Tracing GC normally discovers unreachable
-    /// coroutines at allocation safepoints; a final expression can create an
-    /// unawaited coroutine without another allocation, so context teardown is
-    /// the final deterministic lifecycle boundary.
-    pub(crate) fn finalize_suspended_for_shutdown(&mut self) {
+    fn pending_instance_finalizers(&self) -> Vec<RValue> {
+        let mut pending = self
+            .heap
+            .live_values()
+            .into_iter()
+            .filter_map(|value| match self.heap.get(value) {
+                Some(HeapObject::Instance(instance))
+                    if !instance.finalized
+                        && self.class_attribute(instance.class, "__del__").is_some() =>
+                {
+                    Some((instance.lifecycle_ordinal, value))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        pending.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        pending.into_iter().map(|(_, value)| value).collect()
+    }
+
+    fn unraisable_label(&self, callable: RValue) -> String {
+        let display_target = match self.heap.get(callable) {
+            Some(HeapObject::BoundMethod(method)) => method.function,
+            _ => callable,
+        };
+        crate::operations::display(self, display_target)
+            .unwrap_or_else(|_| "<finalizer>".to_owned())
+    }
+
+    fn report_unraisable(&mut self, callable: RValue) {
+        if self.raised.is_none() {
+            return;
+        }
+        let label = self.unraisable_label(callable);
+        let rendered = self.render_active_exception();
+        eprintln!("Exception ignored in: {label}");
+        eprintln!("{rendered}");
+    }
+
+    fn finalize_instance(&mut self, instance: RValue) {
+        let should_run = match self.heap.get_mut(instance) {
+            Some(HeapObject::Instance(object)) if !object.finalized => {
+                // Mark before Python runs so re-entrant collection, shutdown,
+                // and later resurrection can never schedule this finalizer a
+                // second time.
+                object.finalized = true;
+                true
+            }
+            _ => false,
+        };
+        if !should_run {
+            return;
+        }
+        let method = match self.special_method(instance, "__del__") {
+            Ok(Some(method)) => method,
+            Ok(None) => return,
+            Err(_) => {
+                if self.raised.is_some() {
+                    self.report_unraisable(instance);
+                }
+                return;
+            }
+        };
+        let result = self.with_temporary_roots(&[instance, method], |context| {
+            crate::call::invoke(context, method, &[], &[])
+        });
+        if result.is_err() && self.raised.is_some() {
+            self.report_unraisable(method);
+        }
+    }
+
+    /// Run Python-visible lifecycle cleanup before destroying the entire
+    /// runtime context. Ordinary collection handles unreachable objects; this
+    /// boundary additionally finalizes still-live global instances and pending
+    /// suspended objects in deterministic heap-allocation order.
+    pub(crate) fn finalize_for_shutdown(&mut self) {
+        let finalizable = self.pending_instance_finalizers();
+        for instance in finalizable {
+            let saved_raised = self.raised;
+            let saved_exception = self.exception.clone();
+            self.with_temporary_roots(&[instance], |context| {
+                context.finalize_instance(instance);
+            });
+            self.raised = saved_raised;
+            self.exception = saved_exception;
+        }
+
         let pending = self
             .heap
             .live_values()
@@ -999,6 +1117,7 @@ impl RimeraContext {
             context.allocate(HeapObject::Code(CodeObject {
                 dynamic_mode: None,
                 flags_override: None,
+                native_unit_address: None,
                 code_address: 0,
                 kind: FunctionKind::Normal,
                 name: "<module>".to_owned(),
@@ -1496,6 +1615,16 @@ impl RimeraContext {
                     | crate::object::AsyncGeneratorOperationKind::Close => "async_generator_athrow",
                 },
                 Some(HeapObject::BoundMethod(_)) => "function",
+                Some(HeapObject::WeakReference(object)) if object.callable_proxy => {
+                    "CallableProxyType"
+                }
+                Some(HeapObject::WeakReference(object)) if object.proxy => "ProxyType",
+                Some(HeapObject::WeakReference(_)) => "ReferenceType",
+                Some(HeapObject::WeakContainer(object)) => match object.kind {
+                    WeakContainerKind::KeyDictionary => "WeakKeyDictionary",
+                    WeakContainerKind::ValueDictionary => "WeakValueDictionary",
+                    WeakContainerKind::Set => "WeakSet",
+                },
                 Some(HeapObject::CallArguments(_) | HeapObject::BufferLease(_)) => "object",
                 Some(HeapObject::Property(_))
                 | Some(HeapObject::StaticMethod(_))
@@ -1818,7 +1947,7 @@ impl RimeraContext {
         inherited_slots.extend(own_slots.iter().cloned());
         has_dictionary |=
             declares_dictionary || self.namespace_value(namespace, "__slots__").is_none();
-        has_weakref |= declares_weakref;
+        has_weakref |= declares_weakref || self.namespace_value(namespace, "__slots__").is_none();
         let effective_bases_for_hooks = effective_bases.clone();
         let layout = inherited_layout(&self.heap, &effective_bases)?;
         if self.namespace_value(namespace, "__eq__").is_some()
@@ -2145,6 +2274,8 @@ impl RimeraContext {
         let has_dictionary = type_object.has_dictionary;
         let slot_count = type_object.slot_names.len();
         let layout = type_object.layout;
+        let lifecycle_ordinal = self.instance_lifecycle_sequence;
+        self.instance_lifecycle_sequence = self.instance_lifecycle_sequence.wrapping_add(1);
         self.with_temporary_roots(&[class], |context| {
             let dictionary = if has_dictionary {
                 Some(context.allocate(HeapObject::Dictionary(DictionaryObject {
@@ -2194,6 +2325,8 @@ impl RimeraContext {
                         dictionary,
                         slots: vec![None; slot_count].into_boxed_slice(),
                         storage,
+                        lifecycle_ordinal,
+                        finalized: false,
                     }))
                 })
             })
@@ -2879,7 +3012,7 @@ impl RimeraContext {
         ) {
             match self.namespace_get(namespace, "__annotations__") {
                 Ok(_) => return Ok(()),
-                Err(_) if self.consume_exception_type("KeyError") => {}
+                Err(_) if self.consume_exception_subclass("KeyError") => {}
                 Err(error) => return Err(error),
             }
         }
@@ -2952,6 +3085,12 @@ impl RimeraContext {
         namespace: RValue,
         name: &str,
     ) -> Result<RValue, String> {
+        if matches!(self.heap.get(namespace), Some(HeapObject::Instance(_))) {
+            return self.with_temporary_roots(&[namespace], |context| {
+                let key = crate::operations::string(context, name)?;
+                crate::operations::item_get(context, namespace, key)
+            });
+        }
         if let Some(value) = self.namespace_value(namespace, name) {
             return Ok(value);
         }
@@ -2968,7 +3107,7 @@ impl RimeraContext {
             if dictionary.remove(name).is_some() {
                 return Ok(());
             }
-            return Err(format!("class namespace has no attribute '{name}'"));
+            return self.raise_error("NameError", format!("name '{name}' is not defined"));
         }
         let index = match self.heap.get(namespace) {
             Some(HeapObject::ValueDictionary(dictionary)) => dictionary
@@ -2990,7 +3129,7 @@ impl RimeraContext {
             }
         };
         let Some(index) = index else {
-            return Err(format!("class namespace has no attribute '{name}'"));
+            return self.raise_error("NameError", format!("name '{name}' is not defined"));
         };
         let Some(HeapObject::ValueDictionary(dictionary)) = self.heap.get_mut(namespace) else {
             return Err("class namespace is not a dictionary".to_owned());
@@ -3006,7 +3145,9 @@ impl RimeraContext {
         namespace: RValue,
         name: &str,
     ) -> Result<RValue, String> {
-        if let Some(value) = self.namespace_value(namespace, name) {
+        if !matches!(self.heap.get(namespace), Some(HeapObject::Instance(_)))
+            && let Some(value) = self.namespace_value(namespace, name)
+        {
             return Ok(value);
         }
         if !matches!(
@@ -3015,7 +3156,7 @@ impl RimeraContext {
         ) {
             match self.namespace_get(namespace, name) {
                 Ok(value) => return Ok(value),
-                Err(error) if self.consume_exception_type("KeyError") => {}
+                Err(error) if self.consume_exception_subclass("KeyError") => {}
                 Err(error) => return Err(error),
             }
         }
@@ -3031,18 +3172,114 @@ impl RimeraContext {
         }
     }
 
-    pub(crate) fn execution_builtin(&mut self, name: &str) -> Result<Option<RValue>, String> {
-        if let Some(namespace) = self
-            .globals()
-            .and_then(|globals| self.namespace_value(globals, "__builtins__"))
-        {
-            let namespace = match self.heap.get(namespace) {
-                Some(HeapObject::Module(module)) => module.namespace,
-                _ => namespace,
+    pub(crate) fn dictionary_storage(&self, value: RValue) -> Option<RValue> {
+        match self.heap.get(value) {
+            Some(HeapObject::Dictionary(_) | HeapObject::ValueDictionary(_)) => Some(value),
+            Some(HeapObject::Instance(instance)) => instance.storage.filter(|storage| {
+                matches!(
+                    self.heap.get(*storage),
+                    Some(HeapObject::ValueDictionary(_))
+                )
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn execution_global(&mut self, name: &str) -> Result<Option<RValue>, String> {
+        let Some(globals) = self.globals() else {
+            return Ok(None);
+        };
+        if matches!(self.heap.get(globals), Some(HeapObject::Instance(_))) {
+            return match self.namespace_get(globals, name) {
+                Ok(value) => Ok(Some(value)),
+                Err(_) if self.consume_exception_subclass("KeyError") => Ok(None),
+                Err(error) => Err(error),
             };
-            if Some(namespace) != self.builtins() {
+        }
+        Ok(self.namespace_value(globals, name))
+    }
+
+    pub(crate) fn builtins_for_globals(&self, globals: RValue) -> RValue {
+        let namespace = self
+            .namespace_value(globals, "__builtins__")
+            .or(self.builtins())
+            .unwrap_or(RValue::NONE);
+        match self.heap.get(namespace) {
+            Some(HeapObject::Module(module)) => module.namespace,
+            _ => namespace,
+        }
+    }
+
+    pub(crate) fn execution_builtins(&self) -> RValue {
+        self.active_calls
+            .last()
+            .and_then(|active| match self.heap.get(active.function) {
+                Some(HeapObject::Function(_)) => Some(self.function_builtins(active.function)),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.builtins_for_globals(self.globals().unwrap_or(RValue::NONE)))
+    }
+
+    pub(crate) fn capture_function_builtins(&mut self, function: RValue, globals: RValue) {
+        let namespace = self.builtins_for_globals(globals);
+        let custom = Some(namespace) != self.builtins();
+        if custom {
+            self.dynamic.function_builtins.push((function, namespace));
+        }
+    }
+
+    pub(crate) fn active_dynamic_unit_address(&self) -> Option<usize> {
+        self.active_calls.last().and_then(|active| {
+            let HeapObject::Function(function) = self.heap.get(active.function)? else {
+                return None;
+            };
+            let HeapObject::Code(code) = self.heap.get(function.code)? else {
+                return None;
+            };
+            code.native_unit_address
+        })
+    }
+
+    pub(crate) fn function_builtins(&self, function: RValue) -> RValue {
+        self.dynamic
+            .function_builtins
+            .iter()
+            .rev()
+            .find_map(|(candidate, builtins)| (*candidate == function).then_some(*builtins))
+            .or(self.builtins())
+            .unwrap_or(RValue::NONE)
+    }
+
+    pub(crate) fn execution_builtin(&mut self, name: &str) -> Result<Option<RValue>, String> {
+        let namespace = self.execution_builtins();
+        if Some(namespace) != self.builtins() {
+            if self.heap.get(namespace).is_none() {
+                let type_value = self.type_of(namespace)?;
+                return self.raise_error(
+                    "TypeError",
+                    format!(
+                        "'{}' object is not subscriptable",
+                        self.type_name(type_value)
+                    ),
+                );
+            }
+            if matches!(
+                self.heap.get(namespace),
+                Some(HeapObject::Dictionary(_) | HeapObject::ValueDictionary(_))
+            ) {
                 return Ok(self.namespace_value(namespace, name));
             }
+            return self.with_temporary_roots(&[namespace], |context| {
+                let key = crate::operations::string(context, name)?;
+                match crate::operations::item_get(context, namespace, key) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(_) if context.consume_exception_subclass("KeyError") => Ok(None),
+                    Err(error) if context.raised.is_none() => {
+                        context.raise_error("TypeError", error)
+                    }
+                    Err(error) => Err(error),
+                }
+            });
         }
         if let Some(value) = self.lookup_builtin(name) {
             return Ok(Some(value));
@@ -3068,7 +3305,7 @@ impl RimeraContext {
         ) {
             match self.namespace_get(namespace, name) {
                 Ok(value) => return Ok(value),
-                Err(error) if self.consume_exception_type("KeyError") => {}
+                Err(error) if self.consume_exception_subclass("KeyError") => {}
                 Err(error) => return Err(error),
             }
         }
@@ -3151,6 +3388,48 @@ impl RimeraContext {
     }
 
     pub(crate) fn attribute_get(&mut self, receiver: RValue, name: &str) -> Result<RValue, String> {
+        if matches!(
+            self.heap.get(receiver),
+            Some(HeapObject::WeakReference(object)) if object.proxy
+        ) {
+            let referent = self.resolve_weak_proxy(receiver)?;
+            return self.with_temporary_roots(&[receiver, referent], |context| {
+                context.attribute_get(referent, name)
+            });
+        }
+        if let Some(HeapObject::WeakReference(object)) = self.heap.get(receiver) {
+            return match name {
+                "__callback__" => Ok(object.callback.unwrap_or(RValue::NONE)),
+                _ => Err(format!(
+                    "'weakref.ReferenceType' object has no attribute '{name}'"
+                )),
+            };
+        }
+        if let Some(HeapObject::WeakContainer(object)) = self.heap.get(receiver) {
+            let kind = object.kind;
+            let supported = match kind {
+                WeakContainerKind::KeyDictionary | WeakContainerKind::ValueDictionary => matches!(
+                    name,
+                    "keys" | "values" | "items" | "get" | "pop" | "setdefault" | "clear"
+                ),
+                WeakContainerKind::Set => {
+                    matches!(name, "add" | "discard" | "remove" | "clear")
+                }
+            };
+            if supported {
+                let type_name = match kind {
+                    WeakContainerKind::KeyDictionary => "WeakKeyDictionary",
+                    WeakContainerKind::ValueDictionary => "WeakValueDictionary",
+                    WeakContainerKind::Set => "WeakSet",
+                };
+                return self.bound_builtin_method(
+                    receiver,
+                    &format!("{type_name}.{name}"),
+                    BuiltinFunctionKind::WeakContainerMethod,
+                );
+            }
+            return Err(format!("weak container object has no attribute '{name}'"));
+        }
         if let Some(HeapObject::Module(module)) = self.heap.get(receiver) {
             let namespace = module.namespace;
             if name == "__dict__" {
@@ -3179,6 +3458,8 @@ impl RimeraContext {
                 "__name__" => crate::operations::string(self, &function_name),
                 "__qualname__" => crate::operations::string(self, &qualified_name),
                 "__code__" => Ok(code),
+                "__globals__" => Ok(function.globals),
+                "__builtins__" => Ok(self.function_builtins(receiver)),
                 "__closure__" => Ok(closure.unwrap_or(RValue::NONE)),
                 "__defaults__" => Ok(defaults.unwrap_or(RValue::NONE)),
                 "__kwdefaults__" => Ok(keyword_defaults.unwrap_or(RValue::NONE)),
@@ -3897,6 +4178,28 @@ impl RimeraContext {
                         "super(type, obj): obj must be an instance or subtype of type".to_owned()
                     })?;
                 for candidate in &mro[start + 1..] {
+                    if Some(*candidate) == self.builtin_type("type") && name == "__new__" {
+                        return self.allocate(HeapObject::BuiltinFunction(BuiltinFunctionObject {
+                            name: "type.__new__".to_owned(),
+                            kind: BuiltinFunctionKind::TypePrepare,
+                        }));
+                    }
+                    if matches!(self.heap.get(*candidate), Some(HeapObject::Type(class)) if class.flags & TYPE_FLAG_BUILTIN != 0 && class.layout == TypeLayout::Dictionary)
+                    {
+                        let kind = match name {
+                            "__getitem__" | "__setitem__" | "__delitem__" => {
+                                Some(BuiltinFunctionKind::DictItem)
+                            }
+                            _ => None,
+                        };
+                        if let Some(kind) = kind {
+                            return self.bound_builtin_method(
+                                object.receiver,
+                                &format!("dict.{name}"),
+                                kind,
+                            );
+                        }
+                    }
                     let (value, builtin_storage_init) = match self.heap.get(*candidate) {
                         Some(HeapObject::Type(class)) => {
                             let value = self.namespace_value(class.namespace, name);
@@ -3984,6 +4287,28 @@ impl RimeraContext {
                     && let Some(dictionary) = dictionary
                 {
                     return Ok(dictionary);
+                }
+                if name == "__weakref__"
+                    && matches!(self.heap.get(class), Some(HeapObject::Type(class)) if class.has_weakref)
+                {
+                    let references = self.weak_references_to(receiver);
+                    let callback_free = references.iter().copied().find(|weakref| {
+                        matches!(
+                            self.heap.get(*weakref),
+                            Some(HeapObject::WeakReference(object))
+                                if !object.proxy && object.callback.is_none()
+                        )
+                    });
+                    return Ok(callback_free
+                        .or_else(|| {
+                            references.into_iter().max_by_key(|weakref| {
+                                match self.heap.get(*weakref) {
+                                    Some(HeapObject::WeakReference(object)) => object.ordinal,
+                                    _ => 0,
+                                }
+                            })
+                        })
+                        .unwrap_or(RValue::NONE));
                 }
                 if let Some(dictionary) = dictionary
                     && let Some(value) = self.namespace_value(dictionary, name)
@@ -4103,6 +4428,11 @@ impl RimeraContext {
                             kind: BuiltinFunctionKind::FloatFromHex,
                         }))?;
                     return self.bind_method(function, receiver);
+                } else if name == "__new__" && Some(receiver) == self.builtin_type("type") {
+                    return self.allocate(HeapObject::BuiltinFunction(BuiltinFunctionObject {
+                        name: "type.__new__".to_owned(),
+                        kind: BuiltinFunctionKind::TypePrepare,
+                    }));
                 } else if name == "__prepare__" {
                     let function =
                         self.allocate(HeapObject::BuiltinFunction(BuiltinFunctionObject {
@@ -4257,6 +4587,15 @@ impl RimeraContext {
         name: &str,
         value: RValue,
     ) -> Result<(), String> {
+        if matches!(
+            self.heap.get(receiver),
+            Some(HeapObject::WeakReference(object)) if object.proxy
+        ) {
+            let referent = self.resolve_weak_proxy(receiver)?;
+            return self.with_temporary_roots(&[receiver, referent, value], |context| {
+                context.attribute_set(referent, name, value)
+            });
+        }
         if let Some(HeapObject::Module(module)) = self.heap.get(receiver) {
             let namespace = module.namespace;
             if name == "__dict__" {
@@ -4723,6 +5062,15 @@ impl RimeraContext {
     }
 
     pub(crate) fn attribute_delete(&mut self, receiver: RValue, name: &str) -> Result<(), String> {
+        if matches!(
+            self.heap.get(receiver),
+            Some(HeapObject::WeakReference(object)) if object.proxy
+        ) {
+            let referent = self.resolve_weak_proxy(receiver)?;
+            return self.with_temporary_roots(&[receiver, referent], |context| {
+                context.attribute_delete(referent, name)
+            });
+        }
         if let Some(HeapObject::Module(module)) = self.heap.get(receiver) {
             let namespace = module.namespace;
             if name == "__dict__" {
@@ -4909,6 +5257,7 @@ impl RimeraContext {
     }
 
     pub(crate) fn namespace_value(&self, namespace: RValue, name: &str) -> Option<RValue> {
+        let namespace = self.dictionary_storage(namespace).unwrap_or(namespace);
         match self.heap.get(namespace) {
             Some(HeapObject::Dictionary(dictionary)) => dictionary.get(name),
             Some(HeapObject::ValueDictionary(dictionary)) => {
@@ -4948,6 +5297,15 @@ impl RimeraContext {
         value: RValue,
         name: &str,
     ) -> Result<Option<RValue>, String> {
+        if matches!(
+            self.heap.get(value),
+            Some(HeapObject::WeakReference(object)) if object.proxy
+        ) {
+            let referent = self.resolve_weak_proxy(value)?;
+            return self.with_temporary_roots(&[value, referent], |context| {
+                context.special_method(referent, name)
+            });
+        }
         // Native suspended objects expose protocol slots through the runtime
         // rather than materializing Python methods in their builtin type
         // namespaces. Special-method lookup must still observe those slots,
@@ -4974,6 +5332,15 @@ impl RimeraContext {
         value: RValue,
         name: &str,
     ) -> Result<bool, String> {
+        if matches!(
+            self.heap.get(value),
+            Some(HeapObject::WeakReference(object)) if object.proxy
+        ) {
+            let referent = self.resolve_weak_proxy(value)?;
+            return self.with_temporary_roots(&[value, referent], |context| {
+                context.has_special_method_slot(referent, name)
+            });
+        }
         if matches!(
             self.heap.get(value),
             Some(HeapObject::Generator(generator))
@@ -5995,6 +6362,474 @@ impl RimeraContext {
         }
     }
 
+    fn weakrefable(&mut self, value: RValue) -> Result<bool, String> {
+        let result = match self.heap.get(value) {
+            Some(HeapObject::Instance(instance)) => match self.heap.get(instance.class) {
+                Some(HeapObject::Type(class)) => class.has_weakref,
+                _ => false,
+            },
+            Some(
+                HeapObject::Function(_)
+                | HeapObject::Type(_)
+                | HeapObject::Generator(_)
+                | HeapObject::Module(_)
+                | HeapObject::Code(_)
+                | HeapObject::BoundMethod(_),
+            ) => true,
+            _ => false,
+        };
+        Ok(result)
+    }
+
+    pub(crate) fn new_weak_reference(
+        &mut self,
+        referent: RValue,
+        callback: Option<RValue>,
+        proxy: bool,
+    ) -> Result<RValue, String> {
+        self.new_weak_reference_impl(referent, callback, proxy, false)
+    }
+
+    fn new_weak_container_reference(&mut self, referent: RValue) -> Result<RValue, String> {
+        // CPython's weak containers own a distinct weak observation.  Reusing the
+        // callback-free weakref.ref canonical object would make getweakrefcount()
+        // and getweakrefs() under-report container observations and would couple
+        // otherwise independent weak-container lifetimes.
+        self.new_weak_reference_impl(referent, None, false, true)
+    }
+
+    fn new_weak_reference_impl(
+        &mut self,
+        referent: RValue,
+        callback: Option<RValue>,
+        proxy: bool,
+        container_owned: bool,
+    ) -> Result<RValue, String> {
+        if !self.weakrefable(referent)? {
+            let type_value = self.type_of(referent)?;
+            let type_name = self.type_name(type_value);
+            return self.raise_error(
+                "TypeError",
+                format!("cannot create weak reference to '{type_name}' object"),
+            );
+        }
+        if !container_owned && !proxy && callback.is_none() {
+            for candidate in self.heap.live_values() {
+                if matches!(
+                    self.heap.get(candidate),
+                    Some(HeapObject::WeakReference(WeakReferenceObject {
+                        referent: Some(existing),
+                        callback: None,
+                        proxy: false,
+                        container_owned: false,
+                        ..
+                    })) if *existing == referent
+                ) {
+                    return Ok(candidate);
+                }
+            }
+        }
+        let callable_proxy = proxy
+            && (matches!(
+                self.heap.get(referent),
+                Some(
+                    HeapObject::Type(_)
+                        | HeapObject::Function(_)
+                        | HeapObject::BuiltinFunction(_)
+                        | HeapObject::BoundMethod(_)
+                        | HeapObject::PropertyMethod(_)
+                )
+            ) || self.has_special_method_slot(referent, "__call__")?);
+        let ordinal = self.weakref_sequence;
+        self.weakref_sequence = self.weakref_sequence.wrapping_add(1);
+        self.with_temporary_roots(
+            &callback.into_iter().chain([referent]).collect::<Vec<_>>(),
+            |context| {
+                context.allocate(HeapObject::WeakReference(WeakReferenceObject {
+                    referent: Some(referent),
+                    callback,
+                    cached_hash: None,
+                    proxy,
+                    callable_proxy,
+                    container_owned,
+                    ordinal,
+                }))
+            },
+        )
+    }
+
+    pub(crate) fn resolve_weak_proxy(&mut self, value: RValue) -> Result<RValue, String> {
+        match self.heap.get(value) {
+            Some(HeapObject::WeakReference(object)) if object.proxy => object.referent.ok_or(()),
+            _ => return Ok(value),
+        }
+        .or_else(|()| {
+            self.raise_error(
+                "ReferenceError",
+                "weakly-referenced object no longer exists",
+            )
+        })
+    }
+
+    pub(crate) fn weak_references_to(&self, referent: RValue) -> Vec<RValue> {
+        self.heap
+            .live_values()
+            .into_iter()
+            .filter(|candidate| {
+                matches!(
+                    self.heap.get(*candidate),
+                    Some(HeapObject::WeakReference(object))
+                        if object.referent == Some(referent)
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn new_weak_container(&mut self, kind: WeakContainerKind) -> Result<RValue, String> {
+        self.allocate(HeapObject::WeakContainer(WeakContainerObject {
+            kind,
+            entries: Vec::new(),
+            mutation_version: 0,
+        }))
+    }
+
+    pub(crate) fn weak_container_len(&self, container: RValue) -> Option<usize> {
+        match self.heap.get(container) {
+            Some(HeapObject::WeakContainer(object)) => Some(object.entries.len()),
+            _ => None,
+        }
+    }
+
+    fn weak_container_find(
+        &mut self,
+        container: RValue,
+        key: RValue,
+        hash: i64,
+    ) -> Result<Option<usize>, String> {
+        let entries = match self.heap.get(container) {
+            Some(HeapObject::WeakContainer(object)) => object.entries.clone(),
+            _ => return Err("weak container receiver is invalid".to_owned()),
+        };
+        for entry in entries {
+            if entry.hash != hash {
+                continue;
+            }
+            let candidate = match self.heap.get(entry.weak) {
+                Some(HeapObject::WeakReference(reference)) => match self.heap.get(container) {
+                    Some(HeapObject::WeakContainer(object)) => match object.kind {
+                        WeakContainerKind::KeyDictionary | WeakContainerKind::Set => {
+                            reference.referent
+                        }
+                        WeakContainerKind::ValueDictionary => entry.strong,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            // Equality can execute arbitrary user code (including allocations and
+            // collection).  Keep the weakly observed candidate and its weak handle
+            // alive only for this comparison, then revalidate the exact entry below.
+            let equal =
+                self.with_temporary_roots(&[container, key, candidate, entry.weak], |context| {
+                    let compared = crate::operations::compare(context, 0, candidate, key)?;
+                    context.with_temporary_roots(&[compared], |context| {
+                        crate::operations::truthy(context, compared)
+                    })
+                })?;
+            if equal {
+                return Ok(match self.heap.get(container) {
+                    Some(HeapObject::WeakContainer(object)) => object
+                        .entries
+                        .iter()
+                        .position(|current| current.weak == entry.weak && current.hash == hash),
+                    _ => None,
+                });
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn weak_container_get(
+        &mut self,
+        container: RValue,
+        key: RValue,
+    ) -> Result<Option<RValue>, String> {
+        let hash = crate::operations::hash_i64(self, key)?;
+        let Some(position) = self.weak_container_find(container, key, hash)? else {
+            return Ok(None);
+        };
+        let entry = match self.heap.get(container) {
+            Some(HeapObject::WeakContainer(object)) => object.entries[position].clone(),
+            _ => return Err("weak container receiver is invalid".to_owned()),
+        };
+        match self.heap.get(container) {
+            Some(HeapObject::WeakContainer(object)) => match object.kind {
+                WeakContainerKind::KeyDictionary => Ok(entry.strong),
+                WeakContainerKind::ValueDictionary => Ok(match self.heap.get(entry.weak) {
+                    Some(HeapObject::WeakReference(reference)) => reference.referent,
+                    _ => None,
+                }),
+                WeakContainerKind::Set => Ok(match self.heap.get(entry.weak) {
+                    Some(HeapObject::WeakReference(reference)) => reference.referent,
+                    _ => None,
+                }),
+            },
+            _ => Err("weak container receiver is invalid".to_owned()),
+        }
+    }
+
+    pub(crate) fn weak_container_setdefault(
+        &mut self,
+        container: RValue,
+        key: RValue,
+        value: RValue,
+    ) -> Result<RValue, String> {
+        let kind = match self.heap.get(container) {
+            Some(HeapObject::WeakContainer(object)) => object.kind,
+            _ => return Err("weak container receiver is invalid".to_owned()),
+        };
+        if kind != WeakContainerKind::KeyDictionary {
+            if let Some(existing) = self.weak_container_get(container, key)? {
+                return Ok(existing);
+            }
+            self.weak_container_set_item(container, key, value)?;
+            return Ok(value);
+        }
+
+        self.with_temporary_roots(&[container, key, value], |context| {
+            let hash = crate::operations::hash_i64(context, key)?;
+            if let Some(position) = context.weak_container_find(container, key, hash)? {
+                return match context.heap.get(container) {
+                    Some(HeapObject::WeakContainer(object)) => object
+                        .entries
+                        .get(position)
+                        .and_then(|entry| entry.strong)
+                        .ok_or_else(|| "weak key dictionary entry is invalid".to_owned()),
+                    _ => Err("weak container receiver is invalid".to_owned()),
+                };
+            }
+
+            let weak = context.new_weak_container_reference(key)?;
+            context.with_temporary_roots(&[weak], |context| {
+                context.preflight_managed_growth(std::mem::size_of::<WeakContainerEntry>())?;
+                let Some(HeapObject::WeakContainer(object)) = context.heap.get_mut(container)
+                else {
+                    return Err("weak container receiver is invalid".to_owned());
+                };
+                object.entries.push(WeakContainerEntry {
+                    weak,
+                    strong: Some(value),
+                    hash,
+                });
+                object.mutation_version = object.mutation_version.wrapping_add(1);
+                Ok(value)
+            })
+        })
+    }
+
+    pub(crate) fn weak_container_set_item(
+        &mut self,
+        container: RValue,
+        key: RValue,
+        value: RValue,
+    ) -> Result<(), String> {
+        let kind = match self.heap.get(container) {
+            Some(HeapObject::WeakContainer(object)) => object.kind,
+            _ => return Err("weak container receiver is invalid".to_owned()),
+        };
+        if kind == WeakContainerKind::Set {
+            return Err("WeakSet does not support item assignment".to_owned());
+        }
+        let logical_key = key;
+        let hash = crate::operations::hash_i64(self, logical_key)?;
+        if let Some(position) = self.weak_container_find(container, logical_key, hash)? {
+            if kind == WeakContainerKind::KeyDictionary {
+                let Some(HeapObject::WeakContainer(object)) = self.heap.get_mut(container) else {
+                    return Err("weak container receiver is invalid".to_owned());
+                };
+                object.entries[position].strong = Some(value);
+                return Ok(());
+            }
+            let old_referent = match self.heap.get(container) {
+                Some(HeapObject::WeakContainer(object)) => self
+                    .heap
+                    .get(object.entries[position].weak)
+                    .and_then(|weak| match weak {
+                        HeapObject::WeakReference(reference) => reference.referent,
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            let mut roots = vec![container, key, value];
+            roots.extend(old_referent);
+            return self.with_temporary_roots(&roots, |context| {
+                let weak = context.new_weak_container_reference(value)?;
+                context.with_temporary_roots(&[weak], |context| {
+                    let Some(HeapObject::WeakContainer(object)) = context.heap.get_mut(container)
+                    else {
+                        return Err("weak container receiver is invalid".to_owned());
+                    };
+                    let Some(entry) = object.entries.get_mut(position) else {
+                        return Err("weak container changed during value replacement".to_owned());
+                    };
+                    entry.weak = weak;
+                    Ok(())
+                })
+            });
+        }
+        let weak_target = if kind == WeakContainerKind::KeyDictionary {
+            key
+        } else {
+            value
+        };
+        let weak = self.new_weak_container_reference(weak_target)?;
+        let strong = Some(if kind == WeakContainerKind::KeyDictionary {
+            value
+        } else {
+            key
+        });
+        let roots = [container, key, value, weak];
+        self.with_temporary_roots(&roots, |context| {
+            context.preflight_managed_growth(std::mem::size_of::<WeakContainerEntry>())?;
+            let Some(HeapObject::WeakContainer(object)) = context.heap.get_mut(container) else {
+                return Err("weak container receiver is invalid".to_owned());
+            };
+            object
+                .entries
+                .push(WeakContainerEntry { weak, strong, hash });
+            object.mutation_version = object.mutation_version.wrapping_add(1);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn weak_set_add(&mut self, container: RValue, value: RValue) -> Result<(), String> {
+        let hash = crate::operations::hash_i64(self, value)?;
+        if self.weak_container_find(container, value, hash)?.is_some() {
+            return Ok(());
+        }
+        let weak = self.new_weak_container_reference(value)?;
+        self.with_temporary_roots(&[container, value, weak], |context| {
+            context.preflight_managed_growth(std::mem::size_of::<WeakContainerEntry>())?;
+            let Some(HeapObject::WeakContainer(object)) = context.heap.get_mut(container) else {
+                return Err("weak container receiver is invalid".to_owned());
+            };
+            if object.kind != WeakContainerKind::Set {
+                return Err("weak set operation requires WeakSet".to_owned());
+            }
+            object.entries.push(WeakContainerEntry {
+                weak,
+                strong: None,
+                hash,
+            });
+            object.mutation_version = object.mutation_version.wrapping_add(1);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn weak_container_delete(
+        &mut self,
+        container: RValue,
+        key: RValue,
+    ) -> Result<bool, String> {
+        let hash = crate::operations::hash_i64(self, key)?;
+        let Some(position) = self.weak_container_find(container, key, hash)? else {
+            return Ok(false);
+        };
+        let Some(HeapObject::WeakContainer(object)) = self.heap.get_mut(container) else {
+            return Err("weak container receiver is invalid".to_owned());
+        };
+        object.entries.remove(position);
+        object.mutation_version = object.mutation_version.wrapping_add(1);
+        Ok(true)
+    }
+
+    pub(crate) fn weak_container_pop(
+        &mut self,
+        container: RValue,
+        key: RValue,
+    ) -> Result<Option<RValue>, String> {
+        self.with_temporary_roots(&[container, key], |context| {
+            let hash = crate::operations::hash_i64(context, key)?;
+            let Some(position) = context.weak_container_find(container, key, hash)? else {
+                return Ok(None);
+            };
+            let (kind, entry) = match context.heap.get(container) {
+                Some(HeapObject::WeakContainer(object)) => {
+                    let Some(entry) = object.entries.get(position).cloned() else {
+                        return Err("weak container changed during pop".to_owned());
+                    };
+                    (object.kind, entry)
+                }
+                _ => return Err("weak container receiver is invalid".to_owned()),
+            };
+            let value = match kind {
+                WeakContainerKind::KeyDictionary => entry.strong,
+                WeakContainerKind::ValueDictionary | WeakContainerKind::Set => {
+                    match context.heap.get(entry.weak) {
+                        Some(HeapObject::WeakReference(reference)) => reference.referent,
+                        _ => None,
+                    }
+                }
+            };
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            context.with_temporary_roots(&[entry.weak, value], |context| {
+                let Some(HeapObject::WeakContainer(object)) = context.heap.get_mut(container)
+                else {
+                    return Err("weak container receiver is invalid".to_owned());
+                };
+                if !matches!(
+                    object.entries.get(position),
+                    Some(current) if current.weak == entry.weak && current.hash == hash
+                ) {
+                    return Err("weak container changed during pop".to_owned());
+                }
+                object.entries.remove(position);
+                object.mutation_version = object.mutation_version.wrapping_add(1);
+                Ok(Some(value))
+            })
+        })
+    }
+
+    pub(crate) fn weak_container_iterator(
+        &mut self,
+        container: RValue,
+        kind: WeakIteratorKind,
+    ) -> Result<RValue, String> {
+        let (expected_version, entries) = match self.heap.get(container) {
+            Some(HeapObject::WeakContainer(object)) => (
+                object.mutation_version,
+                object
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.weak, entry.strong))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => return Err("weak container receiver is invalid".to_owned()),
+        };
+        let roots = entries
+            .iter()
+            .flat_map(|(weak, strong)| [Some(*weak), *strong])
+            .flatten()
+            .chain([container])
+            .collect::<Vec<_>>();
+        self.with_temporary_roots(&roots, |context| {
+            context.allocate(HeapObject::Iterator(
+                crate::object::IteratorObject::WeakContainer {
+                    source: container,
+                    entries: entries.clone().into_boxed_slice(),
+                    index: 0,
+                    expected_version,
+                    kind,
+                },
+            ))
+        })
+    }
+
     pub(crate) fn import_name(&mut self, name: &str) -> Result<RValue, String> {
         self.initialize_kernel()?;
         if let Some(module) = self.cached_module(name) {
@@ -6061,6 +6896,45 @@ impl RimeraContext {
                                 },
                             ))?;
                             context.namespace_set(namespace, "read_binary", read_binary)?;
+                        } else if name == "weakref" {
+                            for (attribute, function_name, kind) in [
+                                ("proxy", "proxy", BuiltinFunctionKind::WeakRefProxy),
+                                (
+                                    "getweakrefcount",
+                                    "getweakrefcount",
+                                    BuiltinFunctionKind::WeakRefGetCount,
+                                ),
+                                (
+                                    "getweakrefs",
+                                    "getweakrefs",
+                                    BuiltinFunctionKind::WeakRefGetRefs,
+                                ),
+                            ] {
+                                let function = context.allocate(HeapObject::BuiltinFunction(
+                                    BuiltinFunctionObject {
+                                        name: function_name.to_owned(),
+                                        kind,
+                                    },
+                                ))?;
+                                context.namespace_set(namespace, attribute, function)?;
+                            }
+                            for type_name in [
+                                "ReferenceType",
+                                "ProxyType",
+                                "CallableProxyType",
+                                "WeakKeyDictionary",
+                                "WeakValueDictionary",
+                                "WeakSet",
+                            ] {
+                                let type_value =
+                                    context.ensure_builtin_type(type_name)?.ok_or_else(|| {
+                                        format!("kernel type `{type_name}` is missing")
+                                    })?;
+                                context.namespace_set(namespace, type_name, type_value)?;
+                                if type_name == "ReferenceType" {
+                                    context.namespace_set(namespace, "ref", type_value)?;
+                                }
+                            }
                         } else if name == "rimera.async_runtime" {
                             let run = context.allocate(HeapObject::BuiltinFunction(
                                 BuiltinFunctionObject {
@@ -6569,6 +7443,24 @@ impl RimeraContext {
             return false;
         };
         if self.exception_type_name(exception) != Some(expected) {
+            return false;
+        }
+        self.raised = None;
+        self.exception = None;
+        true
+    }
+
+    pub(crate) fn consume_exception_subclass(&mut self, expected: &str) -> bool {
+        let Some(exception) = self.raised else {
+            return false;
+        };
+        let matches = match (self.heap.get(exception), self.builtin_type(expected)) {
+            (Some(HeapObject::Exception(exception)), Some(expected)) => self
+                .is_subclass(exception.exception_type, expected)
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !matches {
             return false;
         }
         self.raised = None;

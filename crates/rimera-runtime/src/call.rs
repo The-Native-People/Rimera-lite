@@ -14,7 +14,7 @@ use crate::heap::HeapObject;
 use crate::object::{
     AsyncGeneratorOperationKind, AsyncGeneratorOperationObject, AsyncNextAwaitableObject,
     BuiltinFunctionKind, CallArgumentsObject, CodeObject, DictionaryObject, FunctionObject,
-    TYPE_FLAG_BUILTIN, TypeLayout,
+    TYPE_FLAG_BUILTIN, TypeLayout, WeakContainerKind, WeakIteratorKind,
 };
 
 fn exact_positional_target(
@@ -214,9 +214,41 @@ pub(crate) fn invoke(
     positional: &[RValue],
     keywords: &[(String, RValue)],
 ) -> Result<RValue, String> {
+    if let Some(HeapObject::WeakReference(weakref)) = context.heap.get(callable) {
+        let referent = weakref.referent;
+        let proxy = weakref.proxy;
+        let callable_proxy = weakref.callable_proxy;
+        if !proxy {
+            if !keywords.is_empty() || !positional.is_empty() {
+                return Err(format!(
+                    "weakref expected 0 arguments, got {}",
+                    positional.len()
+                ));
+            }
+            return Ok(referent.unwrap_or(RValue::NONE));
+        }
+        let referent = context.resolve_weak_proxy(callable)?;
+        if callable_proxy {
+            let mut roots = positional.to_vec();
+            roots.extend(keywords.iter().map(|(_, value)| *value));
+            roots.extend([callable, referent]);
+            return context.with_temporary_roots(&roots, |context| {
+                invoke(context, referent, positional, keywords)
+            });
+        }
+    }
     if let Some(HeapObject::Type(object)) = context.heap.get(callable) {
         let type_name = object.name.clone();
         let flags = object.flags;
+        if type_name == "ReferenceType" {
+            return invoke_weakref_ref(context, positional, keywords);
+        }
+        if matches!(
+            type_name.as_str(),
+            "WeakKeyDictionary" | "WeakValueDictionary" | "WeakSet"
+        ) {
+            return invoke_weak_container_constructor(context, &type_name, positional, keywords);
+        }
         if type_name == "type" {
             return invoke_type(context, positional, keywords);
         }
@@ -379,6 +411,22 @@ pub(crate) fn invoke(
             BuiltinFunctionKind::AsyncGeneratorOperationClose => {
                 invoke_async_generator_operation_close(context, positional, keywords)
             }
+            BuiltinFunctionKind::TypePrepare if function.name == "type.__new__" => {
+                if positional.len() != 4 || !keywords.is_empty() {
+                    return Err(
+                        "type.__new__() requires a metaclass, name, bases, and namespace"
+                            .to_owned(),
+                    );
+                }
+                let name = crate::operations::string_value(context, positional[1])
+                    .ok_or("type.__new__() name must be str")?
+                    .to_owned();
+                let bases = match context.heap.get(positional[2]) {
+                    Some(HeapObject::Tuple(bases)) => bases.to_vec(),
+                    _ => return Err("type.__new__() bases must be tuple".to_owned()),
+                };
+                context.new_class_with_metaclass(&name, &bases, positional[3], Some(positional[0]))
+            }
             BuiltinFunctionKind::TypePrepare => invoke_type_prepare(context, positional, keywords),
             BuiltinFunctionKind::Property => invoke_property(context, positional, keywords),
             BuiltinFunctionKind::StaticMethod => {
@@ -405,6 +453,19 @@ pub(crate) fn invoke(
             }
             BuiltinFunctionKind::ReadBinaryResource => {
                 invoke_read_binary_resource(context, positional, keywords)
+            }
+            BuiltinFunctionKind::WeakRefProxy => {
+                invoke_weakref_proxy(context, positional, keywords)
+            }
+            BuiltinFunctionKind::WeakRefGetCount => {
+                invoke_weakref_get_count(context, positional, keywords)
+            }
+            BuiltinFunctionKind::WeakRefGetRefs => {
+                invoke_weakref_get_refs(context, positional, keywords)
+            }
+            BuiltinFunctionKind::WeakContainerMethod => {
+                let function_name = function.name.clone();
+                invoke_weak_container_method(context, &function_name, positional, keywords)
             }
             BuiltinFunctionKind::Compile => crate::dynamic::compile(context, positional, keywords),
             BuiltinFunctionKind::Eval => {
@@ -467,6 +528,30 @@ pub(crate) fn invoke(
                 crate::object::DictionaryViewKind::Items,
             ),
             BuiltinFunctionKind::DictGet => invoke_dict_get(context, positional, keywords),
+            BuiltinFunctionKind::DictItem => {
+                let expected = if function.name.ends_with("__setitem__") {
+                    3
+                } else {
+                    2
+                };
+                if !keywords.is_empty() || positional.len() != expected {
+                    return Err("dictionary item method received invalid arguments".to_owned());
+                }
+                let storage = context
+                    .dictionary_storage(positional[0])
+                    .ok_or("dictionary item method requires a dict receiver")?;
+                match function.name.as_str() {
+                    name if name.ends_with("__getitem__") => {
+                        crate::operations::item_get(context, storage, positional[1])
+                    }
+                    name if name.ends_with("__setitem__") => {
+                        crate::operations::item_set(context, storage, positional[1], positional[2])
+                            .map(|()| RValue::NONE)
+                    }
+                    _ => crate::operations::item_delete(context, storage, positional[1])
+                        .map(|()| RValue::NONE),
+                }
+            }
             BuiltinFunctionKind::DictSetDefault => {
                 invoke_dict_setdefault(context, positional, keywords)
             }
@@ -3393,6 +3478,9 @@ fn invoke_hasattr(
 }
 
 fn is_callable_value(context: &mut RimeraContext, value: RValue) -> Result<bool, String> {
+    if let Some(HeapObject::WeakReference(weakref)) = context.heap.get(value) {
+        return Ok(!weakref.proxy || weakref.callable_proxy);
+    }
     Ok(matches!(
         context.heap.get(value),
         Some(
@@ -3403,6 +3491,179 @@ fn is_callable_value(context: &mut RimeraContext, value: RValue) -> Result<bool,
                 | HeapObject::PropertyMethod(_)
         )
     ) || context.has_special_method_slot(value, "__call__")?)
+}
+
+fn weakref_arguments(
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+    name: &str,
+) -> Result<(RValue, Option<RValue>), String> {
+    if !keywords.is_empty() || !(1..=2).contains(&positional.len()) {
+        return Err(format!(
+            "{name} expected 1 or 2 arguments, got {}",
+            positional.len()
+        ));
+    }
+    Ok((
+        positional[0],
+        positional
+            .get(1)
+            .copied()
+            .filter(|callback| *callback != RValue::NONE),
+    ))
+}
+
+fn invoke_weakref_ref(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    let (referent, callback) = weakref_arguments(positional, keywords, "ref")?;
+    context.new_weak_reference(referent, callback, false)
+}
+
+fn invoke_weakref_proxy(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    let (referent, callback) = weakref_arguments(positional, keywords, "proxy")?;
+    context.new_weak_reference(referent, callback, true)
+}
+
+fn invoke_weakref_get_count(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err(format!(
+            "getweakrefcount expected 1 argument, got {}",
+            positional.len()
+        ));
+    }
+    let count = context.weak_references_to(positional[0]).len();
+    crate::operations::store_integer(context, count.into())
+}
+
+fn invoke_weakref_get_refs(
+    context: &mut RimeraContext,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() != 1 {
+        return Err(format!(
+            "getweakrefs expected 1 argument, got {}",
+            positional.len()
+        ));
+    }
+    let values = context.weak_references_to(positional[0]);
+    context.with_temporary_roots(&values, |context| {
+        context.allocate(HeapObject::List(values.clone()))
+    })
+}
+
+fn invoke_weak_container_constructor(
+    context: &mut RimeraContext,
+    type_name: &str,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.len() > 1 {
+        return Err(format!("{type_name} expected at most 1 argument"));
+    }
+    let kind = match type_name {
+        "WeakKeyDictionary" => WeakContainerKind::KeyDictionary,
+        "WeakValueDictionary" => WeakContainerKind::ValueDictionary,
+        "WeakSet" => WeakContainerKind::Set,
+        _ => return Err("unknown weak container type".to_owned()),
+    };
+    let container = context.new_weak_container(kind)?;
+    let Some(source) = positional.first().copied() else {
+        return Ok(container);
+    };
+    context.with_temporary_roots(&[container, source], |context| {
+        let values = crate::operations::collect_iterable(context, source)?;
+        context.with_temporary_roots(&values, |context| {
+            if kind == WeakContainerKind::Set {
+                for value in values.iter().copied() {
+                    context.weak_set_add(container, value)?;
+                }
+            } else {
+                for key in values.iter().copied() {
+                    let value = crate::operations::item_get(context, source, key)?;
+                    context.weak_container_set_item(container, key, value)?;
+                }
+            }
+            Ok(container)
+        })
+    })
+}
+
+fn invoke_weak_container_method(
+    context: &mut RimeraContext,
+    name: &str,
+    positional: &[RValue],
+    keywords: &[(String, RValue)],
+) -> Result<RValue, String> {
+    if !keywords.is_empty() || positional.is_empty() {
+        return Err(format!("{name} received invalid arguments"));
+    }
+    let receiver = positional[0];
+    let method = name.rsplit('.').next().unwrap_or(name);
+    match method {
+        "keys" | "values" | "items" if positional.len() == 1 => context.weak_container_iterator(
+            receiver,
+            match method {
+                "keys" => WeakIteratorKind::Keys,
+                "values" => WeakIteratorKind::Values,
+                _ => WeakIteratorKind::Items,
+            },
+        ),
+        "get" if matches!(positional.len(), 2 | 3) => Ok(context
+            .weak_container_get(receiver, positional[1])?
+            .unwrap_or_else(|| positional.get(2).copied().unwrap_or(RValue::NONE))),
+        "add" if positional.len() == 2 => {
+            context.weak_set_add(receiver, positional[1])?;
+            Ok(RValue::NONE)
+        }
+        "discard" if positional.len() == 2 => {
+            let _ = context.weak_container_delete(receiver, positional[1])?;
+            Ok(RValue::NONE)
+        }
+        "remove" if positional.len() == 2 => {
+            if !context.weak_container_delete(receiver, positional[1])? {
+                return context.raise_error("KeyError", "weak container key not found");
+            }
+            Ok(RValue::NONE)
+        }
+        "pop" if matches!(positional.len(), 2 | 3) => {
+            let value = context.weak_container_pop(receiver, positional[1])?;
+            let Some(value) = value else {
+                if let Some(default) = positional.get(2) {
+                    return Ok(*default);
+                }
+                return context.raise_error("KeyError", "weak container key not found");
+            };
+            Ok(value)
+        }
+        "setdefault" if matches!(positional.len(), 2 | 3) => context.weak_container_setdefault(
+            receiver,
+            positional[1],
+            positional.get(2).copied().unwrap_or(RValue::NONE),
+        ),
+        "clear" if positional.len() == 1 => {
+            let Some(HeapObject::WeakContainer(object)) = context.heap.get_mut(receiver) else {
+                return Err("weak container receiver is invalid".to_owned());
+            };
+            if !object.entries.is_empty() {
+                object.entries.clear();
+                object.mutation_version = object.mutation_version.wrapping_add(1);
+            }
+            Ok(RValue::NONE)
+        }
+        _ => Err(format!("{name} received invalid arguments")),
+    }
 }
 
 fn invoke_callable(
@@ -3918,7 +4179,7 @@ fn dictionary_lookup(
 ) -> Result<Option<RValue>, String> {
     match crate::operations::item_get(context, dictionary, key) {
         Ok(value) => Ok(Some(value)),
-        Err(_) if context.consume_exception_type("KeyError") => Ok(None),
+        Err(_) if context.consume_exception_subclass("KeyError") => Ok(None),
         Err(error) => Err(error),
     }
 }

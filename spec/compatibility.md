@@ -69,8 +69,8 @@ separate later-gate work.
 | 14 | Comprehensions and unpacking | Implemented — conformance audit pending | Recursive exact/starred/chained targets across normal and class-body execution, `for`/comprehension destructuring, dictionary unpacking, expanded calls, list/set/dict comprehensions, and executable generator expressions with CPython 3.12.11 differential, GC, failure-atomicity, and release-artifact proof |
 | 15 | Reflection and introspection | Implemented — conformance audit pending | Gate 7 Slices 1–10 prove the single-owner reflection matrix: native `globals`/`locals`/`vars`/`dir`; narrow managed module-shell composition; generic identity/type/attribute helpers; managed function/code/cell, exception/traceback/frame, generator, class/type, and Python 3.12 type-parameter metadata; Python-level PEP 688 providers with shared traced leases; descendant/metaclass observer invalidation; reflective mutation/base-change atomicity; and cross-family GC/reentrancy composition. Lazy PEP 695 bounds/constraints remain `RIM-CAP-G7-03`; general imports, dynamic compilation, weakrefs, async reflection, and the `inspect` stdlib API remain later-gate boundaries. |
 | 16 | Async and await | Implemented — conformance audit pending | Gate 10 closes the owned Python 3.12 async language/protocol surface on macOS ARM64 with the Compio backend: async syntax/MIR, lazy native coroutines, direct/generic awaitables, async iteration/comprehensions, async generators/finalization, `async with`, cancellation/cleanup, managed buffer lifetime, and the one-root execution boundary. Slice 13 additionally qualifies guarded AOT ready-await and nonescaping create/close elimination: every comparable checked-in p50 speed/throughput row beats CPython 3.12.11, same-source create+close is 2.34 ns effective p50 (27.35x faster), and the pure-ready million-await workload is 30.90x faster, while materialized lifecycle cost remains a separate diagnostic and rebinding/low-heap cases retain the generic path. `--async`/`tool.rimera.async` provide auto/compio selection plus stable unavailable Monoio/Tokio diagnostics, while synchronous artifacts retain zero backend reachability. Constrained-heap composition, race/model stress, zero steady-state adapter allocation, fixed latency/memory/throughput/size budgets, reproducibility, ABI/workspace/release audits, and native-only artifacts are green. This does not implement stdlib `asyncio`, networking, subprocesses, framework compatibility, or cross-thread task guarantees. |
-| 17 | `eval`, `exec`, and runtime compilation | Partial — Gate 11 Slices 1–2 complete | Capability-gated native `compile()` uses the ordinary parser/sema/HIR/verified-MIR/Cranelift path and publishes immutable managed code metadata only after native finalization. `exec`/`eval`/`single` modes, source/filename boundaries, `flags=0`, optimization, syntax metadata, constrained-heap execution, and static-artifact omission are proven against CPython 3.12.11. Full `eval` namespace/closure conformance is Slice 3, full `exec` writes/declarations is Slice 4, and cache/reclamation plus extended/adversarial closure remain later slices. |
-| 18 | Weak references and finalizers | Phase reserved only | GC has a lifecycle phase boundary but exposes neither behavior |
+| 17 | `eval`, `exec`, and runtime compilation | Implemented — conformance audit pending | Gate 11 closes capability-gated native `compile()` through the ordinary parser/sema/HIR/verified-MIR/Cranelift path plus the documented `eval`/`exec` namespace, mapping, builtins, closure, declaration, and class-body behavior. Exact-key JIT reuse, managed-owner lifetime, post-GC reclamation, nested compilation, registered imports, callbacks, generators/coroutines, descriptors, exceptions/tracebacks, fixed source/depth/live-unit limits, recovery/atomicity, constrained heaps, capability denial, and native/static artifact audits are proven. AST input, nonzero `PyCF_*` flags, top-level await, arbitrary stdlib breadth, and unsupported syntax remain outside this category. |
+| 18 | Weak references and finalizers | Narrow partial | Gate 12 Slices 1–4 freeze the lifecycle/reachability contract and expose managed `weakref.ref`, callbacks, live/dead hash and equality, callable/ordinary proxies, type identities, observer queries, `WeakKeyDictionary`, `WeakValueDictionary`, `WeakSet`, and once-only user-instance `__del__`. Collector pruning, reentrant equality, explicit mutation detection, private container observations, single-lookup `pop`, container-specific `setdefault` hash parity, non-strengthening iterators, ordinary finalizer-before-weakref ordering, unraisable exception reporting, and creation-ordered runtime shutdown are covered by CPython 3.12.11 native differentials plus heap tests. Resurrection, cyclic-isolate ordering, `weakref.finalize`, and lifecycle stress remain later slices. |
 | 19 | Python 3.12 edge semantics | Narrow partial | Selected floor arithmetic, call binding, exception cleanup, and traceback behavior |
 | 20 | Pure-Python standard-library corpus | Not started | No corpus claim |
 | 21 | Native stdlib and platform bindings | Not started | No native module corpus claim |
@@ -277,21 +277,19 @@ zero measured allocations over 1,000 warmed cycles. CLI proof executes produced
 artifacts and covers invalid backend/target no-artifact boundaries. The parallel
 native suite also verifies the repaired per-process manifest-publication race.
 
-Gates 1–10 are closed. Gate 9's deterministic module graph and Gate 10's native
-async language/protocol stack are both proven against CPython 3.12.11 within
+Gates 1–11 are closed. Gate 9's deterministic module graph and Gate 10's native
+async language/protocol stack are proven against CPython 3.12.11 within
 their published boundaries, including Slice 13's all-comparable-row performance
 qualification, constrained-heap composition, and final artifact/reproducibility
 audits. The resume board's sole active compatibility
-slice is **Gate 11 Slice 3 — `eval` globals/locals, builtins injection, and
-closure reads**; Slices 1–2 are closed.
+slice is **Gate 12 Slice 4 — `__del__`, finalization order, exception reporting,
+and shutdown**; Gate 12 Slices 1–3 and Gate 11's eight dynamic-compilation slices
+are closed.
 
-1. Gate 11 now executes in numeric order from
-   [`spec/gates/11/README.md`](gates/11/README.md), extending Rimera's existing
-   parser/sema/MIR/Cranelift path without introducing Python bytecode or an
-   interpreter.
-2. Continue later post-core gates in numeric order after Gate 11 with
-   [Gate 12 weak references/finalizers](gates/12/README.md).
-3. Then run [Gate 13 language/runtime conformance](gates/13/README.md),
+1. Gate 12 now executes in numeric order from
+   [Gate 12 weak references/finalizers](gates/12/README.md), extending the
+   existing collector lifecycle without raw-address weak identity.
+2. Then run [Gate 13 language/runtime conformance](gates/13/README.md),
    [Gate 14 standard library](gates/14/README.md),
    [Gate 15 native extensions/platform ABI](gates/15/README.md),
    [Gate 16 packaging/ecosystem compatibility](gates/16/README.md), and

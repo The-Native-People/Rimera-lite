@@ -71,6 +71,193 @@ fn gate11_dynamic_namespaces_use_public_native_pipeline() {
     assert!(!denied_output.exists());
 }
 
+#[test]
+fn gate11_eval_and_exec_scope_conformance() {
+    assert_gate11_fixtures(&["gate11_eval_scope.py", "gate11_exec_scope.py"]);
+}
+
+#[test]
+fn gate11_cache_lifetime_and_dynamic_composition_match_cpython() {
+    assert_gate11_fixtures(&["gate11_cache_lifetime.py", "gate11_dynamic_composition.py"]);
+}
+
+#[test]
+fn gate11_adversarial_limits_and_final_artifact_audit_are_stable() {
+    let status = Command::new("cargo")
+        .current_dir(workspace())
+        .args(["build", "-p", "rimera-compiler", "--lib"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut build_request = request(
+        "gate11_adversarial_limits.py",
+        output("gate11-adversarial-limits"),
+    );
+    build_request.capabilities = CapabilitySet::from_names(["dynamic_compilation".to_owned()]);
+    build_request.heap_limit_bytes = Some(2_500_000);
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let actual = run(&artifact.executable);
+    assert!(
+        actual.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&actual.stdout),
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&actual.stdout),
+        concat!(
+            "source-limit RuntimeError dynamic source exceeds the 1048576 byte limit\n",
+            "source-recovery 42\n",
+            "depth-limit RuntimeError dynamic execution depth exceeds the 32 level limit\n",
+            "depth-recovery 42\n",
+            "syntax SyntaxError invalid syntax. Got unexpected token Newline at byte offset 2\n",
+            "syntax-state 42 True False\n",
+            "runtime ValueError stop\n",
+            "runtime-state 1 False\n",
+        )
+    );
+    assert!(actual.stderr.is_empty());
+    assert_native_only_artifact(&artifact.executable);
+
+    let static_artifact =
+        rimera_compiler::build(request("hello.py", output("gate11-static-final-audit"))).unwrap();
+    let symbols = artifact_symbols(&static_artifact.executable);
+    assert!(!symbols.contains("rimera_dynamic_compiler_install"));
+    assert!(!symbols.contains("compile_native"));
+    assert_native_only_artifact(&static_artifact.executable);
+}
+
+fn assert_gate11_fixtures(fixtures: &[&str]) {
+    let status = Command::new("cargo")
+        .current_dir(workspace())
+        .args(["build", "-p", "rimera-compiler", "--lib"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for fixture in fixtures {
+        let mut build_request = request(fixture, output(fixture));
+        build_request.capabilities = CapabilitySet::from_names(["dynamic_compilation".to_owned()]);
+        build_request.heap_limit_bytes = Some(262_144);
+        let expected = Command::new("/opt/homebrew/bin/python3.12")
+            .arg(&build_request.entry)
+            .output()
+            .unwrap();
+        assert!(
+            expected.status.success(),
+            "{fixture}: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let artifact = rimera_compiler::build(build_request).unwrap();
+        let actual = run(&artifact.executable);
+        assert!(
+            actual.status.success(),
+            "{fixture}: stdout={} stderr={}",
+            String::from_utf8_lossy(&actual.stdout),
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&actual.stdout),
+            String::from_utf8_lossy(&expected.stdout),
+            "{fixture}"
+        );
+        assert_native_only_artifact(&artifact.executable);
+    }
+}
+
+#[test]
+fn gate12_slice2_weak_references_callbacks_hash_equality_and_proxies_match_cpython() {
+    let entry = workspace().join("tests/fixtures/basic/gate12_weak_reference_core.py");
+    let expected = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .output()
+        .unwrap();
+    assert!(
+        expected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+
+    let mut build_request = request(
+        "gate12_weak_reference_core.py",
+        output("gate12-weak-reference-core"),
+    );
+    build_request.heap_limit_bytes = Some(262_144);
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let actual = run(&artifact.executable);
+    assert!(
+        actual.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&actual.stdout),
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(actual.stdout, expected.stdout);
+    assert!(actual.stderr.is_empty());
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate12_slice3_weak_containers_prune_and_iterate_without_strengthening_referents() {
+    let entry = workspace().join("tests/fixtures/basic/gate12_weak_containers.py");
+    let expected = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .output()
+        .unwrap();
+    assert!(
+        expected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+
+    let mut build_request = request(
+        "gate12_weak_containers.py",
+        output("gate12-weak-containers"),
+    );
+    build_request.heap_limit_bytes = Some(262_144);
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let actual = run(&artifact.executable);
+    assert!(
+        actual.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&actual.stdout),
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(actual.stdout, expected.stdout);
+    assert!(actual.stderr.is_empty());
+    assert_native_only_artifact(&artifact.executable);
+}
+
+#[test]
+fn gate12_slice4_del_order_unraisable_reporting_and_shutdown_match_cpython() {
+    let entry = workspace().join("tests/fixtures/basic/gate12_finalization.py");
+    let expected = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&entry)
+        .output()
+        .unwrap();
+    assert!(expected.status.success());
+
+    let mut build_request = request(
+        "gate12_finalization.py",
+        output("gate12-finalization"),
+    );
+    build_request.heap_limit_bytes = Some(262_144);
+    let artifact = rimera_compiler::build(build_request).unwrap();
+    let actual = run(&artifact.executable);
+    assert!(
+        actual.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&actual.stdout),
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(actual.stdout, expected.stdout);
+
+    let stderr = String::from_utf8_lossy(&actual.stderr);
+    assert_eq!(stderr.matches("Exception ignored in:").count(), 2);
+    assert!(stderr.contains("RuntimeError: finalizer boom"));
+    assert!(stderr.contains("ValueError: weak callback boom"));
+    assert_native_only_artifact(&artifact.executable);
+}
+
 fn ensure_runtime_archive() {
     static RUNTIME_ARCHIVE: OnceLock<()> = OnceLock::new();
     RUNTIME_ARCHIVE.get_or_init(|| {
@@ -858,7 +1045,7 @@ fn final_artifact_has_no_legacy_python_or_unwind_symbols() {
 #[test]
 fn unsupported_and_malformed_source_emit_no_artifact() {
     for (fixture, code) in [
-        ("unsupported.py", "RIM-CAP-001"),
+        ("unsupported.py", "RIM-CAP-G7-03"),
         ("malformed.py", "RIM-PARSE-001"),
     ] {
         let output = output(fixture);

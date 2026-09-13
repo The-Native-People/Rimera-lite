@@ -864,6 +864,7 @@ mod tests {
             .allocate(HeapObject::Code(CodeObject {
                 dynamic_mode: None,
                 flags_override: None,
+                native_unit_address: None,
                 code_address,
                 kind: FunctionKind::Coroutine {
                     persistent_slot_count: 1,

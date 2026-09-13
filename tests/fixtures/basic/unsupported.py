@@ -1,2 +1,1 @@
-def unavailable():
-    pass
+type Unavailable[T: int] = T

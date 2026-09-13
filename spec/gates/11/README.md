@@ -9,12 +9,12 @@ dynamic semantics path.
 
 - [x] Slice 1 — modes, code-object contract, capabilities, and oracle matrix
 - [x] Slice 2 — `compile` sources, flags, diagnostics, and code metadata
-- [ ] Slice 3 — `eval` globals/locals, builtins injection, and closure reads
-- [ ] Slice 4 — `exec` namespaces, writes, declarations, and class-body composition
-- [ ] Slice 5 — dynamic cache keys, linking/loading, lifetime, and reclamation
-- [ ] Slice 6 — nested dynamic code, modules, reflection, async, and exceptions
-- [ ] Slice 7 — adversarial inputs, resource limits, atomicity, and artifact proof
-- [ ] Slice 8 — final audit, documentation, and gate closure
+- [x] Slice 3 — `eval` globals/locals, builtins injection, and closure reads
+- [x] Slice 4 — `exec` namespaces, writes, declarations, and class-body composition
+- [x] Slice 5 — dynamic cache keys, linking/loading, lifetime, and reclamation
+- [x] Slice 6 — nested dynamic code, modules, reflection, async, and exceptions
+- [x] Slice 7 — adversarial inputs, resource limits, atomicity, and artifact proof
+- [x] Slice 8 — final audit, documentation, and gate closure
 
 ## Slice acceptance
 
@@ -36,4 +36,6 @@ dynamic semantics path.
 
 Static builds that do not grant dynamic compilation must omit this machinery.
 
-Slices 1–2 are closed. The active compatibility slice is Slice 3; later `eval`/`exec` conformance, cache/reclamation, composition, and adversarial closure remain unchecked.
+All eight slices are closed. Gate 11 is `Implemented — conformance audit
+pending` for its documented capability-enabled subset. Gate 12 Slices 1–3 are
+closed and Slice 4 is the active compatibility dependency.
