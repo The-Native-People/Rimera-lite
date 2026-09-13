@@ -512,7 +512,9 @@ pub enum OperationKind {
     Print {
         values: Vec<ValueId>,
     },
-    Display { value: ValueId },
+    Display {
+        value: ValueId,
+    },
     PrintLiteral {
         value: String,
     },

@@ -16,29 +16,58 @@ fn workspace() -> PathBuf {
 
 #[test]
 fn gate11_dynamic_namespaces_use_public_native_pipeline() {
-    let status = Command::new("cargo").current_dir(workspace())
-        .args(["build", "-p", "rimera-compiler", "--lib"]).status().unwrap();
+    let status = Command::new("cargo")
+        .current_dir(workspace())
+        .args(["build", "-p", "rimera-compiler", "--lib"])
+        .status()
+        .unwrap();
     assert!(status.success());
     let mut build_request = request("gate11_dynamic_namespaces.py", output("gate11-dynamic"));
     build_request.capabilities = CapabilitySet::from_names(["dynamic_compilation".to_owned()]);
-    let expected = Command::new("/opt/homebrew/bin/python3.12").arg(&build_request.entry).output().unwrap();
-    assert!(expected.status.success(), "{}", String::from_utf8_lossy(&expected.stderr));
+    let expected = Command::new("/opt/homebrew/bin/python3.12")
+        .arg(&build_request.entry)
+        .output()
+        .unwrap();
+    assert!(
+        expected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
     let artifact = rimera_compiler::build(build_request).unwrap();
     let actual = run(&artifact.executable);
-    assert!(actual.status.success(), "{}", String::from_utf8_lossy(&actual.stderr));
-    assert_eq!(String::from_utf8_lossy(&actual.stdout), String::from_utf8_lossy(&expected.stdout));
+    assert!(
+        actual.status.success(),
+        "{}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&actual.stdout),
+        String::from_utf8_lossy(&expected.stdout)
+    );
     assert_native_only_artifact(&artifact.executable);
-    let mut limited = request("gate11_dynamic_namespaces.py", output("gate11-dynamic-small-heap"));
+    let mut limited = request(
+        "gate11_dynamic_namespaces.py",
+        output("gate11-dynamic-small-heap"),
+    );
     limited.capabilities = CapabilitySet::from_names(["dynamic_compilation".to_owned()]);
     limited.heap_limit_bytes = Some(262_144);
     let limited = rimera_compiler::build(limited).unwrap();
     let actual = run(&limited.executable);
-    assert!(actual.status.success(), "{}", String::from_utf8_lossy(&actual.stderr));
+    assert!(
+        actual.status.success(),
+        "{}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
     assert_eq!(actual.stdout, expected.stdout);
     let denied = request("gate11_dynamic_namespaces.py", output("gate11-denied"));
     let denied_output = denied.output.clone();
     let errors = rimera_compiler::build(denied).unwrap_err();
-    assert!(errors.as_slice().iter().any(|error| error.code == "RIM-CAP-G7-02"));
+    assert!(
+        errors
+            .as_slice()
+            .iter()
+            .any(|error| error.code == "RIM-CAP-G7-02")
+    );
     assert!(!denied_output.exists());
 }
 
@@ -145,10 +174,14 @@ fn run(path: &Path) -> std::process::Output {
     Command::new(path).output().unwrap()
 }
 
-fn assert_native_only_artifact(path: &Path) {
+fn artifact_symbols(path: &Path) -> String {
     let symbols = Command::new("nm").arg(path).output().unwrap();
     assert!(symbols.status.success());
-    let symbols = String::from_utf8_lossy(&symbols.stdout);
+    String::from_utf8_lossy(&symbols.stdout).into_owned()
+}
+
+fn assert_native_only_artifact(path: &Path) {
+    let symbols = artifact_symbols(path);
     for forbidden in ["Py_", "PyObject", "setjmp", "longjmp", "rimera_compat"] {
         assert!(
             !symbols.contains(forbidden),

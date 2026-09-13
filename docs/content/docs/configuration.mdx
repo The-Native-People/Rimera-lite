@@ -17,6 +17,7 @@ run = false
 debug = false
 heap_limit_bytes = 1048576
 async = "auto"
+dynamic_compilation = false
 ```
 
 <Callout type="warn" title="Current target support">
@@ -68,6 +69,18 @@ async = "auto"
     even for synchronous source; unknown values are also errors.
   </Accordion>
 
+  <Accordion title="dynamic_compilation — opt in to runtime compilation">
+    `dynamic_compilation = true` grants Gate 11's native runtime-compilation
+    capability. The default is `false`; capability-free artifacts omit the
+    dynamic compiler service entirely. Use `--dynamic-compilation` for a one-off
+    opt-in. The flag can turn the capability on but cannot override a project
+    `true` back to false.
+
+    The currently qualified surface is the Gate 11 Slice 1–2 `compile()`
+    foundation. `eval`/`exec` remain under their later Gate 11 conformance
+    slices and are not yet advertised as generally supported.
+  </Accordion>
+
   <Accordion title="run — compile, then start the executable">
     Set `run = true` to start the executable immediately after a successful
     compile. If no output path was chosen, Rimera writes a temporary-style
@@ -112,8 +125,9 @@ rimera-lite --help
 ```
 
 `--output`, `--target`, `--profile`, `--heap-limit-bytes`, and `--async` replace
-their matching project setting for that command. `--run` and `--debug` turn those
-behaviours on for the command; they cannot turn a `true` project default off.
+their matching project setting for that command. `--run`, `--debug`, and
+`--dynamic-compilation` turn those behaviours/capabilities on for the command;
+they cannot turn a `true` project default off.
 
 ```bash
 # Keep the project defaults, but write this build somewhere else.
@@ -124,6 +138,9 @@ rimera-lite app.py --profile release --heap-limit-bytes 33554432 --output dist/a
 
 # Select the current concrete async backend explicitly.
 rimera-lite app.py --async compio --output dist/app
+
+# Opt in to the Gate 11 native compiler service for this artifact.
+rimera-lite app.py --dynamic-compilation --output dist/app
 
 # Compile and run once without choosing a permanent output path.
 rimera-lite app.py --run

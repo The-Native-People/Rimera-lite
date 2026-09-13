@@ -19,7 +19,10 @@ pub(crate) fn lower_dynamic(module: &hir::Module) -> Result<mir::Program, String
     lower_with_chunk_limit(module, usize::MAX)
 }
 
-fn lower_with_chunk_limit(module: &hir::Module, chunk_limit: usize) -> Result<mir::Program, String> {
+fn lower_with_chunk_limit(
+    module: &hir::Module,
+    chunk_limit: usize,
+) -> Result<mir::Program, String> {
     let mut program = ProgramLowerer {
         functions: Vec::new(),
     };
@@ -141,7 +144,9 @@ fn statement_contains_yield(statement: &hir::Statement) -> bool {
         | hir::StatementKind::ImportFrom { .. }
         | hir::StatementKind::Break
         | hir::StatementKind::Continue => false,
-        hir::StatementKind::Expression(value) | hir::StatementKind::Display(value) => expression_contains_yield(value),
+        hir::StatementKind::Expression(value) | hir::StatementKind::Display(value) => {
+            expression_contains_yield(value)
+        }
         hir::StatementKind::Raise { exception, cause } => {
             exception.as_ref().is_some_and(expression_contains_yield)
                 || cause.as_ref().is_some_and(expression_contains_yield)

@@ -60,11 +60,7 @@ pub struct DynamicCompilation {
     pub mir: mir::Program,
 }
 
-fn dynamic_error(
-    code: &'static str,
-    message: impl Into<String>,
-    path: &Path,
-) -> DiagnosticSet {
+fn dynamic_error(code: &'static str, message: impl Into<String>, path: &Path) -> DiagnosticSet {
     DiagnosticSet::one(Diagnostic::new(code, message, path, Span::default()))
 }
 
@@ -113,18 +109,25 @@ pub fn compile_source(
     validate_options(options, &path)?;
     let source = source_text(source, &path)?;
     if source.contains('\0') {
-        return Err(dynamic_error("RIM-DYN-SOURCE-002", "source code string cannot contain null bytes", &path));
+        return Err(dynamic_error(
+            "RIM-DYN-SOURCE-002",
+            "source code string cannot contain null bytes",
+            &path,
+        ));
     }
     let mut syntax = syntax::parse_mode(&path, source, options.mode)?;
     optimize_suite(&mut syntax.statements, options.optimize, true);
     let mut hir = sema::analyze_with_dynamic_compilation(&path, &syntax, true)?;
-    if options.mode == RDynamicCompileMode::Single { mark_display(&mut hir.statements); }
-    if options.mode == RDynamicCompileMode::Eval {
-        if let Some(hir::Statement { kind, .. }) = hir.statements.last_mut() {
-            if let hir::StatementKind::Expression(value) = kind {
-                *kind = hir::StatementKind::Return { value: Some(value.clone()) };
-            }
-        }
+    if options.mode == RDynamicCompileMode::Single {
+        mark_display(&mut hir.statements);
+    }
+    if options.mode == RDynamicCompileMode::Eval
+        && let Some(hir::Statement { kind, .. }) = hir.statements.last_mut()
+        && let hir::StatementKind::Expression(value) = kind
+    {
+        *kind = hir::StatementKind::Return {
+            value: Some(value.clone()),
+        };
     }
     let mut mir = lower::lower_dynamic(&hir)
         .map_err(|error| dynamic_error("RIM-DYN-MIR-001", error, &path))?;
@@ -135,20 +138,39 @@ pub fn compile_source(
     let namespace = mir::ValueId(entry.value_count);
     entry.value_count += 1;
     entry.parameters.push(mir::Parameter {
-        value: namespace, name: "<namespace>".to_owned(),
-        kind: rimera_abi::RParameterKind::PositionalOnly, has_default: false,
+        value: namespace,
+        name: "<namespace>".to_owned(),
+        kind: rimera_abi::RParameterKind::PositionalOnly,
+        has_default: false,
     });
     for block in &mut entry.blocks {
         for operation in &mut block.operations {
             operation.kind = match &operation.kind {
-                mir::OperationKind::AnnotationsEnsure { namespace: None } =>
-                    mir::OperationKind::AnnotationsEnsure { namespace: Some(namespace) },
-                mir::OperationKind::GlobalGet { dest, name } if !globals.contains(name) =>
-                    mir::OperationKind::ClassNameGet { dest: *dest, namespace, name: name.clone() },
-                mir::OperationKind::GlobalSet { name, value } if !globals.contains(name) =>
-                    mir::OperationKind::ClassNamespaceSet { namespace, name: name.clone(), value: *value },
-                mir::OperationKind::GlobalDelete { name } if !globals.contains(name) =>
-                    mir::OperationKind::ClassNamespaceDelete { namespace, name: name.clone() },
+                mir::OperationKind::AnnotationsEnsure { namespace: None } => {
+                    mir::OperationKind::AnnotationsEnsure {
+                        namespace: Some(namespace),
+                    }
+                }
+                mir::OperationKind::GlobalGet { dest, name } if !globals.contains(name) => {
+                    mir::OperationKind::ClassNameGet {
+                        dest: *dest,
+                        namespace,
+                        name: name.clone(),
+                    }
+                }
+                mir::OperationKind::GlobalSet { name, value } if !globals.contains(name) => {
+                    mir::OperationKind::ClassNamespaceSet {
+                        namespace,
+                        name: name.clone(),
+                        value: *value,
+                    }
+                }
+                mir::OperationKind::GlobalDelete { name } if !globals.contains(name) => {
+                    mir::OperationKind::ClassNamespaceDelete {
+                        namespace,
+                        name: name.clone(),
+                    }
+                }
                 other => other.clone(),
             };
         }
@@ -159,16 +181,19 @@ pub fn compile_source(
     for function in &mut mir.functions {
         for block in &mut function.blocks {
             for operation in &mut block.operations {
-                if let mir::OperationKind::GlobalGet { dest, name } | mir::OperationKind::ClassNameGet { dest, name, .. } = &operation.kind {
-                    if name == "__debug__" {
-                        operation.kind = mir::OperationKind::Constant { dest: *dest, value: mir::Constant::Bool(options.optimize <= 0) };
-                    }
+                if let mir::OperationKind::GlobalGet { dest, name }
+                | mir::OperationKind::ClassNameGet { dest, name, .. } = &operation.kind
+                    && name == "__debug__"
+                {
+                    operation.kind = mir::OperationKind::Constant {
+                        dest: *dest,
+                        value: mir::Constant::Bool(options.optimize <= 0),
+                    };
                 }
             }
         }
     }
-    mir::verify(&mir)
-        .map_err(|error| dynamic_error("RIM-DYN-MIR-002", error, &path))?;
+    mir::verify(&mir).map_err(|error| dynamic_error("RIM-DYN-MIR-002", error, &path))?;
     let metadata = DynamicCodeMetadata {
         mode: options.mode,
         filename: options.filename.clone(),
@@ -187,14 +212,40 @@ fn mark_display(statements: &mut [hir::Statement]) {
     for statement in statements {
         match &mut statement.kind {
             S::Expression(value) => statement.kind = S::Display(value.clone()),
-            S::If { then_body, else_body, .. } => { mark_display(then_body); mark_display(else_body); }
-            S::While { body, .. } | S::With { body, .. } => mark_display(body),
-            S::For { body, else_body, .. } => { mark_display(body); mark_display(else_body); }
-            S::Try { body, handlers, else_body, finally_body, .. } => {
-                mark_display(body); mark_display(else_body); mark_display(finally_body);
-                for handler in handlers { mark_display(&mut handler.body); }
+            S::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                mark_display(then_body);
+                mark_display(else_body);
             }
-            S::Match { cases, .. } => for case in cases { mark_display(&mut case.body); },
+            S::While { body, .. } | S::With { body, .. } => mark_display(body),
+            S::For {
+                body, else_body, ..
+            } => {
+                mark_display(body);
+                mark_display(else_body);
+            }
+            S::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+                ..
+            } => {
+                mark_display(body);
+                mark_display(else_body);
+                mark_display(finally_body);
+                for handler in handlers {
+                    mark_display(&mut handler.body);
+                }
+            }
+            S::Match { cases, .. } => {
+                for case in cases {
+                    mark_display(&mut case.body);
+                }
+            }
             _ => {}
         }
     }
@@ -202,45 +253,109 @@ fn mark_display(statements: &mut [hir::Statement]) {
 
 fn optimize_suite(statements: &mut Vec<syntax::Statement>, optimize: i8, docstring: bool) {
     use syntax::StatementKind as S;
-    if optimize == 2 && docstring && statements.first().is_some_and(|statement|
-        matches!(&statement.kind, S::Expression(syntax::Expression { kind: syntax::ExpressionKind::String(_), .. }))) {
+    if optimize == 2
+        && docstring
+        && statements.first().is_some_and(|statement| {
+            matches!(
+                &statement.kind,
+                S::Expression(syntax::Expression {
+                    kind: syntax::ExpressionKind::String(_),
+                    ..
+                })
+            )
+        })
+    {
         statements.remove(0);
     }
-    if optimize > 0 { statements.retain(|statement| !matches!(statement.kind, S::Assert { .. })); }
+    if optimize > 0 {
+        statements.retain(|statement| !matches!(statement.kind, S::Assert { .. }));
+    }
     for statement in statements {
         match &mut statement.kind {
-            S::FunctionDef { body, .. } | S::ClassDef { body, .. } => optimize_suite(body, optimize, true),
-            S::If { then_body, else_body, .. } => { optimize_suite(then_body, optimize, false); optimize_suite(else_body, optimize, false); }
-            S::While { body, .. } | S::With { body, .. } => optimize_suite(body, optimize, false),
-            S::For { body, else_body, .. } => { optimize_suite(body, optimize, false); optimize_suite(else_body, optimize, false); }
-            S::Try { body, handlers, else_body, finally_body, .. } => {
-                optimize_suite(body, optimize, false); optimize_suite(else_body, optimize, false); optimize_suite(finally_body, optimize, false);
-                for handler in handlers { optimize_suite(&mut handler.body, optimize, false); }
+            S::FunctionDef { body, .. } | S::ClassDef { body, .. } => {
+                optimize_suite(body, optimize, true)
             }
-            S::Match { cases, .. } => for case in cases { optimize_suite(&mut case.body, optimize, false); },
+            S::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                optimize_suite(then_body, optimize, false);
+                optimize_suite(else_body, optimize, false);
+            }
+            S::While { body, .. } | S::With { body, .. } => optimize_suite(body, optimize, false),
+            S::For {
+                body, else_body, ..
+            } => {
+                optimize_suite(body, optimize, false);
+                optimize_suite(else_body, optimize, false);
+            }
+            S::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+                ..
+            } => {
+                optimize_suite(body, optimize, false);
+                optimize_suite(else_body, optimize, false);
+                optimize_suite(finally_body, optimize, false);
+                for handler in handlers {
+                    optimize_suite(&mut handler.body, optimize, false);
+                }
+            }
+            S::Match { cases, .. } => {
+                for case in cases {
+                    optimize_suite(&mut case.body, optimize, false);
+                }
+            }
             _ => {}
         }
     }
 }
 
-fn collect_globals(statements: &[syntax::Statement], names: &mut std::collections::BTreeSet<String>) {
+fn collect_globals(
+    statements: &[syntax::Statement],
+    names: &mut std::collections::BTreeSet<String>,
+) {
     use syntax::StatementKind as S;
     for statement in statements {
         match &statement.kind {
             S::Global(items) => names.extend(items.iter().cloned()),
-            S::If { then_body, else_body, .. } => {
-                collect_globals(then_body, names); collect_globals(else_body, names);
+            S::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_globals(then_body, names);
+                collect_globals(else_body, names);
             }
-            S::For { body, else_body, .. } => {
-                collect_globals(body, names); collect_globals(else_body, names);
+            S::For {
+                body, else_body, ..
+            } => {
+                collect_globals(body, names);
+                collect_globals(else_body, names);
             }
             S::While { body, .. } | S::With { body, .. } => collect_globals(body, names),
-            S::Try { body, handlers, else_body, finally_body, .. } => {
-                collect_globals(body, names); collect_globals(else_body, names);
+            S::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+                ..
+            } => {
+                collect_globals(body, names);
+                collect_globals(else_body, names);
                 collect_globals(finally_body, names);
-                for handler in handlers { collect_globals(&handler.body, names); }
+                for handler in handlers {
+                    collect_globals(&handler.body, names);
+                }
             }
-            S::Match { cases, .. } => for case in cases { collect_globals(&case.body, names); },
+            S::Match { cases, .. } => {
+                for case in cases {
+                    collect_globals(&case.body, names);
+                }
+            }
             _ => {}
         }
     }
@@ -249,7 +364,9 @@ fn collect_globals(statements: &[syntax::Statement], names: &mut std::collection
 struct NativeOwner(Option<cranelift_jit::JITModule>);
 
 impl std::fmt::Debug for NativeOwner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("NativeOwner") }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeOwner")
+    }
 }
 
 impl Drop for NativeOwner {
@@ -261,24 +378,51 @@ impl Drop for NativeOwner {
     }
 }
 
-fn compile_native(source: &str, filename: &str, mode: RDynamicCompileMode, flags: u32,
-    optimize: i32) -> Result<rimera_runtime::NativeDynamicCode, rimera_runtime::DynamicCompileError> {
+fn compile_native(
+    source: &str,
+    filename: &str,
+    mode: RDynamicCompileMode,
+    flags: u32,
+    optimize: i32,
+) -> Result<rimera_runtime::NativeDynamicCode, rimera_runtime::DynamicCompileError> {
     use rimera_runtime::DynamicCompileError;
-    let options = DynamicCompileOptions { filename: filename.to_owned(), mode, flags,
-        dont_inherit: true, optimize: i8::try_from(optimize).unwrap_or(127) };
+    let options = DynamicCompileOptions {
+        filename: filename.to_owned(),
+        mode,
+        flags,
+        dont_inherit: true,
+        optimize: i8::try_from(optimize).unwrap_or(127),
+    };
     let unit = compile_source(DynamicSource::Text(source), &options).map_err(|errors| {
         let error = &errors.as_slice()[0];
         DynamicCompileError {
-            exception_type: if error.code.starts_with("RIM-DYN-FLAG") || error.code.starts_with("RIM-DYN-OPT") { "ValueError" } else { "SyntaxError" },
-            message: error.message.clone(), offset: error.span.start as usize,
+            exception_type: if error.code.starts_with("RIM-DYN-FLAG")
+                || error.code.starts_with("RIM-DYN-OPT")
+            {
+                "ValueError"
+            } else {
+                "SyntaxError"
+            },
+            message: error.message.clone(),
+            offset: error.span.start as usize,
         }
     })?;
-    let (module, address) = crate::codegen::emit_jit(&crate::lir::select(&unit.mir),
-        &crate::runtime_symbols::symbols()).map_err(|message| DynamicCompileError {
-            exception_type: "RuntimeError", message, offset: 0,
-        })?;
-    Ok(rimera_runtime::NativeDynamicCode { address: address as usize, mode,
-        filename: filename.to_owned(), flags: 0, owner: Box::new(NativeOwner(Some(module))) })
+    let (module, address) = crate::codegen::emit_jit(
+        &crate::lir::select(&unit.mir),
+        &crate::runtime_symbols::symbols(),
+    )
+    .map_err(|message| DynamicCompileError {
+        exception_type: "RuntimeError",
+        message,
+        offset: 0,
+    })?;
+    Ok(rimera_runtime::NativeDynamicCode {
+        address: address as usize,
+        mode,
+        filename: filename.to_owned(),
+        flags: 0,
+        owner: Box::new(NativeOwner(Some(module))),
+    })
 }
 
 /// Installs the native compiler only in an artifact linked with this service.
@@ -286,7 +430,9 @@ fn compile_native(source: &str, filename: &str, mode: RDynamicCompileMode, flags
 /// # Safety
 /// `context` must point to a live, exclusively borrowed runtime context.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rimera_dynamic_compiler_install(context: *mut rimera_runtime::RimeraContext) -> rimera_abi::RStatus {
+pub unsafe extern "C" fn rimera_dynamic_compiler_install(
+    context: *mut rimera_runtime::RimeraContext,
+) -> rimera_abi::RStatus {
     if let Some(context) = unsafe { context.as_mut() } {
         context.install_dynamic_compiler(compile_native);
         rimera_abi::RStatus::Ok
@@ -326,16 +472,20 @@ mod tests {
 
     #[test]
     fn mode_grammar_matches_cpython_shape() {
-        assert!(compile_source(
-            DynamicSource::Text("value = 1"),
-            &DynamicCompileOptions::cpython_default("<eval>", RDynamicCompileMode::Eval),
-        )
-        .is_err());
-        assert!(compile_source(
-            DynamicSource::Text("first = 1\nsecond = 2"),
-            &DynamicCompileOptions::cpython_default("<single>", RDynamicCompileMode::Single),
-        )
-        .is_err());
+        assert!(
+            compile_source(
+                DynamicSource::Text("value = 1"),
+                &DynamicCompileOptions::cpython_default("<eval>", RDynamicCompileMode::Eval),
+            )
+            .is_err()
+        );
+        assert!(
+            compile_source(
+                DynamicSource::Text("first = 1\nsecond = 2"),
+                &DynamicCompileOptions::cpython_default("<single>", RDynamicCompileMode::Single),
+            )
+            .is_err()
+        );
         compile("1 + 2", RDynamicCompileMode::Exec);
     }
 
@@ -371,13 +521,49 @@ mod tests {
         options.flags = 1;
         let diagnostics = compile_source(DynamicSource::Text("pass"), &options).unwrap_err();
         assert_eq!(diagnostics.as_slice()[0].code, "RIM-DYN-FLAG-001");
-        assert_eq!(diagnostics.as_slice()[0].message, "compile(): unrecognised flags");
+        assert_eq!(
+            diagnostics.as_slice()[0].message,
+            "compile(): unrecognised flags"
+        );
 
         options.flags = 0;
         options.optimize = 3;
         let diagnostics = compile_source(DynamicSource::Text("pass"), &options).unwrap_err();
         assert_eq!(diagnostics.as_slice()[0].code, "RIM-DYN-OPT-001");
-        assert_eq!(diagnostics.as_slice()[0].message, "compile(): invalid optimize value");
+        assert_eq!(
+            diagnostics.as_slice()[0].message,
+            "compile(): invalid optimize value"
+        );
+    }
+
+    #[test]
+    fn optimize_levels_transform_asserts_docstrings_and_debug_constant() {
+        let mut module = syntax::parse_mode(
+            Path::new("<optimize>"),
+            "\"doc\"\nassert True\nvalue = __debug__",
+            RDynamicCompileMode::Exec,
+        )
+        .unwrap();
+        optimize_suite(&mut module.statements, 2, true);
+        assert_eq!(
+            module.statements.len(),
+            1,
+            "optimize=2 should strip module docstring and assert"
+        );
+
+        for (level, expected) in [(0, true), (1, false), (2, false)] {
+            let mut options = DynamicCompileOptions::cpython_default(
+                format!("<optimize-{level}>"),
+                RDynamicCompileMode::Eval,
+            );
+            options.optimize = level;
+            let unit = compile_source(DynamicSource::Text("__debug__"), &options).unwrap();
+            let rendered = mir::render_python(&unit.mir);
+            assert!(
+                rendered.contains(if expected { "true" } else { "false" }),
+                "optimize={level} did not lower __debug__ to the expected constant: {rendered}"
+            );
+        }
     }
 
     #[test]

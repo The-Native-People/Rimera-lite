@@ -78,3 +78,25 @@ namespace['counter'] = 0
 for index in range(30):
     exec(code, namespace)
 print(namespace['counter'])
+print(eval(compile(bytearray(b'19 + 23'), 'bytearray-source.py', 'eval'), {}))
+print(eval(compile(memoryview(b'18 + 24'), 'memoryview-source.py', 'eval'), {}))
+print(compile('1', b'bytes-filename.py', 'eval').co_filename)
+try:
+    compile('1', bytearray(b'bad-filename.py'), 'eval')
+except TypeError:
+    print('filename validated')
+print(eval(compile('40 + 2', 'inherit.py', 'eval', 0, []), {}))
+try:
+    code.co_filename = 'changed.py'
+except AttributeError:
+    print('code metadata readonly')
+try:
+    compile('value =\n', 'offset.py', 'exec')
+except SyntaxError as error:
+    print(error.offset)
+try:
+    compile('1', 'flags.py', 'eval', 1)
+except ValueError as error:
+    print(type(error).__name__, str(error))
+print(eval(compile('__debug__', 'opt0.py', 'eval', optimize=0), {}))
+print(eval(compile('__debug__', 'opt1.py', 'eval', optimize=1), {}))

@@ -9,7 +9,9 @@ use std::time::Instant;
 use clap::{Parser, Subcommand, ValueEnum};
 use rimera_compiler::BuildProgress;
 use rimera_compiler::core::{BuildProfile, Diagnostic, DiagnosticSet, TargetTriple};
-use rimera_compiler::project::{AsyncBackend, BuildRequest, CapabilitySet};
+use rimera_compiler::project::{
+    AsyncBackend, BuildRequest, CAPABILITY_DYNAMIC_COMPILATION, CapabilitySet,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -158,6 +160,8 @@ fn execute(cli: Cli, color: bool) -> Result<ExitCode, CliFailure> {
             };
             let debug = debug || config.debug.unwrap_or(false);
             let run = run || config.run.unwrap_or(false);
+            let dynamic_compilation =
+                dynamic_compilation || config.dynamic_compilation.unwrap_or(false);
             let async_backend = resolve_async_backend(async_backend, config.async_backend);
             let output = output
                 .or(config.output.map(|path| if path.is_absolute() { path } else { project_root.join(path) }))
@@ -174,7 +178,9 @@ fn execute(cli: Cli, color: bool) -> Result<ExitCode, CliFailure> {
                     output,
                     target,
                     profile,
-                    capabilities: CapabilitySet::from_names(dynamic_compilation.then(|| "dynamic_compilation".to_owned())),
+                    capabilities: CapabilitySet::from_names(
+                        dynamic_compilation.then(|| CAPABILITY_DYNAMIC_COMPILATION.to_owned()),
+                    ),
                     debug,
                     heap_limit_bytes: heap_limit_bytes.or(config.heap_limit_bytes),
                     async_backend,
@@ -250,6 +256,7 @@ struct RimeraConfig {
     debug: Option<bool>,
     heap_limit_bytes: Option<u64>,
     async_backend: Option<AsyncBackendOption>,
+    dynamic_compilation: Option<bool>,
     run: Option<bool>,
     module_roots: Vec<PathBuf>,
 }
@@ -301,6 +308,9 @@ fn load_config(project_root: &Path) -> Result<RimeraConfig, CliFailure> {
             ))),
         })
         .transpose()?;
+    let dynamic_compilation = rimera
+        .get("dynamic_compilation")
+        .and_then(toml::Value::as_bool);
     let heap_limit_bytes = rimera
         .get("heap_limit_bytes")
         .and_then(toml::Value::as_integer)
@@ -337,6 +347,7 @@ fn load_config(project_root: &Path) -> Result<RimeraConfig, CliFailure> {
         debug,
         heap_limit_bytes,
         async_backend,
+        dynamic_compilation,
         run,
         module_roots,
     })
@@ -898,6 +909,24 @@ mod tests {
     }
 
     #[test]
+    fn build_command_accepts_dynamic_compilation_capability() {
+        let cli = Cli::try_parse_from([
+            "rimera",
+            "build",
+            "main.py",
+            "--output",
+            "app",
+            "--dynamic-compilation",
+        ])
+        .unwrap();
+        let Command::Build {
+            dynamic_compilation,
+            ..
+        } = cli.command;
+        assert!(dynamic_compilation);
+    }
+
+    #[test]
     fn async_backend_cli_overrides_project_configuration() {
         assert_eq!(
             resolve_async_backend(
@@ -957,7 +986,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("pyproject.toml"),
-            "[tool.rimera]\noutput = \"dist/app\"\nprofile = \"release\"\ndebug = true\nasync = \"compio\"\nheap_limit_bytes = 4096\nrun = true\nmodule_roots = [\"src\", \"vendor\"]\n",
+            "[tool.rimera]\noutput = \"dist/app\"\nprofile = \"release\"\ndebug = true\nasync = \"compio\"\ndynamic_compilation = true\nheap_limit_bytes = 4096\nrun = true\nmodule_roots = [\"src\", \"vendor\"]\n",
         )
         .unwrap();
         let config = load_config(&root).unwrap();
@@ -965,6 +994,7 @@ mod tests {
         assert_eq!(config.profile, Some(Profile::Release));
         assert_eq!(config.debug, Some(true));
         assert_eq!(config.async_backend, Some(AsyncBackendOption::Compio));
+        assert_eq!(config.dynamic_compilation, Some(true));
         assert_eq!(config.heap_limit_bytes, Some(4096));
         assert_eq!(config.run, Some(true));
         assert_eq!(

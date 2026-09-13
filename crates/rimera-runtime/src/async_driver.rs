@@ -882,16 +882,14 @@ mod tests {
         let function = context
             .allocate(HeapObject::Function(FunctionObject {
                 code,
-                fast_call: FastCallMetadata {
-                    positional_arity: Some(0),
-                    kind: FunctionKind::Coroutine {
+                fast_call: FastCallMetadata::new(
+                    code_address,
+                    1,
+                    Some(0),
+                    FunctionKind::Coroutine {
                         persistent_slot_count: 1,
                     },
-                    code_address,
-                    first_line: 1,
-                    ready_coroutine_code_address: None,
-                    ready_coroutine_repeat_pure: false,
-                },
+                ),
                 globals,
                 name: "root".to_owned(),
                 qualified_name: "root".to_owned(),

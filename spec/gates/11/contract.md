@@ -1,6 +1,6 @@
 # Gate 11 dynamic compilation contract
 
-Work in progress; no completion status is implied by this design.
+Slices 1–2 are frozen and complete; Gate 11 remains open with Slice 3 active.
 
 The compiler service is linked only into artifacts granted the
 `dynamic_compilation` capability. Its registered Rust ABI callback compiles
@@ -24,7 +24,11 @@ exception state, and function metadata extend the existing runtime models.
 
 Slices 1–4 require public source differentials, capability-denial/no-artifact
 proof, immutable code metadata, namespace/closure semantics and lifetime proof.
-This file will record accepted arguments and limits once the implementation is
-verified. Slice 5 retains responsibility for cache policy and reclamation;
+The frozen Slice 1–2 argument surface is: modes `exec`/`eval`/`single`; source
+`str` plus UTF-8 bytes/bytearray/memoryview at the Python boundary; filename
+`str` plus valid-UTF-8 `bytes`; `flags=0`; arbitrary `dont_inherit` by truthiness;
+and `optimize=-1/0/1/2`. AST source, nonzero `PyCF_*` feature masks, and
+surrogate-preserving non-UTF-8 byte filenames remain deferred rather than
+silently approximated. Slice 5 retains responsibility for cache policy and reclamation;
 Slice 6 owns extended dynamic/async composition and Slice 7 the adversarial
 resource-limit corpus.

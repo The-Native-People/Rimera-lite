@@ -147,8 +147,8 @@
   boundary. Every comparable accepted p50 speed/throughput row beats CPython
   3.12.11; materialized lifecycle diagnostics remain distinct from AOT-elided
   same-source workload results. The sole active compatibility slice is
-  **Gate 11 Slice 1**, covering modes, code-object contracts, capabilities, and
-  the dynamic-compilation oracle matrix. Execute Gates 11–17 in
+  **Gate 11 Slice 3**, covering `eval` globals/locals, builtins injection, and
+  closure reads after Slices 1–2 closed the dynamic compiler foundation. Execute Gates 11–17 in
   numeric order for dynamic compilation, lifecycle semantics, language
   conformance, stdlib, extension/platform ABI, ecosystem proof, and final
   drop-in release qualification. Do not jump to frameworks, modules, or

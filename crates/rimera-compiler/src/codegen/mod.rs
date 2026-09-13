@@ -162,9 +162,20 @@ fn emit_object_with_modules(
     let builder = ObjectBuilder::new(isa, "rimera", cranelift_module::default_libcall_names())
         .map_err(|error| error.to_string())?;
     let mut module = ObjectModule::new(builder);
-    populate_module(&mut module, program, heap_limit_bytes, module_initializers,
-        linked_async_backend, dynamic_compilation, module_export)?;
-    Ok(module.finish().emit().map_err(|error| error.to_string())?.to_vec())
+    populate_module(
+        &mut module,
+        program,
+        heap_limit_bytes,
+        module_initializers,
+        linked_async_backend,
+        dynamic_compilation,
+        module_export,
+    )?;
+    Ok(module
+        .finish()
+        .emit()
+        .map_err(|error| error.to_string())?
+        .to_vec())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -325,9 +336,19 @@ pub(crate) fn emit_jit(
         builder.symbol(*name, *address);
     }
     let mut module = cranelift_jit::JITModule::new(builder);
-    let entry = populate_module(&mut module, program, None, &BTreeMap::new(), None,
-        false, Some("rimera_dynamic_entry"))?.expect("dynamic entry is exported");
-    module.finalize_definitions().map_err(|error| error.to_string())?;
+    let entry = populate_module(
+        &mut module,
+        program,
+        None,
+        &BTreeMap::new(),
+        None,
+        false,
+        Some("rimera_dynamic_entry"),
+    )?
+    .expect("dynamic entry is exported");
+    module
+        .finalize_definitions()
+        .map_err(|error| error.to_string())?;
     let pointer = module.get_finalized_function(entry);
     Ok((module, pointer))
 }
@@ -1656,14 +1677,7 @@ impl Imports {
             );
         }
         let dynamic_compilation_enable = dynamic_compilation
-            .then(|| {
-                raw_declaration(
-                    module,
-                    "rimera_dynamic_compiler_install",
-                    &[pointer],
-                    true,
-                )
-            })
+            .then(|| raw_declaration(module, "rimera_dynamic_compiler_install", &[pointer], true))
             .transpose()?;
         let async_backend_select = linked_async_backend
             .map(|backend| match backend {

@@ -34,7 +34,8 @@ pub fn analyze_with_dynamic_compilation(
     allow_dynamic_compilation: bool,
 ) -> Result<hir::Module, DiagnosticSet> {
     let raw = RawScope::module(&module.statements);
-    let builtin_print_stable = !allow_dynamic_compilation && !raw.mutates_global_name("print", true);
+    let builtin_print_stable =
+        !allow_dynamic_compilation && !raw.mutates_global_name("print", true);
     let dynamic_builtin_stable =
         ["eval", "exec", "compile"].map(|name| !raw.mutates_global_name(name, true));
     let plan = resolve_scope(path, raw, &[])?;

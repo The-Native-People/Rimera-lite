@@ -124,7 +124,10 @@ pub(crate) fn invoke_ready_coroutine_rooted(
     let metadata = function.fast_call;
     let globals = function.globals;
     if metadata.positional_arity() != Some(positional.len())
-        || !matches!(metadata.kind(), crate::object::FunctionKind::Coroutine { .. })
+        || !matches!(
+            metadata.kind(),
+            crate::object::FunctionKind::Coroutine { .. }
+        )
         || (pure_only && !metadata.ready_coroutine_repeat_pure)
     {
         return Ok(None);
@@ -404,8 +407,12 @@ pub(crate) fn invoke(
                 invoke_read_binary_resource(context, positional, keywords)
             }
             BuiltinFunctionKind::Compile => crate::dynamic::compile(context, positional, keywords),
-            BuiltinFunctionKind::Eval => crate::dynamic::execute(context, positional, keywords, true),
-            BuiltinFunctionKind::Exec => crate::dynamic::execute(context, positional, keywords, false),
+            BuiltinFunctionKind::Eval => {
+                crate::dynamic::execute(context, positional, keywords, true)
+            }
+            BuiltinFunctionKind::Exec => {
+                crate::dynamic::execute(context, positional, keywords, false)
+            }
             BuiltinFunctionKind::FloatConjugate => {
                 invoke_float_conjugate(context, positional, keywords)
             }
@@ -1178,10 +1185,9 @@ pub(crate) fn generator_delegate_resume(
                     }
                     return Ok((RValue::NONE, RGeneratorDelegateOutcome::Propagate));
                 };
-                let close_result = context.with_temporary_roots(
-                    &[iterator, method],
-                    |context| invoke(context, method, &[], &[]),
-                );
+                let close_result = context.with_temporary_roots(&[iterator, method], |context| {
+                    invoke(context, method, &[], &[])
+                });
                 match close_result {
                     Ok(_) => {
                         if let Some(injected) = injected {
@@ -1199,11 +1205,7 @@ pub(crate) fn generator_delegate_resume(
             Ok(value) => Ok((value, RGeneratorDelegateOutcome::Yielded)),
             Err(error) => {
                 let stop_value = if matches!(operation, RGeneratorOperation::Send) {
-                    take_stop_iteration_value_preserving(
-                        context,
-                        ambient_raised,
-                        ambient_exception,
-                    )
+                    take_stop_iteration_value_preserving(context, ambient_raised, ambient_exception)
                 } else {
                     take_stop_iteration_value(context)
                 };

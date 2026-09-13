@@ -20,6 +20,7 @@ heap_limit_bytes = 1048576
 run = false
 target = "aarch64-apple-darwin"
 async = "auto"             # `auto`, `compio`, `monoio`, or `tokio`
+dynamic_compilation = false # opt in to Gate 11 runtime compilation
 module_roots = ["."]        # ordered import roots, relative to the project root
 ```
 
@@ -35,6 +36,12 @@ and `tokio` are recognized future selections and currently fail before artifact
 publication with `RIM-ASYNC-001`. Command-line `--async` overrides the project
 setting. Synchronous source neither links nor advertises an async backend even if
 `compio` is selected explicitly.
+
+`dynamic_compilation` is `false` by default. Setting it to `true`, or passing
+`--dynamic-compilation`, grants the Gate 11 runtime-compilation capability and
+links the native compiler service. Capability-free artifacts omit the service.
+The CLI flag can enable the capability for one build; like `--run`/`--debug`, it
+does not provide a negative override for a project setting that is already true.
 
 `module_roots` is an ordered array of path strings used for project-module
 discovery. Relative entries are resolved from the project root. The default is
@@ -53,6 +60,7 @@ RIMERA_COLOR=always rimera-lite build main.py -o dist/app
 RIMERA_CACHE_DIR="$PWD/.rimera" rimera-lite build main.py -o dist/app
 RIMERA_RUNTIME_ARCHIVE=/opt/rimera/librimera_runtime.a rimera-lite build main.py -o dist/app
 rimera-lite main.py --async compio -o dist/app
+rimera-lite main.py --dynamic-compilation -o dist/app
 ```
 
 The cache is disposable. It contains compiler intermediates only and must not

@@ -7,8 +7,8 @@ dynamic semantics path.
 
 ## Progress ledger
 
-- [ ] Slice 1 — modes, code-object contract, capabilities, and oracle matrix
-- [ ] Slice 2 — `compile` sources, flags, diagnostics, and code metadata
+- [x] Slice 1 — modes, code-object contract, capabilities, and oracle matrix
+- [x] Slice 2 — `compile` sources, flags, diagnostics, and code metadata
 - [ ] Slice 3 — `eval` globals/locals, builtins injection, and closure reads
 - [ ] Slice 4 — `exec` namespaces, writes, declarations, and class-body composition
 - [ ] Slice 5 — dynamic cache keys, linking/loading, lifetime, and reclamation
@@ -35,3 +35,5 @@ dynamic semantics path.
 8. Run the complete dynamic corpus and scan for forbidden interpreter paths.
 
 Static builds that do not grant dynamic compilation must omit this machinery.
+
+Slices 1–2 are closed. The active compatibility slice is Slice 3; later `eval`/`exec` conformance, cache/reclamation, composition, and adversarial closure remain unchecked.

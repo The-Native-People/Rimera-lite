@@ -9,9 +9,9 @@ pub mod manifest;
 pub mod mir;
 pub mod project;
 pub mod resolve;
+mod runtime_symbols;
 pub mod sema;
 pub mod syntax;
-mod runtime_symbols;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -174,11 +174,8 @@ pub fn build_with_progress(
         ),
     );
     let allow_dynamic_compilation = request.capabilities.dynamic_compilation();
-    let hir = sema::analyze_with_dynamic_compilation(
-        &request.entry,
-        &syntax,
-        allow_dynamic_compilation,
-    )?;
+    let hir =
+        sema::analyze_with_dynamic_compilation(&request.entry, &syntax, allow_dynamic_compilation)?;
     let mut module_hir = BTreeMap::new();
     for (name, source) in &resolved.sources {
         if name.as_str() == "__main__" {
@@ -459,7 +456,10 @@ fn build_project_mir_with_progress(
 
     let runtime = if request.capabilities.dynamic_compilation() {
         compiler_archive(request.profile)
-    } else { runtime_archive(request.profile) }.ok_or_else(|| {
+    } else {
+        runtime_archive(request.profile)
+    }
+    .ok_or_else(|| {
         error(
             "RIM-LINK-001",
             "Rust runtime archive is missing; build the Rimera workspace first",
@@ -516,11 +516,18 @@ fn build_project_mir_with_progress(
 }
 
 fn compiler_archive(profile: core::BuildProfile) -> Option<PathBuf> {
-    let path = std::env::var_os("RIMERA_COMPILER_ARCHIVE").map(PathBuf::from).unwrap_or_else(|| {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
-            .join(if profile == core::BuildProfile::Release { "release" } else { "debug" })
-            .join("librimera_compiler.a")
-    });
+    let path = std::env::var_os("RIMERA_COMPILER_ARCHIVE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target")
+                .join(if profile == core::BuildProfile::Release {
+                    "release"
+                } else {
+                    "debug"
+                })
+                .join("librimera_compiler.a")
+        });
     path.is_file().then_some(path)
 }
 

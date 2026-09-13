@@ -116,6 +116,6 @@ coroutine create+immediate-close is below 10 ns effective p50 while materialized
 lifecycle cost remains reported separately. Async syntax/protocols,
 lifecycle/cleanup, one-root execution, static backend selection, cross-feature
 GC/cancellation stress, fixed performance budgets, clean-build reproducibility,
-and native-only release proof remain accepted. The single active compatibility
-item is Gate 11 Slice 1. Monoio/Tokio adapters and the `asyncio` standard library
+and native-only release proof remain accepted. Gate 11 Slices 1–2 have since closed; the single active compatibility
+item is Gate 11 Slice 3. Monoio/Tokio adapters and the `asyncio` standard library
 remain later work and are not implied by Gate 10 closure.

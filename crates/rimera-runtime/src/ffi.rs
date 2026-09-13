@@ -294,9 +294,7 @@ pub unsafe extern "C" fn rimera_context_set_heap_limit(
 /// # Safety
 /// `context` must be a live context returned by [`rimera_context_new`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rimera_dynamic_compilation_enable(
-    context: *mut RimeraContext,
-) -> RStatus {
+pub unsafe extern "C" fn rimera_dynamic_compilation_enable(context: *mut RimeraContext) -> RStatus {
     protect(context, |context| {
         context.enable_dynamic_compilation();
         Ok(())
@@ -495,8 +493,8 @@ pub unsafe extern "C" fn rimera_function_new(
             };
             let code_value = context.with_temporary_roots(&metadata_roots, |context| {
                 context.allocate(HeapObject::Code(CodeObject {
-                dynamic_mode: None,
-                flags_override: None,
+                    dynamic_mode: None,
+                    flags_override: None,
                     code_address: code as usize,
                     kind: FunctionKind::Normal,
                     name: name.to_owned(),
@@ -1457,10 +1455,12 @@ pub unsafe extern "C" fn rimera_global_set(
             .initialize_kernel()
             .map_err(|_| RStatus::Exception)?;
         let globals = context.globals().ok_or(RStatus::InvalidArgument)?;
-        context.namespace_set(globals, name, value).map_err(|message| {
-            record_exception(context, "RuntimeError", message);
-            RStatus::Exception
-        })
+        context
+            .namespace_set(globals, name, value)
+            .map_err(|message| {
+                record_exception(context, "RuntimeError", message);
+                RStatus::Exception
+            })
     })
 }
 
@@ -1837,9 +1837,9 @@ pub unsafe extern "C" fn rimera_global_get(
             return Ok(());
         }
         let value = context.execution_builtin(name).map_err(|message| {
-                record_exception(context, "RuntimeError", message);
-                RStatus::Exception
-            })?;
+            record_exception(context, "RuntimeError", message);
+            RStatus::Exception
+        })?;
         let Some(value) = value else {
             record_exception(
                 context,
@@ -1872,7 +1872,11 @@ pub unsafe extern "C" fn rimera_global_delete(
             .map_err(|_| RStatus::Exception)?;
         let globals = context.globals().ok_or(RStatus::InvalidArgument)?;
         context.namespace_delete(globals, name).map_err(|_| {
-            record_exception(context, "NameError", format!("name '{name}' is not defined"));
+            record_exception(
+                context,
+                "NameError",
+                format!("name '{name}' is not defined"),
+            );
             RStatus::Exception
         })
     })
@@ -4075,18 +4079,31 @@ pub unsafe extern "C" fn rimera_print(
 /// # Safety
 /// `value` points to a live value owned by `context`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rimera_display(context: *mut RimeraContext, value: *const RValue) -> RStatus {
-    if value.is_null() { return RStatus::InvalidArgument; }
+pub unsafe extern "C" fn rimera_display(
+    context: *mut RimeraContext,
+    value: *const RValue,
+) -> RStatus {
+    if value.is_null() {
+        return RStatus::InvalidArgument;
+    }
     let value = unsafe { *value };
-    if value == RValue::NONE { return RStatus::Ok; }
+    if value == RValue::NONE {
+        return RStatus::Ok;
+    }
     protect(context, |context| {
-        context.with_temporary_roots(&[value], |context| {
-            let rendered = operations::repr(context, value)?;
-            let text = operations::string_value(context, rendered).ok_or("repr must return a string")?;
-            writeln!(io::stdout().lock(), "{text}").map_err(|error| error.to_string())?;
-            let builtins = context.builtins().ok_or("builtins unavailable")?;
-            context.namespace_set(builtins, "_", value)
-        }).map_err(|message| { record_exception(context, "RuntimeError", message); RStatus::Exception })
+        context
+            .with_temporary_roots(&[value], |context| {
+                let rendered = operations::repr(context, value)?;
+                let text = operations::string_value(context, rendered)
+                    .ok_or("repr must return a string")?;
+                writeln!(io::stdout().lock(), "{text}").map_err(|error| error.to_string())?;
+                let builtins = context.builtins().ok_or("builtins unavailable")?;
+                context.namespace_set(builtins, "_", value)
+            })
+            .map_err(|message| {
+                record_exception(context, "RuntimeError", message);
+                RStatus::Exception
+            })
     })
 }
 
@@ -4373,8 +4390,8 @@ mod tests {
                     .collect::<Vec<_>>();
                 let code = context.with_temporary_roots(&metadata_roots, |context| {
                     context.allocate(HeapObject::Code(CodeObject {
-                dynamic_mode: None,
-                flags_override: None,
+                        dynamic_mode: None,
+                        flags_override: None,
                         code_address,
                         kind,
                         name: name.to_owned(),
@@ -4393,14 +4410,7 @@ mod tests {
                 context.with_temporary_roots(&metadata_roots, |context| {
                     context.allocate(HeapObject::Function(FunctionObject {
                         code,
-                        fast_call: FastCallMetadata {
-                            positional_arity,
-                            kind,
-                            code_address,
-                            first_line: 1,
-                            ready_coroutine_code_address: None,
-                            ready_coroutine_repeat_pure: false,
-                        },
+                        fast_call: FastCallMetadata::new(code_address, 1, positional_arity, kind),
                         globals,
                         name: name.to_owned(),
                         qualified_name: qualified_name.to_owned(),

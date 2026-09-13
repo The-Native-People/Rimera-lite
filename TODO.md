@@ -320,7 +320,20 @@ These checks describe proven slices, not complete Python categories.
 
 ## Active gate
 
-- [ ] **Gate 11 Slice 1 — modes, code-object contract, capabilities, and oracle matrix**
+- [ ] **Gate 11 Slice 3 — `eval` globals/locals, builtins injection, and closure reads**
+
+
+## Completed Gate 11 foundation slices
+
+- [x] **Gate 11 Slice 1 — modes, code-object contract, capabilities, and oracle matrix**
+  - `exec`/`eval`/`single`, context/native-unit ownership, explicit
+    `dynamic_compilation` CLI/project capability, CPython 3.12.11 oracle
+    behavior, and enabled/disabled artifact symbol reachability are frozen.
+- [x] **Gate 11 Slice 2 — `compile` sources, flags, diagnostics, and code metadata**
+  - Capability-gated native `compile()` now publishes immutable managed code
+    only after the normal parser/sema/HIR/verified-MIR/Cranelift path succeeds.
+    Supported source/filename shapes, `flags=0`, `dont_inherit`, optimization,
+    syntax metadata, low-heap behavior, and native-only proof are documented.
 
 ## Completed Gate 9 package and cache-visibility slices
 
@@ -428,7 +441,7 @@ These checks describe proven slices, not complete Python categories.
 
 ## Queued compatibility gates
 
-These remain unchecked until their own end-to-end evidence lands. Gate 11 Slice 1
+These remain unchecked until their own end-to-end evidence lands. Gate 11 Slice 3
 is the sole active compatibility slice; later post-core areas remain separate
 promotions and must not be implied complete.
 - [ ] **Gate 11 — capability-governed `compile`, `eval`, `exec`, and runtime

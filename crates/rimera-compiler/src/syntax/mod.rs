@@ -384,11 +384,7 @@ pub fn parse(path: &Path, source: &str) -> Result<Module, DiagnosticSet> {
 /// Parses one of Python's three `compile()` grammar modes through the same
 /// RustPython-parser front end used by ordinary Rimera source builds. No AST
 /// interpreter or alternate dynamic grammar exists behind this entry point.
-pub fn parse_mode(
-    path: &Path,
-    source: &str,
-    mode: CompileMode,
-) -> Result<Module, DiagnosticSet> {
+pub fn parse_mode(path: &Path, source: &str, mode: CompileMode) -> Result<Module, DiagnosticSet> {
     let source_path = path.to_string_lossy();
     let parse_error = |error: rustpython_parser::ParseError| {
         DiagnosticSet::one(Diagnostic::new(
@@ -405,7 +401,8 @@ pub fn parse_mode(
             .map(|statement| convert_statement(path, statement))
             .collect::<Result<Vec<_>, _>>()?,
         CompileMode::Eval => {
-            let expression = ast::ModExpression::parse(source, &source_path).map_err(parse_error)?;
+            let expression =
+                ast::ModExpression::parse(source, &source_path).map_err(parse_error)?;
             let expression = convert_expression(path, &expression.body)?;
             vec![Statement {
                 span: expression.span,
@@ -413,7 +410,8 @@ pub fn parse_mode(
             }]
         }
         CompileMode::Single => {
-            let interactive = ast::ModInteractive::parse(source, &source_path).map_err(parse_error)?;
+            let interactive =
+                ast::ModInteractive::parse(source, &source_path).map_err(parse_error)?;
             if interactive.body.windows(2).any(|pair| {
                 source[pair[0].end().to_usize()..pair[1].start().to_usize()].contains('\n')
             }) {

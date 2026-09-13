@@ -90,6 +90,9 @@ const LAZY_BUILTIN_TYPES: &[(&str, &str)] = &[
 /// startup kernel. They are published exactly like eager exception types on
 /// first lookup or first raise, and retain exception-type identity thereafter.
 const LAZY_BUILTIN_EXCEPTIONS: &[(&str, &str)] = &[
+    ("SyntaxError", "Exception"),
+    ("IndentationError", "SyntaxError"),
+    ("TabError", "IndentationError"),
     ("KeyError", "Exception"),
     ("OverflowError", "Exception"),
     ("BufferError", "Exception"),
@@ -1168,9 +1171,6 @@ impl RimeraContext {
             ("ExceptionGroup", "Exception"),
             ("TypeError", "Exception"),
             ("ValueError", "Exception"),
-            ("SyntaxError", "Exception"),
-            ("IndentationError", "SyntaxError"),
-            ("TabError", "IndentationError"),
             ("RuntimeError", "Exception"),
             ("NameError", "Exception"),
             ("AttributeError", "Exception"),
@@ -3019,17 +3019,23 @@ impl RimeraContext {
                 Err(error) => return Err(error),
             }
         }
-        if let Some(value) = self.globals().and_then(|globals| self.namespace_value(globals, name)) {
+        if let Some(value) = self
+            .globals()
+            .and_then(|globals| self.namespace_value(globals, name))
+        {
             return Ok(value);
         }
         match self.execution_builtin(name)? {
             Some(value) => Ok(value),
-            None => self.raise_error("NameError", &format!("name '{name}' is not defined")),
+            None => self.raise_error("NameError", format!("name '{name}' is not defined")),
         }
     }
 
     pub(crate) fn execution_builtin(&mut self, name: &str) -> Result<Option<RValue>, String> {
-        if let Some(namespace) = self.globals().and_then(|globals| self.namespace_value(globals, "__builtins__")) {
+        if let Some(namespace) = self
+            .globals()
+            .and_then(|globals| self.namespace_value(globals, "__builtins__"))
+        {
             let namespace = match self.heap.get(namespace) {
                 Some(HeapObject::Module(module)) => module.namespace,
                 _ => namespace,
@@ -3038,7 +3044,9 @@ impl RimeraContext {
                 return Ok(self.namespace_value(namespace, name));
             }
         }
-        if let Some(value) = self.lookup_builtin(name) { return Ok(Some(value)); }
+        if let Some(value) = self.lookup_builtin(name) {
+            return Ok(Some(value));
+        }
         self.ensure_builtin(name)
     }
 
@@ -3099,7 +3107,9 @@ impl RimeraContext {
     }
 
     fn code_flags(code: &CodeObject) -> u32 {
-        if let Some(flags) = code.flags_override { return flags; }
+        if let Some(flags) = code.flags_override {
+            return flags;
+        }
         if code.code_address == 0 {
             return 0;
         }
